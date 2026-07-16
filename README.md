@@ -1,35 +1,19 @@
 <div align="center">
 
-<h1>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://media.x.ai/v1/website/spacexai-symbol-white-transparent-0c31957f.png">
-    <source media="(prefers-color-scheme: light)" srcset="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png">
-    <img alt="SpaceXAI logo" src="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png" width="96">
-  </picture>
-  <br>
-  Grok Build (<code>grok</code>)
-</h1>
+<h1>Grok OSS (<code>grok-oss</code>)</h1>
 
-**Grok Build** is SpaceXAI's terminal-based AI coding agent. It runs as a
-full-screen TUI that understands your codebase, edits files, executes shell
-commands, searches the web, and manages long-running tasks — interactively,
-headlessly for scripting/CI, or embedded in editors via the Agent Client
-Protocol (ACP).
+**Unofficial open-source fork** of [xAI Grok Build](https://github.com/xai-org/grok-build),
+maintained by [Surmount](https://github.com/SurmountSystems).
 
-[Installing the released binary](#installing-the-released-binary) ·
-[Building from source](#building-from-source) ·
-[Documentation](#documentation) ·
-[Repository layout](#repository-layout) ·
-[Development](#development) ·
+Terminal AI coding agent: full-screen TUI, headless/CI mode, and ACP for editors.
+
+**Not affiliated with or endorsed by xAI / SpaceXAI.**
+
+[FORK.md](FORK.md) ·
 [Contributing](#contributing) ·
-[License](#license)
-
-![Grok Build TUI](https://media.x.ai/v1/website/universe-tui-screenshot-6f7a0837.png)
-
-**Learn more about Grok Build at [x.ai/cli](https://x.ai/cli)**
-
-This repository contains the Rust source for the `grok` CLI/TUI and its agent
-runtime. It is synced periodically from the SpaceXAI monorepo.
+[Install](#install) ·
+[Build from source](#build-from-source) ·
+[Upstream](#relationship-to-upstream)
 
 A small `SOURCE_REV` file at the root records the full monorepo commit SHA
 for the version of the code present in this tree.
@@ -38,20 +22,68 @@ for the version of the code present in this tree.
 
 ---
 
-## Installing the released binary
+## Vision
 
-Prebuilt binaries are published for macOS, Linux, and Windows:
+| Pillar | What we do |
+|--------|------------|
+| **Faithful** | Track [xai-org/grok-build](https://github.com/xai-org/grok-build); keep crate layout for clean merges |
+| **Open** | Public source, **PRs accepted here**, security-conscious review |
+| **Distinct** | Product **Grok OSS**, CLI **`grok-oss`**, clear unofficial labeling |
+| **Compatible** | Config/session state still under **`~/.grok`** (shared with upstream CLI if both installed) |
 
-```sh
-curl -fsSL https://x.ai/cli/install.sh | bash   # macOS / Linux / Git Bash
-irm https://x.ai/cli/install.ps1 | iex          # Windows PowerShell
-grok --version
+Fork features (examples): OpenRouter as a separate model option — see shell docs.
+
+## Install
+
+### Arch Linux (AUR)
+
+Sources live in-tree under [`packaging/aur/`](packaging/aur/). After the package
+is published to the AUR:
+
+```bash
+# VCS package tracking main (recommended while following upstream closely)
+yay -S grok-oss-git
+# or: paru -S grok-oss-git
 ```
 
-See the [changelog](https://x.ai/build/changelog) for the latest fixes,
-features, and improvements in each release.
+Until AUR publish is live, build with `makepkg` from `packaging/aur/grok-oss-git/`.
 
-## Building from source
+### Cargo (from this repo)
+
+```bash
+git clone https://github.com/SurmountSystems/grok-oss.git
+cd grok-oss
+cargo install --path crates/codegen/xai-grok-pager-bin --locked --force
+# installs: ~/.cargo/bin/grok-oss
+grok-oss --version
+```
+
+If the GitHub repo is still named `grok-build`, use that clone URL until rename.
+
+### Nix
+
+```bash
+nix develop          # fenix toolchain from rust-toolchain.toml + build deps
+nix build .#grok-oss # → ./result/bin/grok-oss
+```
+
+CI uses the same flake (see `.github/workflows/ci.yml`). Locally, mirror GH CI with:
+
+```bash
+just ci        # full nix job (build + checks + openrouter tests)
+just ci-quick  # faster cargo check/tests inside nix develop
+```
+
+
+### Official upstream binary (not this fork)
+
+```bash
+curl -fsSL https://x.ai/cli/install.sh | bash   # installs official `grok`
+```
+
+That path is SpaceXAI’s release channel, **not** Grok OSS.
+
+## Build from source
 
 Requirements:
 
@@ -72,69 +104,48 @@ Requirements:
 - macOS and Linux are supported build hosts; Windows builds are best-effort
   and not currently tested from this tree.
 
-```sh
-cargo run -p xai-grok-pager-bin              # build + launch the TUI
-cargo build -p xai-grok-pager-bin --release  # release binary: target/release/xai-grok-pager
-cargo check -p xai-grok-pager-bin            # fast validation
+```bash
+cargo run -p xai-grok-pager-bin                 # build + launch
+cargo build -p xai-grok-pager-bin --release     # target/release/grok-oss
+cargo check -p xai-grok-pager-bin
 ```
 
-The binary artifact is named `xai-grok-pager`; official installs ship it as
-`grok`. On first launch it opens your browser to authenticate — see the
-[authentication guide](crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md).
+Package name remains `xai-grok-pager-bin` for upstream mergeability; the binary
+artifact is **`grok-oss`**.
+
+## Relationship to upstream
+
+| | Upstream | Grok OSS |
+|--|----------|----------|
+| Repo | [xai-org/grok-build](https://github.com/xai-org/grok-build) | SurmountSystems/grok-oss |
+| External PRs | Not accepted | **Welcome** |
+| Binary | `grok` (official installer) | `grok-oss` |
+| License | Apache-2.0 | Apache-2.0 (same first-party terms) |
+
+Sync: `./scripts/sync-upstream.sh` (see [`FORK.md`](FORK.md)).
 
 ## Documentation
 
-Full online documentation is available at
-[docs.x.ai/build/overview](https://docs.x.ai/build/overview).
-
-The user guide ships with the pager crate:
-[`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
-— getting started, keyboard shortcuts, slash commands, configuration, theming,
-MCP servers, skills, plugins, hooks, headless mode, sandboxing, and more.
-
-## Repository layout
-
-| Path | Contents |
-|------|----------|
-| `crates/codegen/xai-grok-pager-bin` | Composition-root package; builds the `xai-grok-pager` binary |
-| `crates/codegen/xai-grok-pager` | The TUI: scrollback, prompt, modals, rendering |
-| `crates/codegen/xai-grok-shell` | Agent runtime + leader/stdio/headless entry points |
-| `crates/codegen/xai-grok-tools` | Tool implementations (terminal, file edit, search, ...) |
-| `crates/codegen/xai-grok-workspace` | Host filesystem, VCS, execution, checkpoints |
-| `crates/codegen/...` | The rest of the CLI crate closure (config, MCP, markdown, sandbox, ...) |
-| `crates/common/`, `crates/build/`, `prod/mc/` | Small shared leaf crates pulled in by the closure |
-| `third_party/` | Vendored upstream source (Mermaid diagram stack) — see below |
-
-> [!IMPORTANT]
-> The root `Cargo.toml` (workspace members, dependency versions, lints,
-> profiles) is **generated** — treat it as read-only. Prefer editing per-crate
-> `Cargo.toml` files.
+- Fork process & divergences: [`FORK.md`](FORK.md)
+- User guide (upstream docs tree): [`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
+- Online upstream docs may still say “Grok Build”; behavior is largely the same, CLI name differs.
 
 ## Development
 
-```sh
-cargo check -p <crate>        # always target specific crates; full-workspace builds are slow
-cargo test -p xai-grok-config # per-crate tests
-cargo clippy -p <crate>       # lint config: clippy.toml at the repo root
-cargo fmt --all               # rustfmt.toml at the repo root
+```bash
+cargo check -p <crate>        # prefer targeted crates; full workspace is slow
+cargo test -p xai-grok-shell --test openrouter_credentials
+cargo clippy -p <crate>
+cargo fmt --all
 ```
 
 ## Contributing
 
-> [!NOTE]
-> External contributions are not accepted. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+PRs against **this** repository are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 
-First-party code in this repository is licensed under the **Apache License,
-Version 2.0** — see [`LICENSE`](LICENSE).
+First-party code: **Apache License 2.0** — [`LICENSE`](LICENSE).
 
-Third-party and vendored code remains under its original licenses. See:
-
-- [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES) — crates.io / git dependencies,
-  bundled UI themes, and **in-tree source ports** (including openai/codex and
-  sst/opencode tool implementations)
-- [`crates/codegen/xai-grok-tools/THIRD_PARTY_NOTICES.md`](crates/codegen/xai-grok-tools/THIRD_PARTY_NOTICES.md)
-  — crate-local notice for the codex and opencode ports (license texts +
-  Apache §4(b) change notice)
-- [`third_party/NOTICE`](third_party/NOTICE) — vendored Mermaid-stack index
+Third-party: [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES) and
+[`crates/codegen/xai-grok-tools/THIRD_PARTY_NOTICES.md`](crates/codegen/xai-grok-tools/THIRD_PARTY_NOTICES.md).

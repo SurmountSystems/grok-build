@@ -63,10 +63,13 @@ fn target_dir() -> PathBuf {
         .unwrap_or_else(|| workspace_root().join("target"))
 }
 
+/// CLI binary name for Grok OSS (Surmount fork). Package remains xai-grok-pager-bin.
+const GROK_OSS_BIN: &str = "grok-oss";
+
 fn local_grok_binary_path() -> PathBuf {
     target_dir()
         .join("debug")
-        .join(format!("xai-grok-pager{}", std::env::consts::EXE_SUFFIX))
+        .join(format!("{GROK_OSS_BIN}{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn ensure_local_grok_binary(binary: &Path) {
@@ -77,25 +80,31 @@ fn ensure_local_grok_binary(binary: &Path) {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let output = Command::new(&cargo)
         .current_dir(workspace_root())
-        .args(["build", "-p", "xai-grok-pager", "--bin", "xai-grok-pager"])
+        .args([
+            "build",
+            "-p",
+            "xai-grok-pager-bin",
+            "--bin",
+            GROK_OSS_BIN,
+        ])
         .output()
-        .unwrap_or_else(|e| panic!("failed to spawn {cargo} to build xai-grok-pager: {e}"));
+        .unwrap_or_else(|e| panic!("failed to spawn {cargo} to build {GROK_OSS_BIN}: {e}"));
 
     assert!(
         output.status.success(),
-        "failed to build xai-grok-pager for lifecycle tests (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        "failed to build {GROK_OSS_BIN} for lifecycle tests (exit {:?})\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
         binary.exists(),
-        "xai-grok-pager build completed but binary missing at {}",
+        "{GROK_OSS_BIN} build completed but binary missing at {}",
         binary.display()
     );
 }
 
-/// Resolve grok binary: `GROK_BINARY` env (CI) or a locally built `xai-grok-pager` binary.
+/// Resolve CLI binary: `GROK_BINARY` env (CI) or a locally built `grok-oss` binary.
 pub fn grok_binary() -> PathBuf {
     if let Ok(path) = std::env::var("GROK_BINARY") {
         let p = PathBuf::from(path);
@@ -103,7 +112,8 @@ pub fn grok_binary() -> PathBuf {
         return p;
     }
 
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_xai-grok-pager") {
+    // Cargo sets CARGO_BIN_EXE_<name> with underscores for hyphens.
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_grok-oss") {
         let p = PathBuf::from(path);
         if p.exists() {
             return p;
