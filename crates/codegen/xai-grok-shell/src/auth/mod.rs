@@ -1,16 +1,19 @@
 pub(crate) mod attribution;
 mod config;
 pub mod credential_provider;
+pub mod credentials_store;
 #[path = "devbox_login_stub.rs"]
 pub(crate) mod devbox_login;
 pub mod device_code;
 pub mod error;
 mod external_auth;
 mod flow;
+pub mod harness_secrets;
 mod jwt;
 pub(crate) mod manager;
 mod model;
 pub mod oidc;
+pub mod openrouter;
 pub(crate) mod recovery;
 pub(crate) mod refresh;
 mod storage;
@@ -38,6 +41,16 @@ pub use meta::{AuthMeta, GateInfo};
 pub use model::{AuthMode, GrokAuth, lookup_auth};
 pub(crate) use model::{TOKEN_TTL, UserInfo, is_expired, token_suffix};
 pub(crate) use refresh::DiagnosticUploader;
+pub use harness_secrets::{
+    GROK_ZED_CONFIG_DIR_ENV, SharedKeySource, probe_shared_openrouter_key,
+    probe_shared_openrouter_key_default,
+};
+pub use openrouter::{
+    OPENROUTER_API_KEY_ENV, OPENROUTER_API_URL, OPENROUTER_GROK_45_CATALOG_ID, OpenRouterAuthError,
+    clear_openrouter_api_key, has_openrouter_api_key, load_openrouter_api_key,
+    load_openrouter_api_key_default, run_openrouter_login, run_openrouter_logout,
+    store_openrouter_api_key,
+};
 pub use storage::{
     clear_api_key, read_api_key, read_auth_json, read_token_by_scope, store_api_key,
 };

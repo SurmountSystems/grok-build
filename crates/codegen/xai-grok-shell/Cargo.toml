@@ -28,6 +28,7 @@ chrono = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 ignore = { workspace = true }
 jsonschema = { workspace = true }
+keyring = { workspace = true }
 futures = { workspace = true }
 glob = { workspace = true }
 globset = { workspace = true }
@@ -176,9 +177,16 @@ xai-tool-types = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
 
+# Zed Secret Service interop (Linux): same schema as Zed GPUI / oo7
+# (label `zed-github-account`, attributes `url` + `username`).
+# `crypto-rust` enables EncryptionType::Dh for encrypted session transport.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+dbus-secret-service = { version = "4", features = ["crypto-rust"] }
+
 [target.'cfg(windows)'.dependencies]
 siphasher = { workspace = true }
-windows = { workspace = true }
+# Win32_Security_Credentials: Zed Credential Manager interop (`zed:url=…`).
+windows = { workspace = true, features = ["Win32_Security_Credentials"] }
 
 [dev-dependencies]
 criterion = { workspace = true }

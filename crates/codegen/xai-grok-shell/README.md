@@ -1756,6 +1756,59 @@ api_key = "sk-custom"
 > # base_url, api_key, env_key optional — defaults to cli-chat-proxy
 > ```
 
+### OpenRouter (Grok 4.5)
+
+OpenRouter is a **separate model option** in the picker (`openrouter-grok-4.5`). It does not replace the native Grok Build model and is not a source for models OpenRouter does not host (e.g. Composer-class models).
+
+**Authenticate** — resolution order:
+
+1. `OPENROUTER_API_KEY` (portable; shared with Zed and other tools)
+2. Grok Build secret store (OS keyring service `grok-build`, or `~/.grok/provider_credentials.json`)
+3. **Read-only** shared harness probes — including keys already saved in **Zed**:
+   - Dev channel: `~/.config/zed/development_credentials` (or `%APPDATA%\Zed\…`)
+   - OS store: Zed’s Secret Service / Keychain / Credential Manager layout  
+     (Linux label `zed-github-account` + `url` attribute; Windows target `zed:url=…`)
+
+Grok **never writes** into Zed’s stores. Override Zed config discovery with `GROK_ZED_CONFIG_DIR`. Set `GROK_CREDENTIALS_FORCE_FILE=1` to skip Grok’s OS keyring (CI / headless).
+
+```bash
+# Preferred: environment variable (works for Grok and Zed)
+export OPENROUTER_API_KEY="sk-or-..."
+
+# Or store a Grok-only key (OS keyring when available, else ~/.grok/provider_credentials.json)
+grok login --openrouter
+# non-interactive:
+grok login --openrouter --api-key "sk-or-..."
+
+# Clear Grok’s stored key only (does not unset OPENROUTER_API_KEY or touch Zed)
+grok logout --openrouter
+```
+
+If you already configured OpenRouter in Zed (Settings → AI → LLM Providers), Grok will reuse that key when `OPENROUTER_API_KEY` is unset and no Grok-local key is stored.
+
+**Tests** (integration tests avoid the shell crate’s unit-test migration surface):
+
+```bash
+cargo test -p xai-grok-shell --test openrouter_credentials
+```
+
+**Use the model:**
+
+```bash
+grok models                          # lists Grok 4.5 (OpenRouter) among others
+grok -p "Hello" -m openrouter-grok-4.5
+# In the TUI:
+/model openrouter-grok-4.5
+```
+
+```toml
+# Optional: make OpenRouter the default for new sessions
+[models]
+default = "openrouter-grok-4.5"
+```
+
+Credentials are never written to `config.toml`. Keys are keyed by API URL (`https://openrouter.ai/api/v1`).
+
 ### Examples
 
 **OpenAI-compatible endpoint:**

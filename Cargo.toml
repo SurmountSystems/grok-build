@@ -162,6 +162,9 @@ infer = "0.19.0"
 insta = "1"
 itertools = "0.14"
 jsonschema = "0.30.0"
+# OS credential store (v4 `v1` API). Defaults use secret-service 5 → zbus 5
+# on Linux (keyring 3 pulled secret-service 4 → zbus 4).
+keyring = "4"
 libc = "0.2"
 linkify = "0.10"
 lipsum = "0.9"

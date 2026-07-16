@@ -16,22 +16,36 @@ pub enum Command {
         json: bool,
     },
     /// Sign out and clear cached credentials
-    Logout,
+    Logout {
+        /// Clear only the stored OpenRouter API key (not xAI session auth).
+        #[arg(long = "openrouter")]
+        openrouter: bool,
+    },
     /// Sign in to Grok
     Login {
         /// Ignored (kept for backwards compatibility). OAuth2 is now the only auth method.
         #[arg(long, hide = true)]
         legacy: bool,
         /// Use Grok OAuth via auth.x.ai.
-        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth"])]
+        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth", "openrouter"])]
         oauth: bool,
         /// Use device-code authentication for headless/remote environments.
         #[arg(
             long = "device-auth",
             visible_alias = "device-code",
-            conflicts_with_all = ["oauth"]
+            conflicts_with_all = ["oauth", "openrouter"]
         )]
         device_auth: bool,
+        /// Store an OpenRouter API key (for Grok 4.5 via OpenRouter).
+        ///
+        /// Keys go to the OS secret store (or `$GROK_HOME/provider_credentials.json`
+        /// when the keyring is unavailable). Prefer `OPENROUTER_API_KEY` env over
+        /// storing a key. Does not replace xAI login.
+        #[arg(long = "openrouter", conflicts_with_all = ["oauth", "device_auth"])]
+        openrouter: bool,
+        /// OpenRouter API key (with `--openrouter`). If omitted, prompts on stdin.
+        #[arg(long = "api-key", requires = "openrouter")]
+        api_key: Option<String>,
         /// Authenticate for remote development environments (hidden).
         ///
         /// Field is always present so match arms stay feature-unification-safe
@@ -1107,8 +1121,41 @@ mod tests {
     #[test]
     fn subcommand_takes_precedence_over_positional_prompt() {
         let args = PagerArgs::try_parse_from(["grok", "logout"]).expect("subcommand parses");
-        assert!(matches!(args.command, Some(Command::Logout)));
+        assert!(matches!(
+            args.command,
+            Some(Command::Logout { openrouter: false })
+        ));
         assert!(args.prompt.is_none());
+    }
+
+    #[test]
+    fn login_openrouter_parses_api_key() {
+        let args = PagerArgs::try_parse_from([
+            "grok",
+            "login",
+            "--openrouter",
+            "--api-key",
+            "sk-or-test",
+        ])
+        .expect("login --openrouter parses");
+        match args.command {
+            Some(Command::Login {
+                openrouter: true,
+                api_key: Some(key),
+                ..
+            }) => assert_eq!(key, "sk-or-test"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logout_openrouter_parses() {
+        let args = PagerArgs::try_parse_from(["grok", "logout", "--openrouter"])
+            .expect("logout --openrouter parses");
+        assert!(matches!(
+            args.command,
+            Some(Command::Logout { openrouter: true })
+        ));
     }
     #[test]
     fn positional_prompt_conflicts_with_headless_single() {
