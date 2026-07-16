@@ -1,0 +1,17 @@
+pkgbase = grok-oss-git
+	pkgdesc = Unofficial open-source Grok Build coding agent (Surmount fork of xai-org/grok-build)
+	pkgver = 0.1.220.alpha.4.r0.gunknown
+	pkgrel = 1
+	url = https://github.com/SurmountSystems/grok-oss
+	arch = x86_64
+	license = Apache-2.0
+	makedepends = cargo
+	makedepends = git
+	makedepends = protobuf
+	provides = grok-oss
+	conflicts = grok-oss
+	options = !lto
+	source = grok-oss-git::git+https://github.com/SurmountSystems/grok-oss.git#branch=main
+	sha256sums = SKIP
+
+pkgname = grok-oss-git

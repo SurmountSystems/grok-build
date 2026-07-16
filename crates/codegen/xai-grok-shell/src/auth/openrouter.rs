@@ -3,7 +3,7 @@
 //! # Credential resolution order
 //!
 //! 1. `OPENROUTER_API_KEY` environment variable (portable; shared with Zed and others)
-//! 2. Grok Build secret store (`CredentialsStore` — OS keyring service `grok-build`
+//! 2. Grok OSS secret store (`CredentialsStore` — OS keyring service `grok-build`
 //!    or `$GROK_HOME/provider_credentials.json`)
 //! 3. Shared harness probes ([`super::harness_secrets`]) — **read-only**, including
 //!    Zed's development credentials file and Zed's OS keychain layouts
@@ -36,7 +36,7 @@ pub const OPENROUTER_GROK_45_CONTEXT_WINDOW: u64 = 500_000;
 pub const OPENROUTER_HTTP_REFERER: &str = "https://x.ai";
 
 /// X-Title value OpenRouter uses for app attribution.
-pub const OPENROUTER_X_TITLE: &str = "Grok Build";
+pub const OPENROUTER_X_TITLE: &str = "Grok OSS";
 
 /// Whether `base_url` targets OpenRouter (host contains `openrouter.ai`).
 pub fn is_openrouter_base_url(base_url: &str) -> bool {

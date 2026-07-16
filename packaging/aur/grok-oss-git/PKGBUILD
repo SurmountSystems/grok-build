@@ -1,0 +1,49 @@
+# Maintainer: Hunter Beast <hunter@surmount.systems>
+# Unofficial open-source fork of xAI Grok Build — not affiliated with xAI/SpaceXAI.
+
+pkgname=grok-oss-git
+pkgver=0.1.220.alpha.4.r0.gunknown
+pkgrel=1
+pkgdesc='Unofficial open-source Grok Build coding agent (Surmount fork of xai-org/grok-build)'
+arch=('x86_64')
+url='https://github.com/SurmountSystems/grok-oss'
+license=('Apache-2.0')
+depends=()
+makedepends=('cargo' 'git' 'protobuf')
+provides=('grok-oss')
+conflicts=('grok-oss')
+source=("${pkgname}::git+https://github.com/SurmountSystems/grok-oss.git#branch=main")
+sha256sums=('SKIP')
+options=('!lto') # large Rust workspace; LTO optional later
+
+pkgver() {
+  cd "$pkgname"
+  # Prefer cargo package version + git describe when possible
+  local cargo_ver
+  cargo_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codegen/xai-grok-pager-bin/Cargo.toml | head -1 | tr '-' '.')"
+  local rev count
+  rev="$(git rev-parse --short HEAD)"
+  count="$(git rev-list --count HEAD)"
+  printf "%s.r%s.g%s" "${cargo_ver:-0.0.0}" "$count" "$rev"
+}
+
+prepare() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  # rust-toolchain.toml may pin a specific channel; rustup will download if needed
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --release --locked -p xai-grok-pager-bin
+}
+
+package() {
+  install -Dm755 "$srcdir/target/release/grok-oss" "$pkgdir/usr/bin/grok-oss"
+  install -Dm644 "$pkgname/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$pkgname/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "$pkgname/FORK.md" "$pkgdir/usr/share/doc/$pkgname/FORK.md"
+}
