@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nix:
+    name: just ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@v9
+
+      # Same entrypoint as local: `just ci` (see justfile).
+      - name: just ci
+        run: nix shell nixpkgs#just -c just ci

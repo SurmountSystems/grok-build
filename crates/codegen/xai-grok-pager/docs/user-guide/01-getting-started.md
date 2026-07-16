@@ -1,6 +1,13 @@
 # Getting Started
 
-Grok Build is a terminal-based AI coding assistant from SpaceXAI. It runs as a TUI (Terminal User Interface) that understands your codebase, executes shell commands, edits files, searches the web, and manages tasks.
+> **Grok OSS note:** This guide is largely shared with upstream Grok Build docs.
+> On this fork the CLI binary is **`grok-oss`** (not `grok`). Config still lives
+> under `~/.grok`. See the repository [README](../../../../../README.md) and
+> [FORK.md](../../../../../FORK.md).
+
+Grok OSS is a terminal-based AI coding assistant (open-source fork of SpaceXAI’s
+Grok Build). It runs as a TUI that understands your codebase, executes shell
+commands, edits files, searches the web, and manages tasks.
 
 You can use it interactively as a full-screen TUI, run it headlessly for scripting and CI/CD, or integrate it into editors via the Agent Client Protocol (ACP).
 
@@ -8,36 +15,34 @@ You can use it interactively as a full-screen TUI, run it headlessly for scripti
 
 ## Installation
 
-Install the latest stable release (macOS, Linux, or Windows via Git Bash):
+### Grok OSS (this fork)
+
+```bash
+# From a clone of SurmountSystems/grok-oss (or grok-build until renamed)
+cargo install --path crates/codegen/xai-grok-pager-bin --locked --force
+grok-oss --version
+```
+
+Arch users: see `packaging/aur/` for AUR PKGBUILDs (`grok-oss-git`).
+
+### Official upstream (SpaceXAI)
+
+Installs the official **`grok`** binary, not Grok OSS:
 
 ```bash
 curl -fsSL https://x.ai/cli/install.sh | bash
 ```
 
-Install a specific version:
-
-```bash
-curl -fsSL https://x.ai/cli/install.sh | bash -s 0.1.42
-```
-
-On **Windows (PowerShell)**, use the native PowerShell installer:
+On **Windows (PowerShell)**:
 
 ```powershell
 irm https://x.ai/cli/install.ps1 | iex
 ```
 
-Install a specific version:
-
-```powershell
-$env:GROK_VERSION="0.1.42"; irm https://x.ai/cli/install.ps1 | iex
-```
-
-The PowerShell installer automatically adds `%USERPROFILE%\.grok\bin` to your User PATH. Alternatively, install via [Git for Windows](https://gitforwindows.org/) (Git Bash) or MSYS2 using the bash script above. WSL users get the Linux binary automatically.
-
-Verify the installation:
+Verify Grok OSS:
 
 ```bash
-grok --version
+grok-oss --version
 ```
 
 Update to the latest version at any time:
