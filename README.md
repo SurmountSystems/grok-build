@@ -67,7 +67,7 @@ nix build .#grok-oss # → ./result/bin/grok-oss
 CI uses the same flake (see `.github/workflows/ci.yml`). Locally, mirror GH CI with:
 
 ```bash
-just ci        # full nix job (build + checks + openrouter tests)
+just ci        # local mirror of GHA quality (flake-meta + ci-prep + just test)
 just ci-quick  # faster cargo check/tests inside nix develop
 ```
 

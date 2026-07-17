@@ -16,7 +16,8 @@ concurrency:
 
 # Shared env for free ubuntu-latest (~4 vCPU / 16GB).
 # CI never builds a release package (no nix build .#grok-oss).
-# Quality (fmt/clippy/test) and openrouter are separate jobs.
+# Single quality job: fmt / clippy / workspace tests (includes offline
+# openrouter_credentials integration tests via cargo test --workspace).
 env:
   NIX_CONFIG: |
     download-attempts = 5
@@ -106,55 +107,4 @@ jobs:
             # Cargo quality payload once (no outer retry of permanent fails).
             nix shell .#just -c just test
             exit $?
-          done
-
-  # Focused OpenRouter flake check -- independent of fmt/clippy/workspace tests.
-  openrouter:
-    name: openrouter-tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v16
-
-      - name: just openrouter-tests
-        run: |
-          set -euo pipefail
-          rm -f .ci-started
-          attempts=4
-          backoff=5
-          n=1
-          while true; do
-            echo "==> openrouter attempt ${n}/${attempts}"
-            set +e
-            nix shell .#just -c just flake-meta
-            status=$?
-            set -e
-            if [[ "${status}" -ne 0 ]]; then
-              if [[ "${n}" -ge "${attempts}" ]]; then
-                exit "${status}"
-              fi
-              sleep "${backoff}"
-              backoff=$((backoff * 3))
-              n=$((n + 1))
-              continue
-            fi
-            set +e
-            nix shell .#just -c just openrouter-tests
-            status=$?
-            set -e
-            if [[ "${status}" -eq 0 ]]; then
-              exit 0
-            fi
-            if [[ "${n}" -ge "${attempts}" ]]; then
-              exit "${status}"
-            fi
-            # openrouter is pure nix check; retry whole step on flake/network flakes.
-            echo "==> openrouter-tests failed (exit ${status}); retry in ${backoff}s" >&2
-            sleep "${backoff}"
-            backoff=$((backoff * 3))
-            n=$((n + 1))
           done

@@ -114,12 +114,12 @@ default:
 # CI never builds a release package (`nix build .#grok-oss`). That is optional
 # packaging for humans (`just build` / `just smoke` / `just install-nix`).
 #
-# GHA jobs (see .github/workflows/ci.yml):
-#   quality  -> just ci-prep && just test
-#   openrouter -> just ci-prep-light && just openrouter-tests
+# GHA (see .github/workflows/ci.yml): single `quality` job → just ci-prep && just test.
 #
-# `just test` = quality gate CI quality job runs (fmt, clippy -D warnings,
-# workspace tests all features/targets, mem-guard crate tests).
+# `just test` = quality gate (fmt, clippy -D warnings, workspace unit/integration
+# tests including offline openrouter_credentials, mem-guard). No separate
+# OpenRouter GHA job — a second Nix cold-start for one cargo test target was
+# redundant with `cargo test --workspace`.
 #
 # `just test-extra` = local-only extras CI does not run (cross-target clippy,
 # nix_retry smoke).
@@ -128,12 +128,11 @@ default:
 # nix monorepo release build -- that OOMs on ~16GB runners).
 # ---------------------------------------------------------------------------
 
-# Optional single-shot local gate (not used by multi-job GHA).
+# Optional single-shot local gate (matches GHA quality job).
 ci: require_system
     just flake-meta
     just ci-prep
     just test
-    just openrouter-tests
     @rm -f .ci-started
     @echo "CI passed"
 
@@ -141,12 +140,6 @@ ci: require_system
 # Permanent cargo failures must not re-enter the outer GHA bootstrap loop.
 ci-prep: require_system mem-guard
     @echo "==> ci-prep: realize .#ci-tools (nix_retry)"
-    just nix_retry nix build -L {{ nix_low_mem_opts }} .#ci-tools
-    @touch .ci-started
-
-# Lighter prep when only flake checks need the shell (openrouter job).
-ci-prep-light: require_system
-    @echo "==> ci-prep-light: realize .#ci-tools (nix_retry)"
     just nix_retry nix build -L {{ nix_low_mem_opts }} .#ci-tools
     @touch .ci-started
 
@@ -171,9 +164,11 @@ cargo-check: require_system
     @echo "==> cargo-check [not CI quality]"
     just nix_retry nix build -L {{ nix_low_mem_opts }} ".#checks.{{ system }}.cargoCheck"
 
-# OpenRouter credential integration tests (separate GHA job).
+# Optional flake-only re-run of openrouter credential tests (offline; not a
+# separate GHA job). Prefer `just test` / `cargo test -p xai-grok-shell --test
+# openrouter_credentials` for the normal path.
 openrouter-tests: require_system
-    @echo "==> openrouter-tests"
+    @echo "==> openrouter-tests (optional flake check; covered by just test)"
     just nix_retry nix build -L {{ nix_low_mem_opts }} ".#checks.{{ system }}.openrouter-credentials"
 
 # Build cargo-mem-guard package + unit tests as flake check.
