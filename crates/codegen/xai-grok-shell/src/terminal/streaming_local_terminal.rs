@@ -866,7 +866,7 @@ fn spawn_shell_command(
     #[cfg(unix)]
     {
         let program = crate::terminal::default_shell_path();
-        spawn_with_argv(program, cwd, env, |cmd| {
+        spawn_with_argv(&program, cwd, env, |cmd| {
             cmd.arg("-c").arg(command);
         })
     }

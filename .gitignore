@@ -3,3 +3,6 @@
 .DS_Store
 result
 /result
+
+# Nested crate cargo targets (standalone crates like cargo-mem-guard)
+**/target/

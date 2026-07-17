@@ -195,15 +195,28 @@ impl ShellKind {
     }
 
     /// Resolved absolute path to the shell binary. Falls back from `$SHELL` →
-    /// `which` → common dirs → `/bin/<name>`. Result is cached process-wide
-    /// in `xai_grok_config::shell::unix_shell_path`. See that function for
-    /// the full cascade. Returns `&'static str`.
-    pub fn binary_path(&self) -> &'static str {
+    /// `which` → common dirs → `/bin/<name>`. Cached process-wide (with
+    /// re-resolve when the path vanishes) via
+    /// `xai_grok_config::shell::unix_shell_path`.
+    pub fn binary_path(&self) -> String {
         let kind = match self {
             Self::Bash => xai_grok_config::shell::UnixShellKind::Bash,
             Self::Zsh => xai_grok_config::shell::UnixShellKind::Zsh,
         };
         xai_grok_config::shell::unix_shell_path(kind)
+    }
+
+    /// Config shell kind used by the path resolver / refresh helpers.
+    pub fn unix_kind(self) -> xai_grok_config::shell::UnixShellKind {
+        match self {
+            Self::Bash => xai_grok_config::shell::UnixShellKind::Bash,
+            Self::Zsh => xai_grok_config::shell::UnixShellKind::Zsh,
+        }
+    }
+
+    /// Force-refresh the resolved shell binary (after spawn ENOENT).
+    pub fn refresh_binary_path(&self) -> String {
+        xai_grok_config::shell::refresh_unix_shell_path(self.unix_kind())
     }
 
     /// The user's primary rc file name (relative to `$HOME`).
@@ -428,7 +441,7 @@ impl ShellState {
             ),
         };
 
-        let effective_cwd = cwd_override.unwrap_or(&self.cwd);
+        let effective_cwd = cwd_override.unwrap_or(&self.cwd).to_path_buf();
 
         let args: Vec<String> = match self.shell {
             ShellKind::Bash => vec![
@@ -454,13 +467,31 @@ impl ShellState {
         ];
 
         Ok(PreparedCommand {
-            binary: self.shell.binary_path().to_string(),
+            binary: self.shell.binary_path(),
             args,
             fd_mappings,
             state_in_write,
             state_out_read,
-            cwd: effective_cwd.to_path_buf(),
+            cwd: effective_cwd,
         })
+    }
+
+    /// If the tracked cwd no longer exists, reset it to `fallback` when that
+    /// is a live directory. Returns true when a reset happened.
+    pub fn recover_cwd_if_missing(&mut self, fallback: &Path) -> bool {
+        if self.cwd.is_dir() {
+            return false;
+        }
+        if fallback.is_dir() {
+            tracing::warn!(
+                tracked = %self.cwd.display(),
+                fallback = %fallback.display(),
+                "persistent shell cwd gone; resetting to request working_directory"
+            );
+            self.cwd = fallback.to_path_buf();
+            return true;
+        }
+        false
     }
 
     /// Update this state from a raw dump string (read from fd 4).
@@ -759,14 +790,14 @@ mod tests {
     /// On NixOS the resolver returns the nix-store / profile path, so this
     /// guard works there too.
     fn bash_available() -> bool {
-        std::path::Path::new(ShellKind::Bash.binary_path()).exists()
+        std::path::Path::new(&ShellKind::Bash.binary_path()).exists()
     }
 
     /// Returns true iff a usable zsh binary exists at the resolved path.
     /// Mirrors [`bash_available`] so zsh integration tests skip (rather than
     /// fail) on systems without zsh installed.
     fn zsh_available() -> bool {
-        std::path::Path::new(ShellKind::Zsh.binary_path()).exists()
+        std::path::Path::new(&ShellKind::Zsh.binary_path()).exists()
     }
 
     #[test]
@@ -774,19 +805,35 @@ mod tests {
         // The resolver may pick any absolute path (e.g. `/opt/homebrew/bin/bash`
         // on macOS+brew, `/run/current-system/sw/bin/bash` on NixOS), but the
         // file name must match the requested kind.
-        let bash = std::path::Path::new(ShellKind::Bash.binary_path())
+        let bash_path = ShellKind::Bash.binary_path();
+        let bash = std::path::Path::new(&bash_path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
         assert_eq!(bash, "bash", "Bash kind must resolve to a *bash* binary");
 
-        let zsh = std::path::Path::new(ShellKind::Zsh.binary_path())
+        let zsh_path = ShellKind::Zsh.binary_path();
+        let zsh = std::path::Path::new(&zsh_path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
         assert_eq!(zsh, "zsh", "Zsh kind must resolve to a *zsh* binary");
+    }
+
+    #[test]
+    fn recover_cwd_if_missing_resets_to_fallback() {
+        let mut state = ShellState {
+            cwd: PathBuf::from("/this/path/definitely/does/not/exist-grok-test"),
+            snapshot: String::new(),
+            shell: ShellKind::Bash,
+        };
+        let fallback = std::env::temp_dir();
+        assert!(state.recover_cwd_if_missing(&fallback));
+        assert_eq!(state.cwd, fallback);
+        // Second call: cwd is live, no reset.
+        assert!(!state.recover_cwd_if_missing(&fallback));
     }
 
     #[test]

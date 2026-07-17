@@ -629,7 +629,12 @@ impl LocalTerminalActor {
 
         self.ensure_persistent_shell_initialized(cwd).await;
 
-        let shell_state = self.shell_state.as_ref().unwrap();
+        // Recover if the model `cd`'d into a directory that has since vanished
+        // (deleted worktree / temp dir) so spawn does not fail with a bare ENOENT.
+        if let Some(state) = self.shell_state.as_mut() {
+            state.recover_cwd_if_missing(cwd);
+        }
+
         // When the persistent shell already tracks a
         // model-set cwd (the model ran a `cd`), honor it unconditionally.
         // The bash tool always populates `request.working_directory` with
@@ -642,82 +647,113 @@ impl LocalTerminalActor {
         // …)` to the command string — that mechanism is local to a single
         // call and does NOT mutate the parent shell's `$PWD`, so we never
         // need to surface it as a `cwd_override` here.
-        let cwd_override: Option<&std::path::Path> = None;
-        // Silence the unused-binding lint on the inbound `cwd` parameter:
-        // it's still threaded into `spawn_command` (the non-persistent
-        // fallback path) below.
-        let _ = cwd;
-        let prep = shell_state
-            .prepare_command(command, cwd_override, self.search_shadows)
-            .map_err(|e| ComputerError::io(format!("prepare persistent command: {e}")))?;
+        let mut attempt = 0u8;
+        let mut last_binary = String::new();
+        loop {
+            attempt += 1;
+            if attempt > 1 {
+                let shell = shell_state::ShellKind::detect();
+                let fresh = shell.refresh_binary_path();
+                tracing::warn!(
+                    attempt,
+                    old = %last_binary,
+                    new = %fresh,
+                    "persistent shell spawn ENOENT; retrying with refreshed shell path"
+                );
+            }
 
-        let mut cmd = tokio::process::Command::new(&prep.binary);
-        cmd.args(&prep.args)
-            .current_dir(&prep.cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            let shell_state = self.shell_state.as_ref().unwrap();
+            let prep = shell_state
+                .prepare_command(command, None, self.search_shadows)
+                .map_err(|e| ComputerError::io(format!("prepare persistent command: {e}")))?;
+            last_binary = prep.binary.clone();
+            preflight_spawn_paths(&prep.binary, &prep.cwd)?;
 
-        // Apply SHELL_ENV_OVERRIDES (TERM=dumb, NO_COLOR, GROK_AGENT=1, etc.)
-        // + request env + pager env. Agent marker is re-applied last so request
-        // env cannot clear it.
-        cmd.envs(shell_state::shell_env_overrides());
+            let mut cmd = tokio::process::Command::new(&prep.binary);
+            cmd.args(&prep.args)
+                .current_dir(&prep.cwd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
 
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
+            // Apply SHELL_ENV_OVERRIDES (TERM=dumb, NO_COLOR, GROK_AGENT=1, etc.)
+            // + request env + pager env. Agent marker is re-applied last so request
+            // env cannot clear it.
+            cmd.envs(shell_state::shell_env_overrides());
 
-        cmd.envs(crate::util::pager_env());
-        crate::util::apply_grok_agent_marker(&mut cmd);
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
 
-        cmd.fd_mappings(prep.fd_mappings)
-            .map_err(|e| ComputerError::io(format!("fd mapping: {e}")))?;
+            cmd.envs(crate::util::pager_env());
+            crate::util::apply_grok_agent_marker(&mut cmd);
 
-        unsafe {
-            cmd.pre_exec(crate::util::detach_from_tty);
-        }
+            cmd.fd_mappings(prep.fd_mappings)
+                .map_err(|e| ComputerError::io(format!("fd mapping: {e}")))?;
 
-        #[cfg(target_os = "linux")]
-        if xai_grok_sandbox::should_restrict_child_network() {
             unsafe {
-                cmd.pre_exec(|| xai_grok_sandbox::child_net::install_child_network_filter());
+                cmd.pre_exec(crate::util::detach_from_tty);
+            }
+
+            #[cfg(target_os = "linux")]
+            if xai_grok_sandbox::should_restrict_child_network() {
+                unsafe {
+                    cmd.pre_exec(|| xai_grok_sandbox::child_net::install_child_network_filter());
+                }
+            }
+
+            let spawn_result = cmd.spawn();
+            // Drop cmd to release the FdMapping OwnedFds held in its pre_exec closure.
+            // Without this, the parent keeps the write-end of the state-out pipe open,
+            // preventing the dump reader from seeing EOF.
+            // (cmd is dropped when we leave this scope after mapping spawn_result.)
+
+            match spawn_result {
+                Ok(child) => {
+                    drop(cmd);
+                    let mut process_group = crate::util::ProcessGroup::new()
+                        .map_err(|e| ComputerError::io(format!("ProcessGroup::new: {e}")))?;
+                    if let Err(e) = process_group.attach(&child) {
+                        tracing::debug!(
+                            "Failed to attach persistent-shell child to ProcessGroup: {e}"
+                        );
+                    }
+
+                    // Write prior snapshot to fd 3 (state input pipe) in a background task.
+                    let snapshot = shell_state.snapshot.clone();
+                    let state_in_write = prep.state_in_write;
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            shell_state::write_snapshot_to_pipe(&snapshot, state_in_write).await
+                        {
+                            tracing::debug!("failed to write shell snapshot to pipe: {e}");
+                        }
+                    });
+
+                    // Read new dump from fd 4 (state output pipe) in a background task.
+                    let state_out_read = prep.state_out_read;
+                    let dump_handle = tokio::spawn(async move {
+                        shell_state::read_dump_from_pipe(state_out_read).await
+                    });
+
+                    return Ok(SpawnResult {
+                        child,
+                        process_group,
+                        state_dump_handle: Some(dump_handle),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => {
+                    drop(cmd);
+                    // Retry once after forced path refresh.
+                    continue;
+                }
+                Err(e) => {
+                    drop(cmd);
+                    return Err(spawn_io_error(&prep.binary, &prep.cwd, e));
+                }
             }
         }
-
-        let child = cmd.spawn().map_err(ComputerError::from)?;
-        // Drop cmd to release the FdMapping OwnedFds held in its pre_exec closure.
-        // Without this, the parent keeps the write-end of the state-out pipe open,
-        // preventing the dump reader from seeing EOF.
-        drop(cmd);
-
-        let mut process_group = crate::util::ProcessGroup::new()
-            .map_err(|e| ComputerError::io(format!("ProcessGroup::new: {e}")))?;
-        if let Err(e) = process_group.attach(&child) {
-            tracing::debug!("Failed to attach persistent-shell child to ProcessGroup: {e}");
-        }
-
-        // Write prior snapshot to fd 3 (state input pipe) in a background task.
-        let snapshot = shell_state.snapshot.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                shell_state::write_snapshot_to_pipe(&snapshot, prep.state_in_write).await
-            {
-                tracing::debug!("failed to write shell snapshot to pipe: {e}");
-            }
-        });
-
-        // Read new dump from fd 4 (state output pipe) in a background task.
-        let dump_handle =
-            tokio::spawn(
-                async move { shell_state::read_dump_from_pipe(prep.state_out_read).await },
-            );
-
-        Ok(SpawnResult {
-            child,
-            process_group,
-            state_dump_handle: Some(dump_handle),
-        })
     }
 
     /// Main actor loop
@@ -2692,6 +2728,57 @@ async fn capture_login_path() -> HashMap<String, String> {
     }
 }
 
+/// Fail fast with a precise message when cwd or the shell binary is missing.
+/// Kernel `ENOENT` on spawn does not say *which* path was missing.
+#[cfg(unix)]
+fn preflight_spawn_paths(binary: &str, cwd: &std::path::Path) -> Result<(), ComputerError> {
+    if !cwd.exists() {
+        return Err(ComputerError::io_with_kind(
+            format!(
+                "working directory does not exist: {} (shell binary would be {binary})",
+                cwd.display()
+            ),
+            std::io::ErrorKind::NotFound,
+        ));
+    }
+    if !cwd.is_dir() {
+        return Err(ComputerError::io(format!(
+            "working directory is not a directory: {}",
+            cwd.display()
+        )));
+    }
+    let bin = std::path::Path::new(binary);
+    if !bin.exists() {
+        return Err(ComputerError::io_with_kind(
+            format!(
+                "shell binary does not exist: {binary} (cwd={})",
+                cwd.display()
+            ),
+            std::io::ErrorKind::NotFound,
+        ));
+    }
+    Ok(())
+}
+
+/// Enrich spawn I/O errors so agents see binary + cwd, not a bare os error 2.
+fn spawn_io_error(binary: &str, cwd: &std::path::Path, err: std::io::Error) -> ComputerError {
+    let kind = err.kind();
+    let msg = if kind == std::io::ErrorKind::NotFound {
+        format!(
+            "failed to spawn shell: binary={binary:?} cwd={} : {err} \
+             (hint: missing shell binary, missing cwd, or stale cached shell path — \
+             set GROK_SHELL=/bin/bash or restart the agent)",
+            cwd.display()
+        )
+    } else {
+        format!(
+            "failed to spawn shell: binary={binary:?} cwd={} : {err}",
+            cwd.display()
+        )
+    };
+    ComputerError::io_with_kind(msg, kind)
+}
+
 /// Spawn the shell command and attach the child to a [`ProcessGroup`].
 ///
 /// The returned `ProcessGroup` is what the teardown helpers
@@ -2710,8 +2797,9 @@ fn spawn_shell_command(
     // shell wrapper below; keep them live on Windows to avoid unused-arg warnings.
     #[cfg(not(unix))]
     let _ = (&login_env, &search_shadows);
+
     #[cfg(unix)]
-    let mut cmd = {
+    {
         let shell = shell_state::ShellKind::detect();
         let wrapped_command = {
             let inject = super::embedded_search_tools::search_injection(search_shadows);
@@ -2721,58 +2809,93 @@ fn spawn_shell_command(
                 format!("{inject}{command}")
             }
         };
-        let mut cmd = tokio::process::Command::new(shell.binary_path());
-        // Non-interactive zsh still defaults to NOMATCH; pass via argv like init's -o extendedglob.
-        if matches!(shell, shell_state::ShellKind::Zsh) {
-            cmd.arg("-o").arg("nonomatch");
-        }
-        cmd.arg("-c")
-            .arg(&wrapped_command)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // NOTE: do NOT set .process_group(0) here — std runs setpgid()
-            // BEFORE pre_exec hooks, which would make the child a process
-            // group leader and cause setsid() to fail with EPERM.
-            // detach_from_tty() handles both session and process group creation.
-            .kill_on_drop(true);
 
-        // Apply env vars from the request (e.g., .envrc, color vars, ACP-provided vars).
-        cmd.envs(shell_state::shell_env_overrides());
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-        cmd.envs(crate::util::pager_env());
+        let mut attempt = 0u8;
+        let mut binary = shell.binary_path();
+        loop {
+            attempt += 1;
+            if let Err(ce) = preflight_spawn_paths(&binary, cwd) {
+                let kind = ce.io_error_kind().unwrap_or(std::io::ErrorKind::Other);
+                return Err(std::io::Error::new(kind, ce.to_string()));
+            }
 
-        // Inject the user's login-shell PATH LAST so tools installed via rc
-        // files (.bashrc, .zshrc, virtualenvs) are always discoverable. The
-        // request env often carries a copy of the parent process's PATH which
-        // doesn't include rc-file additions — applying login PATH after the
-        // request env ensures those additions aren't clobbered.
-        if let Some(login) = login_env {
-            cmd.envs(login);
-        }
-        // Agent marker must win over request/login env.
-        crate::util::apply_grok_agent_marker(&mut cmd);
+            let mut cmd = tokio::process::Command::new(&binary);
+            // Non-interactive zsh still defaults to NOMATCH; pass via argv like init's -o extendedglob.
+            if matches!(shell, shell_state::ShellKind::Zsh) {
+                cmd.arg("-o").arg("nonomatch");
+            }
+            cmd.arg("-c")
+                .arg(&wrapped_command)
+                .current_dir(cwd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                // NOTE: do NOT set .process_group(0) here — std runs setpgid()
+                // BEFORE pre_exec hooks, which would make the child a process
+                // group leader and cause setsid() to fail with EPERM.
+                // detach_from_tty() handles both session and process group creation.
+                .kill_on_drop(true);
 
-        // Detach from the controlling terminal so subprocesses cannot open
-        // /dev/tty and compete with the TUI for terminal input.
-        crate::util::detach_command(&mut cmd);
+            // Apply env vars from the request (e.g., .envrc, color vars, ACP-provided vars).
+            cmd.envs(shell_state::shell_env_overrides());
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+            cmd.envs(crate::util::pager_env());
 
-        // If the sandbox profile restricts network, install a seccomp BPF
-        // filter on the child that blocks connect/bind/sendto/listen/accept.
-        // The parent (grok) process retains network for the LLM API.
-        // Filesystem restrictions are already inherited from the process-level
-        // Landlock/Seatbelt sandbox — no action needed here for FS.
-        #[cfg(target_os = "linux")]
-        if xai_grok_sandbox::should_restrict_child_network() {
-            unsafe {
-                cmd.pre_exec(|| xai_grok_sandbox::child_net::install_child_network_filter());
+            // Inject the user's login-shell PATH LAST so tools installed via rc
+            // files (.bashrc, .zshrc, virtualenvs) are always discoverable. The
+            // request env often carries a copy of the parent process's PATH which
+            // doesn't include rc-file additions — applying login PATH after the
+            // request env ensures those additions aren't clobbered.
+            if let Some(login) = login_env {
+                cmd.envs(login);
+            }
+            // Agent marker must win over request/login env.
+            crate::util::apply_grok_agent_marker(&mut cmd);
+
+            // Detach from the controlling terminal so subprocesses cannot open
+            // /dev/tty and compete with the TUI for terminal input.
+            crate::util::detach_command(&mut cmd);
+
+            // If the sandbox profile restricts network, install a seccomp BPF
+            // filter on the child that blocks connect/bind/sendto/listen/accept.
+            // The parent (grok) process retains network for the LLM API.
+            // Filesystem restrictions are already inherited from the process-level
+            // Landlock/Seatbelt sandbox — no action needed here for FS.
+            #[cfg(target_os = "linux")]
+            if xai_grok_sandbox::should_restrict_child_network() {
+                unsafe {
+                    cmd.pre_exec(|| xai_grok_sandbox::child_net::install_child_network_filter());
+                }
+            }
+
+            let mut group = crate::util::ProcessGroup::new()?;
+            match cmd.spawn() {
+                Ok(child) => {
+                    if let Err(e) = group.attach(&child) {
+                        tracing::debug!("Failed to attach child to ProcessGroup: {e}");
+                    }
+                    return Ok((child, group));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => {
+                    let fresh = shell.refresh_binary_path();
+                    tracing::warn!(
+                        old = %binary,
+                        new = %fresh,
+                        "shell spawn ENOENT; retrying with refreshed shell path"
+                    );
+                    binary = fresh;
+                    continue;
+                }
+                Err(e) => {
+                    let ce = spawn_io_error(&binary, cwd, e);
+                    let kind = ce.io_error_kind().unwrap_or(std::io::ErrorKind::Other);
+                    return Err(std::io::Error::new(kind, ce.to_string()));
+                }
             }
         }
-        cmd
-    };
+    }
 
     #[cfg(not(unix))]
     let mut build_cmd = |with_breakaway: bool| {
@@ -2818,11 +2941,6 @@ fn spawn_shell_command(
         cmd
     };
 
-    #[cfg(unix)]
-    let mut group = crate::util::ProcessGroup::new()?;
-    #[cfg(unix)]
-    let child = cmd.spawn()?;
-
     #[cfg(not(unix))]
     let (child, mut group) = {
         let group = crate::util::ProcessGroup::new()?;
@@ -2849,10 +2967,13 @@ fn spawn_shell_command(
         }
     };
 
-    if let Err(e) = group.attach(&child) {
-        tracing::debug!("Failed to attach child to ProcessGroup: {e}");
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = group.attach(&child) {
+            tracing::debug!("Failed to attach child to ProcessGroup: {e}");
+        }
+        Ok((child, group))
     }
-    Ok((child, group))
 }
 
 fn extract_exit_status(status: std::process::ExitStatus) -> ExitStatus {
