@@ -763,18 +763,15 @@ mod tests {
         }
     }
 
-    /// Verify that setsid() prevents hook child processes from opening
+    /// Verify that TTY detach prevents hook child processes from opening
     /// `/dev/tty`. This is the core fix for GPG pinentry corruption.
     ///
-    /// The hook tries `exec 3>/dev/tty` — if detached, this fails and the
-    /// shell exits 1 (caught by `||`), making the overall command exit 0.
-    /// If NOT detached, the open succeeds and the command exits 1.
+    /// The hook probes `(: >/dev/tty)` — if detached, the open fails and the
+    /// command exits 0; if still attached, it exits 1.
     #[tokio::test]
     #[cfg(unix)]
     async fn test_hook_child_cannot_open_dev_tty() {
-        // Skip in CI / environments without a controlling terminal —
-        // setsid() gets EPERM when already a session leader and the
-        // setpgid fallback doesn't detach /dev/tty.
+        // Skip in CI / environments without a controlling terminal.
         if std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/tty")
@@ -784,8 +781,12 @@ mod tests {
             return;
         }
 
-        // exit 0 if /dev/tty is inaccessible (DETACHED), exit 1 if accessible
-        let spec = make_shell_spec("exec 3>/dev/tty 2>/dev/null && exit 1 || exit 0");
+        // Probe: exit 0 if /dev/tty cannot be opened (detached), exit 1 if it
+        // can. Prefer `(: >/dev/tty)` over bare `exec 3>/dev/tty` — on bash
+        // 5.x a failed `exec`-only redirection aborts the shell with status 1
+        // before `|| exit 0` runs, so a correctly detached child looked like a
+        // failure. A colon-command redirect continues and hits `|| exit 0`.
+        let spec = make_shell_spec("(: >/dev/tty) 2>/dev/null && exit 1 || exit 0");
         let envelope = make_envelope();
         let ctx = make_ctx();
 
@@ -793,7 +794,8 @@ mod tests {
 
         assert!(
             matches!(result, HookRunnerResult::Success),
-            "hook child should not be able to open /dev/tty after setsid(), got {:?}",
+            "hook child should not be able to open /dev/tty after detach \
+             (setsid + TIOCNOTTY), got {:?}",
             result
         );
     }

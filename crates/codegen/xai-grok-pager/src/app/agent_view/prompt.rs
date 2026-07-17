@@ -602,11 +602,12 @@ impl AgentView {
                     //    that text as the next prompt.
                     // 2) Empty composer + a visible follow-up in the queue →
                     //    same as bare Enter: send the top row now.
-                    // 3) Idle / nothing to send → no-op (not send-like-Enter).
+                    // 3) Idle / nothing to send → toast (never silent no-op).
                     let text = self.prompt.text().trim().to_string();
                     let turn_running = self.session.state.is_turn_running();
                     if !text.is_empty() {
                         if !turn_running {
+                            self.show_toast("Nothing running to interrupt — press Enter to send");
                             return InputOutcome::Changed;
                         }
                         // Paste-then-immediate-send: an image probe is still
@@ -614,6 +615,7 @@ impl AgentView {
                         // completion so the not-yet-attached chip isn't dropped.
                         if self.paste_probe_in_flight > 0 {
                             self.deferred_send = Some(AgentDeferredSend::Interject);
+                            self.show_toast("Attaching image — send now when ready");
                             return InputOutcome::Changed;
                         }
                         // Drain images BEFORE set_text("") wipes the chip elements.
@@ -621,9 +623,14 @@ impl AgentView {
                         self.prompt.set_text("");
                         return InputOutcome::Action(Action::SendPromptNow { text, images });
                     }
-                    if turn_running && let Some(outcome) = self.try_send_now_queued_from_prompt() {
-                        return outcome;
+                    if turn_running {
+                        if let Some(outcome) = self.try_send_now_queued_from_prompt() {
+                            return outcome;
+                        }
+                        self.show_toast("Nothing queued to send now");
+                        return InputOutcome::Changed;
                     }
+                    self.show_toast("Nothing running to interrupt — press Enter to send");
                     return InputOutcome::Changed;
                 }
                 ActionId::ToggleMultiline => {
@@ -1438,6 +1445,70 @@ mod history_browse_panel_tests {
             "Down at the newest must still close the panel"
         );
         assert_eq!(agent.prompt.text(), "");
+    }
+}
+
+/// Send-now (InterjectPrompt) must never silent-no-op: toast or action.
+#[cfg(test)]
+mod send_now_key_tests {
+    use super::*;
+    use crate::app::agent::AgentState;
+    use crate::app::agent_view::test_fixtures::{make_agent, make_running_agent};
+    use crate::app::app_view::InputOutcome;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn ctrl_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn send_now_with_text_while_idle_toasts() {
+        let mut agent = make_agent();
+        agent.session.state = AgentState::Idle;
+        agent.prompt.set_text("please fix this");
+        let outcome = agent.handle_prompt_key_for_test(&ctrl_enter());
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(
+            agent.toast.as_ref().map(|(m, _)| m.as_str()),
+            Some("Nothing running to interrupt — press Enter to send")
+        );
+        assert_eq!(agent.prompt.text(), "please fix this", "draft preserved");
+    }
+
+    #[test]
+    fn send_now_empty_while_running_with_empty_queue_toasts() {
+        let mut agent = make_running_agent();
+        // Drop local + shared queue so nothing is force-sendable.
+        agent.session.pending_prompts.clear();
+        agent.shared_queue.clear();
+        agent.queue.sync_from_merged(
+            &agent.session.pending_prompts,
+            &agent.shared_queue,
+            None,
+            None,
+            &agent.send_now_painted_blocks,
+        );
+        agent.prompt.set_text("");
+        let outcome = agent.handle_prompt_key_for_test(&ctrl_enter());
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(
+            agent.toast.as_ref().map(|(m, _)| m.as_str()),
+            Some("Nothing queued to send now")
+        );
+    }
+
+    #[test]
+    fn send_now_with_text_while_running_emits_send_prompt_now() {
+        let mut agent = make_running_agent();
+        agent.prompt.set_text("steer left");
+        let outcome = agent.handle_prompt_key_for_test(&ctrl_enter());
+        match outcome {
+            InputOutcome::Action(Action::SendPromptNow { text, .. }) => {
+                assert_eq!(text, "steer left");
+            }
+            other => panic!("expected SendPromptNow, got {other:?}"),
+        }
+        assert!(agent.prompt.text().is_empty());
     }
 }
 

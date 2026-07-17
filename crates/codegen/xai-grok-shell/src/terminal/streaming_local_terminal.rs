@@ -1444,10 +1444,12 @@ mod tests {
             session_id: acp::SessionId::new(session_id),
         };
 
+        // Prefer `(: >/dev/tty)` over bare `exec 3>/dev/tty` (bash 5.x aborts
+        // on failed exec-only redirects so DETACHED never prints).
         let result = runner
             .run(make_request(
                 &tool_id,
-                "(exec 3>/dev/tty && echo ATTACHED || echo DETACHED) 2>/dev/null",
+                "(: >/dev/tty) 2>/dev/null && echo ATTACHED || echo DETACHED",
             ))
             .await
             .unwrap();
