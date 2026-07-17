@@ -709,12 +709,13 @@ pub async fn run(
 /// Plain-quit "Resume this session with…" lines (after terminal restore).
 /// Best-effort: closed-pane EIO/BrokenPipe must not panic (`panic = "abort"`).
 fn print_exit_resume_hint(session_id: &str, minimal: bool, w: &mut impl Write) {
+    let cli = screen_mode_relaunch::cli_hint_name();
     let _ = writeln!(w);
     let _ = writeln!(w, "Resume this session with:");
     if minimal {
-        let _ = writeln!(w, "  grok --minimal --resume {session_id}");
+        let _ = writeln!(w, "  {cli} --minimal --resume {session_id}");
     } else {
-        let _ = writeln!(w, "  grok --resume {session_id}");
+        let _ = writeln!(w, "  {cli} --resume {session_id}");
     }
 }
 /// Screen-mode relaunch failure fallback (same quit tail as plain resume).
@@ -1739,18 +1740,23 @@ mod tests {
     fn print_exit_resume_hint_writes_expected_lines() {
         let mut buf = Vec::new();
         print_exit_resume_hint("sess-abc", false, &mut buf);
+        let cli = screen_mode_relaunch::cli_hint_name();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "\nResume this session with:\n  grok --resume sess-abc\n"
+            format!("\nResume this session with:\n  {cli} --resume sess-abc\n")
         );
+        // Cargo-test binaries are not product-named → Surmount default.
+        assert_eq!(cli, screen_mode_relaunch::DEFAULT_CLI_HINT_NAME);
+        assert_eq!(cli, "grok-oss");
     }
     #[test]
     fn print_exit_resume_hint_includes_minimal_flag() {
         let mut buf = Vec::new();
         print_exit_resume_hint("sess-abc", true, &mut buf);
+        let cli = screen_mode_relaunch::cli_hint_name();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "\nResume this session with:\n  grok --minimal --resume sess-abc\n"
+            format!("\nResume this session with:\n  {cli} --minimal --resume sess-abc\n")
         );
     }
     #[test]

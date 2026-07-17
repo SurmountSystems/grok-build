@@ -551,7 +551,10 @@ async fn run_remove(name: &str, requested_scope: Option<McpScope>) -> Result<()>
             eprintln!("MCP server '{name}' exists in multiple scopes:");
             eprintln!("  user: {}", display_user_grok_path("config.toml"));
             eprintln!("  project: {}", project_path.display());
-            eprintln!("Specify which one to remove, e.g.: grok mcp remove {name} --scope project");
+            eprintln!(
+                "Specify which one to remove, e.g.: {} mcp remove {name} --scope project",
+                crate::app::screen_mode_relaunch::cli_hint_name()
+            );
             std::process::exit(1);
         }
     };
