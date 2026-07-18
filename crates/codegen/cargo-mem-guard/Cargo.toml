@@ -1,0 +1,22 @@
+# Standalone crate (not a monorepo workspace member). Built via flake
+# `.#cargo-mem-guard` with a filtered src root so crane does not see
+# the parent workspace Cargo.toml.
+[workspace]
+
+[package]
+name = "cargo-mem-guard"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Memory-aware cargo wrapper: throttle jobs under pressure, restart with fewer jobs, optional mold"
+authors = ["Surmount"]
+publish = false
+
+[[bin]]
+name = "cargo-mem-guard"
+path = "src/main.rs"
+
+[profile.release]
+lto = false
+codegen-units = 16
+

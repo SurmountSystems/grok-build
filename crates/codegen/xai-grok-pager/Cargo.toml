@@ -285,7 +285,4 @@ default-bazel = [
 jemalloc = []
 sandbox-enforce = ["xai-grok-sandbox/enforce"]
 release-dist = []
-# Exposes test-only view-model constructors/setters (e.g. `test_agent_view`,
-# `AgentSession::set_yolo_mode_for_test`) to sibling crates' test builds — used
-# by `xai-grok-pager-minimal`'s unit tests. Never enabled in production builds.
-test-support = ["xai-grok-pager-render/test-support"]
+

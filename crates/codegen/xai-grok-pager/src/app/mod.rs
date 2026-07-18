@@ -13,6 +13,8 @@ pub mod actions;
 pub mod agent;
 pub mod agent_view;
 pub mod app_view;
+/// Auto-run `/implement` follow-ups from the prior user prompt after a turn ends.
+pub mod auto_implement;
 pub mod bundle;
 pub mod cli;
 pub use crate::link_opener;
