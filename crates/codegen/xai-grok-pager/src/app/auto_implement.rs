@@ -148,12 +148,12 @@ fn find_followup_implement_offset(text: &str) -> Option<usize> {
             }
             // Mid-line: "Review the PR. /implement …"
             for unit in split_sentences(line) {
-                if is_implement_command_sentence(&unit) {
-                    if let Some(rel) = find_implement_token_offset(line) {
-                        let before = line[..rel].trim();
-                        if !before.is_empty() || saw_non_implement {
-                            return Some(pos + rel);
-                        }
+                if is_implement_command_sentence(&unit)
+                    && let Some(rel) = find_implement_token_offset(line)
+                {
+                    let before = line[..rel].trim();
+                    if !before.is_empty() || saw_non_implement {
+                        return Some(pos + rel);
                     }
                 }
             }

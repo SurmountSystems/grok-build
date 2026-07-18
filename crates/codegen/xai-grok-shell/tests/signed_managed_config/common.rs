@@ -172,12 +172,15 @@ pub fn signed_team_body(
     requirements: Option<&str>,
 ) -> String {
     let payload = SignedPayload {
+        typ: signed_policy::MANAGED_POLICY_TYP.into(),
         version: prod_mc_cli_chat_proxy_types::SIGNED_PAYLOAD_VERSION,
         deployment_id: None,
         team_id: Some(team_id.to_owned()),
         managed_config: managed.map(str::to_owned),
         requirements: requirements.map(str::to_owned),
-        fail_closed: requirements.is_some_and(xai_grok_config::fail_closed_flag_from_str),
+        // Match production: parse served requirements via the shared flag API.
+        fail_closed: requirements
+            .is_some_and(|r| prod_mc_cli_chat_proxy_types::fail_closed_flag_status(r).is_enabled()),
         expires_at: TEST_EXPIRES_AT,
         key_id: TEST_KEY_ID.into(),
     };

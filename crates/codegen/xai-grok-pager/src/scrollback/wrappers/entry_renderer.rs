@@ -1484,9 +1484,12 @@ mod tests {
     #[test]
     fn background_block_gutter_uses_block_background_fill() {
         // Background blocks own the gutter via the existing full-area fill, so
-        // the no-bg clear must not run for them. Concrete theme so bg_light !=
-        // bg_base (Theme::current() quantizes both to Reset in the test env).
-        let theme = Theme::groknight();
+        // the no-bg clear must not run for them. Pin GrokNight: UserPrompt
+        // line bands read `Theme::current()` (not the EntryRenderer theme
+        // handle), and under nextest a fresh process otherwise seeds from the
+        // developer's `~/.grok/config.toml` (e.g. oscura-midnight).
+        let _pin = pin_theme();
+        let theme = Theme::current();
         assert_ne!(
             theme.bg_light, theme.bg_base,
             "test premise: block bg must differ from base bg"

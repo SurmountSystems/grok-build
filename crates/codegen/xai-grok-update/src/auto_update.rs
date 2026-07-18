@@ -1198,13 +1198,15 @@ async fn download_verified_from_base(
 
     eprintln!("  Downloading grok v{} ({})...", version, platform);
 
-    // Published already +x (see `publish_downloaded_artifact`).
-    download_cli_artifact_from_gcs(gcs_base_url, &binary_name, &binary_path, true).await?;
-
-    // Smoke-test: run the binary before activating it. A truncated or
-    // corrupt download is caught here and never becomes the active grok.
-    if !smoke_test_binary(&binary_path).await {
-        let _ = tokio::fs::remove_file(&binary_path).await;
+    // Stage into a unique path, smoke-test the stage, then rename onto the
+    // shared versioned name. Never smoke or delete the shared dest: concurrent
+    // same-version installers race on that path (unlink / ETXTBSY under
+    // another racer's smoke → "downloaded binary failed to run").
+    // download_* writes via its own unique tmp then renames onto `staging`.
+    let staging = tmp_download_path(&binary_path);
+    download_cli_artifact_from_gcs(gcs_base_url, &binary_name, &staging, true).await?;
+    if !smoke_test_binary(&staging).await {
+        let _ = tokio::fs::remove_file(&staging).await;
         // No prefix: run_install_script's wrap adds "Auto-update failed:".
         anyhow::bail!(
             "downloaded binary failed to run.\n\
@@ -1213,6 +1215,7 @@ async fn download_verified_from_base(
             manual_install_cmd()
         );
     }
+    tokio::fs::rename(&staging, &binary_path).await?;
 
     Ok(VerifiedDownload {
         version,

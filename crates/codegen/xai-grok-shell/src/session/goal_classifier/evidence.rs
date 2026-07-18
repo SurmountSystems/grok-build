@@ -1575,10 +1575,24 @@ mod tests {
     /// Run a `git` subcommand from `cwd`; panic on non-zero exit so
     /// test setup failures are loud. Used to script the lazy-baseline
     /// scenarios below.
+    ///
+    /// Masks host global/system git config (`commit.gpgsign`,
+    /// `core.hooksPath`, etc.) so fixture commits in temp repos are
+    /// hermetic and do not trip developer-machine signing hooks.
     fn git(cwd: &std::path::Path, args: &[&str]) {
         let output = std::process::Command::new(super::git_bin())
             .args(args)
             .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .expect("spawn git");
         assert!(
@@ -1597,6 +1611,16 @@ mod tests {
             .args(args)
             .env("GIT_AUTHOR_DATE", &date)
             .env("GIT_COMMITTER_DATE", &date)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .current_dir(cwd)
             .output()
             .expect("spawn git");

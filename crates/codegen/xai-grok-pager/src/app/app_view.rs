@@ -8502,6 +8502,9 @@ pub(crate) mod tests {
             .push_block(crate::scrollback::RenderBlock::agent_message(
                 "hello world this should wrap across lines",
             ));
+        // push_block may auto-select; clear so mouse-up is a select, not
+        // OpenBlockViewer (click-already-selected open parity).
+        agent.scrollback.set_selected(None);
         agent.scrollback.prepare_layout(40, 10);
         let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 40, 20));
         let _ = agent.draw(
@@ -8557,6 +8560,9 @@ pub(crate) mod tests {
         agent
             .scrollback
             .push_block(crate::scrollback::RenderBlock::agent_message("hello world"));
+        // push_block may auto-select; clear so mouse-up performs selection
+        // (not OpenBlockViewer for an already-selected openable row).
+        agent.scrollback.set_selected(None);
         agent.scrollback.prepare_layout(40, 10);
         let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 40, 20));
         let _ = agent.draw(

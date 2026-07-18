@@ -71,6 +71,22 @@ pub async fn git_cli(cwd: &Path, args: &[&str]) -> Result<String> {
     for &(key, val) in xai_tty_utils::GIT_AUTH_SUPPRESSION_ENVS.iter() {
         cmd.env(key, val);
     }
+    // Unit tests create fixture commits in temp repos. Mask host global/system
+    // git config so developer `core.hooksPath` / `commit.gpgsign` cannot make
+    // those fixtures fail. Production binaries are not built with `cfg(test)`.
+    #[cfg(test)]
+    {
+        cmd.env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t.com")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0");
+    }
     cmd.stdin(std::process::Stdio::null());
     xai_grok_tools::util::detach_command(&mut cmd);
     cmd.envs(xai_grok_tools::util::pager_env());

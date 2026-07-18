@@ -126,9 +126,21 @@ pub fn git_workdir() -> TempDir {
     let path = dir.path();
 
     fn run_git(args: &[&str], dir: &Path) {
+        // Mask host global/system git config so developer `core.hooksPath` /
+        // `commit.gpgsign` cannot block fixture commits in temp workdirs.
         let output = Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .unwrap_or_else(|e| panic!("failed to spawn git {}: {e}", args.join(" ")));
         assert!(
@@ -144,11 +156,12 @@ pub fn git_workdir() -> TempDir {
     // Configure git user for commits (required in CI where no global config exists)
     run_git(&["config", "user.email", "test@test.com"], path);
     run_git(&["config", "user.name", "Test"], path);
+    run_git(&["config", "commit.gpgsign", "false"], path);
 
     std::fs::write(path.join("README.md"), "test file\n").expect("write test file");
 
     run_git(&["add", "-A"], path);
-    run_git(&["commit", "-m", "init", "--no-gpg-sign"], path);
+    run_git(&["commit", "-m", "init"], path);
 
     dir
 }

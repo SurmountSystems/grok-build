@@ -428,6 +428,9 @@ fn force_mold_rustflags(raw: &str) -> String {
 /// Others (notably `fmt`) reject `-j` and must only get `CARGO_BUILD_JOBS` via
 /// env if anything — injecting argv `-j` breaks GHA `just test` under
 /// `CI_LOW_MEM` (`cargo fmt -j 2 --all -- --check`).
+///
+/// `nextest` is handled separately: `cargo nextest run` takes
+/// `--build-jobs` / `-j` (test threads), not cargo's `-j`.
 fn cargo_subcommand_accepts_jobs(sub: &str) -> bool {
     matches!(
         sub,
@@ -444,12 +447,46 @@ fn cargo_subcommand_accepts_jobs(sub: &str) -> bool {
     )
 }
 
+/// Drop existing job-control flags from a slice of args.
+fn strip_job_flags(rest: &[String]) -> Vec<String> {
+    let mut j = 0;
+    let mut cleaned = Vec::new();
+    while j < rest.len() {
+        let a = &rest[j];
+        if a == "-j"
+            || a == "--jobs"
+            || a == "--build-jobs"
+            || a == "--test-threads"
+        {
+            j += 2;
+            continue;
+        }
+        if let Some(restn) = a.strip_prefix("-j") {
+            if !restn.is_empty() && restn.chars().all(|c| c.is_ascii_digit()) {
+                j += 1;
+                continue;
+            }
+        }
+        if a.starts_with("--jobs=")
+            || a.starts_with("--build-jobs=")
+            || a.starts_with("--test-threads=")
+        {
+            j += 1;
+            continue;
+        }
+        cleaned.push(rest[j].clone());
+        j += 1;
+    }
+    cleaned
+}
+
 /// Insert or replace cargo -j N so restarts actually reduce parallelism.
 /// Only injects for job-aware cargo subcommands (build/check/test/clippy/...).
+/// `cargo nextest run` gets `--build-jobs` + `-j` (test threads).
 /// Meta invocations (`cargo --version`) and non-job subcommands (`fmt`) only
 /// get `CARGO_BUILD_JOBS` via env in [`run_once`].
 fn with_jobs_args(cmd: &[String], jobs: u32) -> Vec<String> {
-    let mut out = Vec::with_capacity(cmd.len() + 2);
+    let mut out = Vec::with_capacity(cmd.len() + 4);
     let mut i = 0;
     if let Some(bin) = cmd.first() {
         out.push(bin.clone());
@@ -480,34 +517,33 @@ fn with_jobs_args(cmd: &[String], jobs: u32) -> Vec<String> {
     let sub = cmd[i].as_str();
     out.push(cmd[i].clone());
     i += 1;
+
+    // cargo nextest run|run-partition → --build-jobs N -j N
+    if sub == "nextest" {
+        if i < cmd.len() && !cmd[i].starts_with('-') {
+            let nsub = cmd[i].as_str();
+            out.push(cmd[i].clone());
+            i += 1;
+            if matches!(nsub, "run" | "run-partition") {
+                let cleaned = strip_job_flags(&cmd[i..]);
+                out.push("--build-jobs".into());
+                out.push(jobs.to_string());
+                out.push("-j".into());
+                out.push(jobs.to_string());
+                out.extend(cleaned);
+                return out;
+            }
+        }
+        out.extend(cmd[i..].iter().cloned());
+        return out;
+    }
+
     if !cargo_subcommand_accepts_jobs(sub) {
         // e.g. `cargo fmt` — pass through without -j.
         out.extend(cmd[i..].iter().cloned());
         return out;
     }
-    // Drop existing -j / --jobs on the remainder
-    let rest = &cmd[i..];
-    let mut j = 0;
-    let mut cleaned = Vec::new();
-    while j < rest.len() {
-        let a = &rest[j];
-        if a == "-j" || a == "--jobs" {
-            j += 2;
-            continue;
-        }
-        if let Some(restn) = a.strip_prefix("-j") {
-            if !restn.is_empty() && restn.chars().all(|c| c.is_ascii_digit()) {
-                j += 1;
-                continue;
-            }
-        }
-        if a.starts_with("--jobs=") {
-            j += 1;
-            continue;
-        }
-        cleaned.push(rest[j].clone());
-        j += 1;
-    }
+    let cleaned = strip_job_flags(&cmd[i..]);
     out.push("-j".into());
     out.push(jobs.to_string());
     out.extend(cleaned);
@@ -794,6 +830,75 @@ mod tests {
             vec!["cargo", "fmt", "--all", "--", "--check"]
         );
         assert!(!out.iter().any(|a| a == "-j" || a.starts_with("-j") || a.starts_with("--jobs")));
+    }
+
+    #[test]
+    fn with_jobs_nextest_run_injects_build_jobs_and_test_threads() {
+        // `just test-unit` under CI_LOW_MEM: cargo-mem-guard wraps
+        // `cargo nextest run --workspace --locked`. nextest rejects cargo's
+        // bare `-j` placement; it wants `--build-jobs` + `-j` (test threads).
+        let cmd = vec![
+            "cargo".into(),
+            "nextest".into(),
+            "run".into(),
+            "--workspace".into(),
+            "--locked".into(),
+        ];
+        let out = with_jobs_args(&cmd, 2);
+        assert_eq!(
+            out,
+            vec![
+                "cargo",
+                "nextest",
+                "run",
+                "--build-jobs",
+                "2",
+                "-j",
+                "2",
+                "--workspace",
+                "--locked",
+            ]
+        );
+    }
+
+    #[test]
+    fn with_jobs_nextest_run_replaces_existing_job_flags() {
+        let cmd = vec![
+            "cargo".into(),
+            "nextest".into(),
+            "run".into(),
+            "--build-jobs=8".into(),
+            "-j".into(),
+            "16".into(),
+            "--workspace".into(),
+        ];
+        let out = with_jobs_args(&cmd, 1);
+        assert_eq!(
+            out,
+            vec![
+                "cargo",
+                "nextest",
+                "run",
+                "--build-jobs",
+                "1",
+                "-j",
+                "1",
+                "--workspace",
+            ]
+        );
+        assert!(!out.iter().any(|a| a.starts_with("--build-jobs=")));
+    }
+
+    #[test]
+    fn with_jobs_nextest_list_does_not_inject() {
+        let cmd = vec![
+            "cargo".into(),
+            "nextest".into(),
+            "list".into(),
+            "--workspace".into(),
+        ];
+        let out = with_jobs_args(&cmd, 2);
+        assert_eq!(out, vec!["cargo", "nextest", "list", "--workspace"]);
     }
 
     #[test]

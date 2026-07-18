@@ -280,6 +280,8 @@
               [
                 rustToolchain
                 cargo-mem-guard
+                # Process-per-test runner used by `just test-unit`.
+                pkgs.cargo-nextest
                 pkgs.pkg-config
                 pkgs.protobuf
                 pkgs.cmake
@@ -300,7 +302,7 @@
               "/share"
             ];
             meta = {
-              description = "Host CI toolchain: fenix rustc, cargo-mem-guard, mold, build deps";
+              description = "Host CI toolchain: fenix rustc, cargo-nextest, cargo-mem-guard, mold, build deps";
               homepage = "https://github.com/SurmountSystems/grok-oss";
               license = lib.licenses.asl20;
             };
@@ -317,6 +319,7 @@
               pkgs.git
               pkgs.ripgrep
               cargo-mem-guard
+              pkgs.cargo-nextest
             ]
             ++ lib.optionals pkgs.stdenv.isLinux [
               pkgs.dbus

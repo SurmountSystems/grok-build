@@ -117,9 +117,9 @@ default:
 # GHA (see .github/workflows/ci.yml): single `quality` job → just ci-prep && just test.
 #
 # `just test` = quality gate (fmt, clippy -D warnings, workspace unit/integration
-# tests including offline openrouter_credentials, mem-guard). No separate
-# OpenRouter GHA job — a second Nix cold-start for one cargo test target was
-# redundant with `cargo test --workspace`.
+# tests including offline openrouter_credentials via cargo-nextest, mem-guard).
+# No separate OpenRouter GHA job — a second Nix cold-start for one cargo test
+# target was redundant with `cargo nextest run --workspace`.
 #
 # `just test-extra` = local-only extras CI does not run (cross-target clippy,
 # nix_retry smoke).
@@ -194,9 +194,12 @@ cargo-ci +cmd:
     # agent runtime) often export NO_COLOR=1, which quantizes every theme
     # color to Reset and collapses accent_skill vs text_primary checks.
     # Match CI (no NO_COLOR) so local `just test` is deterministic.
+    #
+    # Same for CARGO_TERM_COLOR=never: nextest binds --color to that env and
+    # drops its progress UI / live status when color is forced off. Unset so
+    # nextest/cargo use auto (TTY -> rich UI; pipe/CI -> plain).
     unset NO_COLOR
-    # Developer machines often export OPENROUTER_API_KEY / have Zed keychain
-    # entries; unit tests assert NotAuthenticated / empty stores. Match CI.
+    unset CARGO_TERM_COLOR
     # Developer machines often export OPENROUTER_API_KEY and/or have Zed
     # OpenRouter keys in the OS keychain; unit tests assert NotAuthenticated
     # and that default catalog entries lack live credentials. Match CI.
@@ -223,10 +226,11 @@ dev-ci:
 # runfiles) break plain cargo. Not --all-targets on clippy: unit/integration
 # tests pull cross-crate `cfg(test)` seams that Bazel injects via default-bazel;
 # those need per-crate test-support (partially wired). Clippy therefore lints
-# production surfaces (--lib --bins). Tests run via cargo test (enables
-# cfg(test) on the crate under test).
+# production surfaces (--lib --bins). Unit/integration tests run via
+# cargo-nextest (process-per-test isolation for globals like theme cache).
+# Doctests stay on `cargo test --doc` (nextest does not run rustdoc tests).
 #
-# Covers: fmt check, clippy -D warnings (lib+bins), workspace tests, doctests,
+# Covers: fmt check, clippy -D warnings (lib+bins), workspace nextest, doctests,
 # cargo-mem-guard (workspace-excluded).
 test: test-fmt test-clippy test-unit test-doc test-mem-guard
     @echo "just test passed"
@@ -243,9 +247,12 @@ test-clippy:
     @echo "==> cargo clippy --workspace --lib --bins (-D warnings)"
     just cargo-ci cargo clippy --workspace --lib --bins --locked -- -D warnings
 
+# Process-per-test runner. Requires cargo-nextest on PATH (devShell / ci-tools /
+# or `cargo install cargo-nextest`). Under CI_LOW_MEM, cargo-mem-guard wraps the
+# whole `cargo nextest` invocation and caps compile jobs via CARGO_BUILD_JOBS.
 test-unit:
-    @echo "==> cargo test --workspace"
-    just cargo-ci cargo test --workspace --locked
+    @echo "==> cargo nextest run --workspace"
+    just cargo-ci cargo nextest run --workspace --locked
 
 test-doc:
     @echo "==> cargo test --workspace --doc"

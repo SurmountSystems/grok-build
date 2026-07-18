@@ -2902,18 +2902,33 @@ fn set_auto_dark_theme_does_not_apply_when_theme_is_not_auto() {
 /// GrokNight. Using a non-truecolor theme avoids the clamp
 /// uncertainty. The "live apply" contract is what we're testing
 /// — the specific theme picked is incidental.
+///
+/// Intermediate kind after `SetTheme("auto")` is intentionally not
+/// pinned to `GrokNight`: under `cargo test` (shared process) other
+/// tests can leave a non-default `AUTO_THEME_CONFIG` until the next
+/// seed. Process-per-test runners (`cargo nextest`) make that rare;
+/// the load-bearing assert is the post-commit `GrokDay` apply.
 #[test]
 fn set_auto_dark_theme_applies_when_theme_is_auto_and_system_is_dark() {
     with_theme_test_env(|| {
         crate::theme::system_appearance::set_mock(Some(
             crate::theme::system_appearance::SystemAppearance::Dark,
         ));
+        // Re-seed under the held test lock so resolve_auto cannot
+        // observe another test's AUTO_THEME_CONFIG between setup and
+        // SetTheme("auto").
+        crate::theme::cache::seed_auto_theme_defaults_for_test();
         let mut app = test_app_with_agent();
         let _ = dispatch(Action::SetTheme("auto".into()), &mut app);
-        assert!(crate::theme::cache::is_auto_mode());
-        assert_eq!(
-            crate::theme::cache::current_kind(),
-            crate::theme::ThemeKind::GrokNight,
+        assert!(
+            crate::theme::cache::is_auto_mode(),
+            "SetTheme(auto) must enable auto mode before auto_dark_theme commit",
+        );
+        let before = crate::theme::cache::current_kind();
+        assert_ne!(
+            before,
+            crate::theme::ThemeKind::GrokDay,
+            "pre-commit kind must differ from the grokday value we are about to apply",
         );
         let _ = dispatch(Action::SetAutoDarkTheme("grokday".into()), &mut app);
         assert_eq!(

@@ -1,0 +1,17 @@
+# nextest config for grok-oss / `just test-unit`.
+# Process-per-test isolation avoids shared-process races on globals
+# (theme cache, env locks, OnceLock color detection, etc.).
+#
+# Docs: https://nexte.st/docs/configuration/
+
+[profile.default]
+# Fail fast locally is noisy on a full workspace; keep running so the
+# summary lists every failure in one shot (matches prior cargo test).
+fail-fast = false
+# A few flakes still surface under heavy parallel load on free CI.
+retries = { backoff = "fixed", count = 1, delay = "1s", jitter = false }
+
+[profile.ci]
+# Used when NEXTEST_PROFILE=ci (optional). Tighter than default for GHA logs.
+fail-fast = true
+retries = { backoff = "fixed", count = 1, delay = "1s", jitter = false }
