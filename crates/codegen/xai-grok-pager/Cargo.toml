@@ -15,7 +15,7 @@ xai-grok-version = { workspace = true }
 xai-prompt-queue = { workspace = true }
 
 # Presentation-primitives layer (extracted)
-xai-grok-pager-render = { path = "../xai-grok-pager-render" }
+xai-grok-pager-render = { path = "../xai-grok-pager-render", features = ["test-support"] }
 
 # Rendering
 ratatui = { workspace = true, features = ["crossterm", "unstable-widget-ref"] }
@@ -269,6 +269,8 @@ name = "todo-pane-playground"
 path = "src/bin/todo_pane_playground.rs"
 
 [features]
+# Cross-crate test seams (minimal_api helpers, pager-render probes).
+test-support = ["xai-grok-pager-render/test-support"]
 default = ["jemalloc", "sandbox-enforce"]
 default-bazel = [
     "jemalloc",

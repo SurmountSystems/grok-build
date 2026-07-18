@@ -408,7 +408,7 @@ impl Default for GboomState {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};

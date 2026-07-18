@@ -58,7 +58,48 @@ const fn const_str_eq(a: &str, b: &str) -> bool {
 /// Run `f` over the trusted key set — the compiled-in [`EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS`],
 /// unless the compile-time-excluded test seam overrides it.
 fn with_embedded_keys<R>(f: impl FnOnce(&[(&str, &[u8])]) -> R) -> R {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if let Some(keys) = test_seam::override_keys() {
+            // Stable storage for the duration of `f` (keys live on the heap).
+            let owned: Vec<(&str, &[u8])> = keys
+                .iter()
+                .map(|(id, k)| (id.as_str(), k.as_slice()))
+                .collect();
+            return f(&owned);
+        }
+    }
     f(EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS)
+}
+
+/// Test-only override for [`EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS`].
+///
+/// Integration tests install a throwaway Ed25519 public key so verification
+/// can be ACTIVE without shipping a production key in the binary.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_seam {
+    use std::sync::Mutex;
+
+    type KeyOverride = Option<Vec<(String, Vec<u8>)>>;
+    static OVERRIDE: Mutex<KeyOverride> = Mutex::new(None);
+
+    /// Replace the trusted key set for this process (or clear with empty slice).
+    pub fn set_embedded_keys(keys: &[(&str, &[u8])]) {
+        let mut g = OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
+        if keys.is_empty() {
+            *g = None;
+            return;
+        }
+        *g = Some(
+            keys.iter()
+                .map(|(id, k)| ((*id).to_owned(), (*k).to_vec()))
+                .collect(),
+        );
+    }
+
+    pub(super) fn override_keys() -> Option<Vec<(String, Vec<u8>)>> {
+        OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 /// Sidecar persisted next to the policy so the load-time gate can re-verify it offline.
 pub const SIGNATURE_SIDECAR_FILE: &str = "managed_config.sig.json";

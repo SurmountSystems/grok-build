@@ -537,6 +537,41 @@ pub(in crate::app::dispatch) fn set_prompt_suggestions(
     }]
 }
 
+pub(super) fn set_auto_run_implement_inner(app: &mut AppView, new: bool) {
+    crate::appearance::cache::set_auto_run_implement(new);
+    app.current_ui.auto_run_implement = Some(new);
+}
+
+/// Set whether a sentence-leading `/implement` in the prior user prompt is
+/// auto-queued after a successful turn.
+///
+/// SHELL-OWNED: cache mirror + `[ui].auto_run_implement` via
+/// `Effect::PersistSetting`. Read at turn end, so toggling applies without a
+/// restart. Default ON for discoverability.
+pub(in crate::app::dispatch) fn set_auto_run_implement(
+    app: &mut AppView,
+    new: bool,
+) -> Vec<Effect> {
+    let prev = crate::appearance::cache::load_auto_run_implement();
+    if prev == new {
+        return vec![];
+    }
+    set_auto_run_implement_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(
+        target: "settings",
+        key = "auto_run_implement",
+        value = new,
+        "setting changed",
+    );
+    app.show_toast(&save_success_toast("Auto-run /implement", new));
+    vec![Effect::PersistSetting {
+        key: "auto_run_implement",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
 pub(super) fn set_keep_text_selection_inner(kind: crate::appearance::TextSelection) {
     crate::appearance::cache::set_keep_text_selection(kind);
 }

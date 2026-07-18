@@ -14,13 +14,14 @@ use xai_grok_shell::auth::credentials_store::{
     BEARER_USERNAME, CredentialsStore, FORCE_FILE_ENV, SERVICE_NAME,
 };
 use xai_grok_shell::auth::harness_secrets::{
-    GROK_ZED_CONFIG_DIR_ENV, ZED_DEVELOPMENT_CREDENTIALS_FILE, parse_zed_development_credentials,
-    probe_shared_openrouter_key, read_zed_development_credentials_at, zed_config_dir,
-    zed_development_credentials_path, zed_windows_credential_target,
+    DISABLE_SHARED_HARNESS_ENV, GROK_ZED_CONFIG_DIR_ENV, ZED_DEVELOPMENT_CREDENTIALS_FILE,
+    parse_zed_development_credentials, probe_shared_openrouter_key,
+    read_zed_development_credentials_at, zed_config_dir, zed_development_credentials_path,
+    zed_windows_credential_target,
 };
 use xai_grok_shell::auth::openrouter::{
-    OPENROUTER_API_KEY_ENV, OPENROUTER_API_URL, clear_openrouter_api_key, is_openrouter_base_url,
-    load_openrouter_api_key, store_openrouter_api_key, OpenRouterAuthError,
+    OPENROUTER_API_KEY_ENV, OPENROUTER_API_URL, OpenRouterAuthError, clear_openrouter_api_key,
+    is_openrouter_base_url, load_openrouter_api_key, store_openrouter_api_key,
 };
 use xai_grok_test_support::EnvGuard;
 
@@ -146,6 +147,9 @@ fn load_falls_back_to_zed_development_credentials() {
     fs::write(&zed_path, serde_json::to_vec(&map).unwrap()).unwrap();
 
     let _env = EnvGuard::unset(OPENROUTER_API_KEY_ENV);
+    // cargo-ci disables harness probes so host Zed keychain cannot pollute
+    // other tests; re-enable for this intentional interop check.
+    let _enable = EnvGuard::unset(DISABLE_SHARED_HARNESS_ENV);
     let _zed = EnvGuard::set(GROK_ZED_CONFIG_DIR_ENV, zed_dir.path().to_str().unwrap());
 
     assert_eq!(
@@ -185,6 +189,7 @@ fn store_and_clear_grok_only() {
     fs::write(&zed_path, serde_json::to_vec(&map).unwrap()).unwrap();
 
     let _env = EnvGuard::unset(OPENROUTER_API_KEY_ENV);
+    let _enable = EnvGuard::unset(DISABLE_SHARED_HARNESS_ENV);
     let _zed = EnvGuard::set(GROK_ZED_CONFIG_DIR_ENV, zed_dir.path().to_str().unwrap());
 
     store_openrouter_api_key(&store, "sk-or-grok").unwrap();

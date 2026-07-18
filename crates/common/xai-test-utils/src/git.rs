@@ -56,42 +56,25 @@ macro_rules! require_git {
 /// Initialise a fresh git repository at `path` with a dummy user config.
 ///
 /// Calls [`ensure_hermetic_git_on_path`] first so the hermetic binary is used.
+/// Masks global/system git config so host `commit.gpgsign` / hooks cannot leave
+/// an empty repo without a HEAD commit.
 pub fn init_git_repo(path: &Path) {
     ensure_hermetic_git_on_path();
-    std::process::Command::new("git")
-        .current_dir(path)
-        .args(["init"])
-        .output()
-        .unwrap();
-
-    std::process::Command::new("git")
-        .current_dir(path)
-        .args(["config", "user.email", "test@test.com"])
-        .output()
-        .unwrap();
-
-    std::process::Command::new("git")
-        .current_dir(path)
-        .args(["config", "user.name", "Test"])
-        .output()
-        .unwrap();
+    // Deterministic branch name across git versions / host init.defaultBranch.
+    run_git_with_env(path, &["-c", "init.defaultBranch=main", "init"], &[]);
+    run_git(path, &["config", "user.email", "test@test.com"]);
+    run_git(path, &["config", "user.name", "Test"]);
+    // Local-only: never inherit host signing requirements for temp repos.
+    run_git(path, &["config", "commit.gpgsign", "false"]);
 }
 
 /// Stage all files and create a commit.
 ///
 /// Calls [`ensure_hermetic_git_on_path`] first so the hermetic binary is used.
+/// Asserts success (unlike a raw `Command` that ignored non-zero exits).
 pub fn git_commit_all(path: &Path, message: &str) {
-    ensure_hermetic_git_on_path();
-    std::process::Command::new("git")
-        .current_dir(path)
-        .args(["add", "."])
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .current_dir(path)
-        .args(["commit", "-m", message])
-        .output()
-        .unwrap();
+    run_git(path, &["add", "."]);
+    run_git(path, &["commit", "--allow-empty-message", "-m", message]);
 }
 
 /// Run a git command in `dir` with a deterministic author/committer, assert

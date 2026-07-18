@@ -2,10 +2,14 @@
 
 [workspace]
 resolver = "2"
+exclude = [
+    "crates/codegen/cargo-mem-guard",
+]
 members = [
     "crates/build/xai-proto-build",
     "crates/codegen/ptyctl",
     "crates/codegen/ptyctl-cli",
+    "crates/codegen/grok-rate-limit",
     "crates/codegen/xai-acp-lib",
     "crates/codegen/xai-agent-lifecycle",
     "crates/codegen/xai-chat-state",
@@ -292,6 +296,7 @@ xai-grok-mcp = { path = "crates/codegen/xai-grok-mcp" }
 xai-grok-memory = { path = "crates/codegen/xai-grok-memory" }
 xai-grok-mermaid = { path = "crates/codegen/xai-grok-mermaid" }
 xai-grok-models = { path = "crates/codegen/xai-grok-models" }
+grok-rate-limit = { path = "crates/codegen/grok-rate-limit" }
 xai-grok-sampler = { path = "crates/codegen/xai-grok-sampler" }
 xai-grok-secrets = { path = "crates/codegen/xai-grok-secrets" }
 xai-grok-shared = { path = "crates/codegen/xai-grok-shared" }
@@ -386,6 +391,13 @@ doc_overindented_list_items = "allow"
 needless_lifetimes = "allow"
 single_range_in_vec_init = "allow"
 too_many_arguments = "allow"
+# Upstream monorepo export packs dense if/if-let chains (often one physical
+# line after rustfmt). possible_missing_else is noise against that style.
+possible_missing_else = "allow"
+# Prefer intentional nested guards in places where let-chain rewrite is noisy.
+collapsible_if = "allow"
+collapsible_else_if = "allow"
+needless_else = "allow"
 
 # Allow uninlined_format_args lint to prevent main from breaking after merges
 # When older branches (created before this lint was added to CI) get merged,

@@ -1,0 +1,22 @@
+[package]
+name = "grok-rate-limit"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+description = "Cross-process shared API rate-limit cooldowns for Grok OSS (Surmount fork)"
+authors = ["Surmount"]
+
+[dependencies]
+fs2 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
+
+[lints]
+workspace = true

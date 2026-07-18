@@ -325,6 +325,31 @@ where
         Err(_) => StreamStep::IdleTimeout,
     }
 }
+/// Build the `(client tools, hosted tools, Responses tool_choice)` triple for
+/// a compaction summarizer request.
+///
+/// Client-side tool definitions are retained so the request prefix stays
+/// aligned with turn requests (KV-cache reuse). Tool *use* is disabled via
+/// `tool_choice: none` on backends that support it (ChatCompletions,
+/// Responses). Hosted/server-side tools (`web_search`, `x_search`, …) are
+/// always stripped: the Responses API rejects `tool_choice: 'none'` when any
+/// server-side tool is present, and compaction must never invoke tools on
+/// any backend (Messages has no `none` either, so stripping is the only
+/// hard guarantee there).
+fn compaction_request_tools(
+    tools: Vec<ToolSpec>,
+    _hosted_tools: Vec<HostedTool>,
+) -> (
+    Vec<ToolSpec>,
+    Vec<HostedTool>,
+    Option<ConversationToolChoice>,
+) {
+    let tool_choice = (!tools.is_empty()).then_some(ConversationToolChoice::None);
+    // Always clear hosted/server-side tools on compact. Responses rejects
+    // `tool_choice: none` with web_search/x_search; Messages has no `none`.
+    (tools, Vec::new(), tool_choice)
+}
+
 /// Generates a summary of the conversation for compaction.
 /// Accepts `Vec<ConversationItem>` so the Responses path can preserve
 /// encrypted reasoning. ChatCompletions converts at point of use.
@@ -333,15 +358,20 @@ where
 /// user message — use [`build_compaction_chat_history`] to construct it. The
 /// split lets callers persist the exact request payload before issuing it.
 ///
-/// `tools` / `hosted_tools` are the SAME effective definitions the turn loop
-/// attaches to normal requests. Tool definitions are serialized into the
-/// prompt prefix by every backend, so omitting them would shift the entire
-/// prefix and force a full prefill on the summarizer call — attaching them
-/// keeps the request prefix byte-identical to the turn requests so the
-/// engine reuses the session's KV cache (the whole point of the verbatim
-/// input path). Tool *use* is forbidden via `tool_choice: none` where the
-/// backend can express it (ChatCompletions, Responses); the Messages wire
-/// enum has no `none`, so that path relies on the prompt instruction alone.
+/// Client `tools` are the SAME effective definitions the turn loop attaches
+/// to normal requests. Tool definitions are serialized into the prompt prefix
+/// by every backend, so omitting them would shift the entire prefix and force
+/// a full prefill on the summarizer call — attaching them keeps the request
+/// prefix byte-identical to the turn requests so the engine reuses the
+/// session's KV cache (the whole point of the verbatim input path). Tool
+/// *use* is forbidden via `tool_choice: none` where the backend can express
+/// it (ChatCompletions, Responses); the Messages wire enum has no `none`, so
+/// that path relies on the prompt instruction alone.
+///
+/// Hosted/server-side tools (`web_search`, `x_search`, …) are **not** attached
+/// on the compact path. Responses rejects `tool_choice: 'none'` combined with
+/// server-side tools, and compact must not invoke tools on any backend —
+/// see [`compaction_request_tools`].
 ///
 /// Errors carry a [`CompactFailure`] classification so the caller can
 /// short-circuit retries on deterministic failures (4xx schema violations,
@@ -358,6 +388,8 @@ pub(crate) async fn generate_session_compact(
     wall_clock_budget_secs: u64,
 ) -> Result<CompactOutput, CompactFailure> {
     let num_messages = chat_history.len();
+    let (tools, hosted_tools, responses_tool_choice) =
+        compaction_request_tools(tools, hosted_tools);
     let output = match sampling_config.api_backend {
         ApiBackend::ChatCompletions => {
             let chat_messages: Vec<ChatRequestMessage> =
@@ -467,7 +499,7 @@ pub(crate) async fn generate_session_compact(
         ApiBackend::Responses => {
             let request = ConversationRequest {
                 items: chat_history,
-                tool_choice: (!tools.is_empty()).then_some(ConversationToolChoice::None),
+                tool_choice: responses_tool_choice,
                 tools,
                 hosted_tools,
                 model: Some(sampling_config.model.to_owned()),
@@ -724,6 +756,73 @@ pub(crate) async fn generate_session_compact(
         Ok(output)
     }
 }
+/// Policy tests for [`compaction_request_tools`]: client tools + tool_choice
+/// none for prefix alignment; hosted/server-side tools always stripped so
+/// Responses never sees `tool_choice: none` with web_search/x_search.
+#[cfg(test)]
+mod compaction_request_tools_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn client_tool(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.to_string(),
+            description: Some(format!("{name} tool")),
+            parameters: json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    #[test]
+    fn strips_hosted_tools_when_client_tools_and_tool_choice_none() {
+        let tools = vec![client_tool("read_file")];
+        let hosted = vec![
+            HostedTool::WebSearch {
+                allowed_domains: None,
+            },
+            HostedTool::XSearch,
+        ];
+        let (out_tools, out_hosted, choice) = compaction_request_tools(tools, hosted);
+        assert_eq!(out_tools.len(), 1);
+        assert_eq!(out_tools[0].name, "read_file");
+        assert!(
+            out_hosted.is_empty(),
+            "hosted/server-side tools must not ride with tool_choice none; got {out_hosted:?}"
+        );
+        assert!(
+            matches!(choice, Some(ConversationToolChoice::None)),
+            "Responses compact must forbid tool use when client tools are attached; got {choice:?}"
+        );
+    }
+
+    #[test]
+    fn strips_hosted_tools_even_when_no_client_tools() {
+        let hosted = vec![
+            HostedTool::WebSearch {
+                allowed_domains: Some(vec!["example.com".into()]),
+            },
+            HostedTool::XSearch,
+        ];
+        let (out_tools, out_hosted, choice) = compaction_request_tools(vec![], hosted);
+        assert!(out_tools.is_empty());
+        assert!(
+            out_hosted.is_empty(),
+            "compact must never attach hosted tools on any backend; got {out_hosted:?}"
+        );
+        assert!(
+            choice.is_none(),
+            "tool_choice without client tools is rejected by some backends; got {choice:?}"
+        );
+    }
+
+    #[test]
+    fn empty_inputs_yield_empty_tools_and_no_choice() {
+        let (out_tools, out_hosted, choice) = compaction_request_tools(vec![], vec![]);
+        assert!(out_tools.is_empty());
+        assert!(out_hosted.is_empty());
+        assert!(choice.is_none());
+    }
+}
+
 /// Tests for `classify_sampling_error` and `classify_response_event_error`.
 /// Pin the deterministic-vs-transient mapping for every `SamplingError`
 /// variant and for the meaningful branches of the response-event classifier

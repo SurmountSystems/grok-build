@@ -644,11 +644,36 @@ fn compute_activity(
             "Compacting…".to_string(),
             false,
         ),
-        (AgentState::TurnRunning, Some(TurnActivity::Retrying { attempt, .. })) => (
-            Style::default().fg(theme.warning),
-            format!("Retrying (attempt {attempt})…"),
-            false,
-        ),
+        (
+            AgentState::TurnRunning,
+            Some(TurnActivity::Retrying {
+                attempt,
+                max_retries,
+                reason,
+            }),
+        ) => {
+            // Unlimited budget (u32::MAX) shows attempt only; finite shows N/M.
+            let mut label = if *max_retries == u32::MAX {
+                format!("Retrying (attempt {attempt})")
+            } else {
+                format!("Retrying ({attempt}/{max_retries})")
+            };
+            let brief = reason.trim();
+            if !brief.is_empty() {
+                // Keep status line readable: first line / first 48 chars of reason.
+                let one_line = brief.lines().next().unwrap_or(brief);
+                let clipped = if one_line.chars().count() > 48 {
+                    let t: String = one_line.chars().take(45).collect();
+                    format!("{t}…")
+                } else {
+                    one_line.to_string()
+                };
+                label.push_str(" · ");
+                label.push_str(&clipped);
+            }
+            label.push('…');
+            (Style::default().fg(theme.warning), label, false)
+        }
         (AgentState::TurnRunning, Some(TurnActivity::Waiting(reason))) => (
             // Explicit wait reason (model / subagent / task output / tasks /
             // sleep): name what the agent is blocked on instead of a generic

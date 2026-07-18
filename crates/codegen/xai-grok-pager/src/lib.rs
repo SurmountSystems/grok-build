@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "test-support", allow(dead_code, unused_imports))]
 //! xai-grok-pager — Grok Build TUI.
 //!
 //! A clean-room implementation built on the v3 pager rendering engine.

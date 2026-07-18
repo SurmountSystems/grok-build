@@ -77,7 +77,6 @@ impl GrokRequestHeaders<'_> {
 /// Our inference backends only emit integer seconds (never HTTP-date),
 /// so we only handle that form. HTTP-dates silently return `None` and
 /// the caller falls back to exponential backoff.
-/// Capped at 120s to prevent absurdly long sleeps from a misbehaving upstream.
 /// Deserialize a Responses API SSE event, with a fallback for xAI-specific
 /// tool types (e.g., `x_search`) that `async_openai` can't parse.
 ///
@@ -203,12 +202,23 @@ fn record_stream_request_failure(err: &reqwest::Error) {
     span.record("error", err.to_string().as_str());
 }
 
+/// Parse `Retry-After` as integer seconds (HTTP-date forms ignored → None).
+///
+/// Grok OSS: **no default duration cap** — honor the server value fully.
+/// Optional clamp only if `GROK_MAX_RETRY_AFTER_SECS` is set (positive integer).
 fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    headers
+    let secs = headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())?;
+    let cap = std::env::var("GROK_MAX_RETRY_AFTER_SECS")
+        .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .map(|s| s.min(120))
+        .filter(|c| *c > 0);
+    Some(match cap {
+        Some(c) => secs.min(c),
+        None => secs,
+    })
 }
 
 fn extract_should_retry(headers: &reqwest::header::HeaderMap) -> Option<bool> {
@@ -2117,10 +2127,11 @@ mod tests {
     }
 
     #[test]
-    fn extract_retry_after_caps_at_120() {
+    fn extract_retry_after_honors_long_server_values_by_default() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, "3600".parse().unwrap());
-        assert_eq!(extract_retry_after(&headers), Some(120));
+        // No GROK_MAX_RETRY_AFTER_SECS → full honor (Grok OSS: no silent caps).
+        assert_eq!(extract_retry_after(&headers), Some(3600));
     }
 
     #[test]

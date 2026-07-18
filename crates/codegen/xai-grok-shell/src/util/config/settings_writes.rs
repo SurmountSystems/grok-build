@@ -192,6 +192,11 @@ pub async fn set_prompt_suggestions(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.prompt_suggestions = Some(value)).await
 }
 
+/// Persist `[ui].auto_run_implement` via `update_config`.
+pub async fn set_auto_run_implement(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.auto_run_implement = Some(value)).await
+}
+
 /// Persist `[toolset.ask_user_question].timeout_enabled` via `update_config`
 /// (the user tier of the shell's tiered resolver; the effective value is
 /// re-resolved at agent build).

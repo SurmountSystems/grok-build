@@ -458,6 +458,7 @@ mod tests {
         run_git(path, &["init", "--initial-branch", "main"]);
         run_git(path, &["config", "user.email", "test@example.com"]);
         run_git(path, &["config", "user.name", "Test User"]);
+        run_git(path, &["config", "commit.gpgsign", "false"]);
         add_commit(path, "file.txt", "initial");
     }
 
@@ -491,6 +492,16 @@ mod tests {
         let output = std::process::Command::new(git_bin)
             .current_dir(dir)
             .args(args)
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            // Mask host global/system config (commit.gpgsign, hooks, etc.).
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")
             .env("GIT_LFS_SKIP_SMUDGE", "1")

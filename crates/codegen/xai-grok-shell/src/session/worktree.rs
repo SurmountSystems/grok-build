@@ -919,37 +919,41 @@ mod tests {
             "expected registry-unavailable error, got: {msg}"
         );
     }
+    /// Hermetic git for worktree tests (mask host gpgsign / hooks).
+    fn run_git(path: &std::path::Path, args: &[&str]) {
+        crate::test_support::ensure_hermetic_git_on_path();
+        let out = std::process::Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} spawn failed: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     /// Test helper: Initialize a git repo at the given path
     fn init_git_repo(path: &std::path::Path) {
-        crate::test_support::ensure_hermetic_git_on_path();
-        std::process::Command::new("git")
-            .current_dir(path)
-            .args(["init"])
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .current_dir(path)
-            .args(["config", "user.email", "test@test.com"])
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .current_dir(path)
-            .args(["config", "user.name", "Test"])
-            .output()
-            .unwrap();
+        run_git(path, &["-c", "init.defaultBranch=main", "init"]);
+        run_git(path, &["config", "user.email", "test@test.com"]);
+        run_git(path, &["config", "user.name", "Test"]);
+        run_git(path, &["config", "commit.gpgsign", "false"]);
     }
     /// Test helper: Stage and commit all files
     fn git_commit_all(path: &std::path::Path, message: &str) {
-        std::process::Command::new("git")
-            .current_dir(path)
-            .args(["add", "."])
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .current_dir(path)
-            .args(["commit", "-m", message])
-            .output()
-            .unwrap();
+        run_git(path, &["add", "."]);
+        run_git(path, &["commit", "-m", message]);
     }
     #[tokio::test]
     async fn create_worktree_for_resume_produces_independent_worktree() {
@@ -984,18 +988,10 @@ mod tests {
         let repo_path = tmp.path().join("repo");
         std::fs::create_dir(&repo_path).unwrap();
         init_git_repo(&repo_path);
-        std::process::Command::new("git")
-            .current_dir(&repo_path)
-            .args(["checkout", "-b", "main"])
-            .output()
-            .unwrap();
+        run_git(&repo_path, &["checkout", "-b", "main"]);
         std::fs::write(repo_path.join("file.txt"), "on-main").unwrap();
         git_commit_all(&repo_path, "initial");
-        std::process::Command::new("git")
-            .current_dir(&repo_path)
-            .args(["checkout", "-b", "feature"])
-            .output()
-            .unwrap();
+        run_git(&repo_path, &["checkout", "-b", "feature"]);
         std::fs::write(repo_path.join("file.txt"), "on-feature").unwrap();
         git_commit_all(&repo_path, "feature commit");
         std::fs::write(repo_path.join("dirty.txt"), "uncommitted").unwrap();
@@ -1055,8 +1051,19 @@ mod tests {
         let out = std::process::Command::new("git")
             .current_dir(path)
             .args(["rev-parse", "HEAD"])
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .unwrap();
+        assert!(
+            out.status.success(),
+            "rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
     #[tokio::test]

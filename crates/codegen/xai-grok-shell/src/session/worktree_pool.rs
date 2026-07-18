@@ -1869,38 +1869,40 @@ pool_size = 3
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo_path = dir.path().to_path_buf();
 
-        let out = std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&repo_path)
-            .output()
-            .expect("git init");
-        assert!(out.status.success(), "git init failed");
-
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&repo_path)
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&repo_path)
-            .output();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_path)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@test.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@test.com")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} spawn failed: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["-c", "init.defaultBranch=main", "init"]);
+        run_git(&["config", "user.email", "test@test.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
 
         for i in 0..file_count {
             let file_path = repo_path.join(format!("file_{i}.txt"));
             std::fs::write(&file_path, format!("content {i}")).expect("write file");
         }
 
-        let _ = std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&repo_path)
-            .output()
-            .expect("git add");
-        let out = std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(&repo_path)
-            .output()
-            .expect("git commit");
-        assert!(out.status.success(), "git commit failed");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "initial"]);
 
         (dir, repo_path)
     }

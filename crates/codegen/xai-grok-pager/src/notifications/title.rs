@@ -240,7 +240,11 @@ fn write_activity(buf: &mut String, activity: &TurnActivity) {
             max_retries,
             ..
         } => {
-            let _ = write!(buf, "Retrying ({}/{})", attempt, max_retries);
+            if *max_retries == u32::MAX {
+                let _ = write!(buf, "Retrying (#{attempt})");
+            } else {
+                let _ = write!(buf, "Retrying ({attempt}/{max_retries})");
+            }
         }
         TurnActivity::Waiting(reason) => buf.push_str(&reason.label()),
     }
@@ -518,6 +522,18 @@ mod tests {
         };
         mgr.update(&state);
         assert_eq!(mgr.last_title, "Retrying (2/5)");
+
+        let activity = TurnActivity::Retrying {
+            attempt: 7,
+            max_retries: u32::MAX,
+            reason: "502".to_owned(),
+        };
+        let state = TitleState {
+            activity: Some(&activity),
+            ..idle_state()
+        };
+        mgr.update(&state);
+        assert_eq!(mgr.last_title, "Retrying (#7)");
     }
 
     #[test]

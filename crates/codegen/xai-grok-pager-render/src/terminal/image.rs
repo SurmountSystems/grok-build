@@ -647,5 +647,5 @@ pub fn fit_image_to_cells(img_w: u32, img_h: u32, max_cols: u16, max_rows: u16) 
 // Tests
 // =========================================================================
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod tests;

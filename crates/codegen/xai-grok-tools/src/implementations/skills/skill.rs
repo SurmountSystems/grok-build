@@ -36,6 +36,29 @@ pub struct SkillOutput {
 // Old `SkillToolImpl` + `impl Tool` deleted.
 // New implementation is in `grok_build/skill/`.
 
+/// Mint an 8-char lowercase hex run id from host OS entropy (`uuid` crate).
+///
+/// Injected into every skill envelope so orchestrator skills can use a
+/// collision-resistant id without shelling out to Python/Bash or inventing
+/// tokens in the model. Not cryptographic key material — only for artifact
+/// path uniqueness within a skill invocation.
+pub fn mint_skill_run_id() -> String {
+    let u = uuid::Uuid::new_v4();
+    let b = u.as_bytes();
+    format!("{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3])
+}
+
+/// One-line host preamble so the model cannot miss the minted id.
+fn skill_run_id_preamble(run_id: &str) -> String {
+    format!(
+        "Host-minted run_id for this skill invocation: `{run_id}`\n\
+         Use this as IMPL_ID / PLAN_ID / DESIGN_ID / REVIEW_ID / INSTANCE_ID \
+         (or any run-scoped artifact id). Do **not** mint ids via shell, \
+         Python, or model invention. The RUN_ID body placeholder expands to \
+         the same value when substitutions run.\n"
+    )
+}
+
 /// Build the formatted skill message shown to the model.
 ///
 /// Canonical formatter for skill content injection. Used by the skill tool
@@ -43,13 +66,14 @@ pub struct SkillOutput {
 /// preloading — every path that surfaces a skill to the model routes
 /// through this function so the presentation stays consistent.
 ///
-/// Format: `<skill>` envelope with name, description, and path attributes
-/// wraps the raw markdown body. The open/close tags give the model a clear
-/// identity and boundary — everything inside is additional instructions
-/// to follow, not a program being invoked.
+/// Format: `<skill>` envelope with name, description, path, and a host-minted
+/// `run_id` attribute wraps the raw markdown body. The open/close tags give
+/// the model a clear identity and boundary — everything inside is additional
+/// instructions to follow, not a program being invoked.
 ///
 /// ```text
-/// <skill name="{name}" description="{description}" path="{path}">
+/// <skill name="{name}" description="{description}" path="{path}" run_id="{id}">
+/// Host-minted run_id ...
 /// {body}
 /// </skill>
 /// ```
@@ -57,9 +81,19 @@ pub struct SkillOutput {
 /// Used on both the invocation path (skill tool, slash expansion) and
 /// preloading paths (agent definitions) — no separate instruct prefix.
 pub fn build_skill_message(skill: &SkillInfo, content: &str) -> String {
+    let run_id = mint_skill_run_id();
+    let mut body = content.to_string();
+    if body.contains("${RUN_ID}") {
+        body = body.replace("${RUN_ID}", &run_id);
+    }
     format!(
-        "<skill name=\"{}\" description=\"{}\" path=\"{}\">\n{}\n</skill>",
-        skill.name, skill.description, skill.path, content
+        "<skill name=\"{}\" description=\"{}\" path=\"{}\" run_id=\"{}\">\n{}{}\n</skill>",
+        skill.name,
+        skill.description,
+        skill.path,
+        run_id,
+        skill_run_id_preamble(&run_id),
+        body
     )
 }
 
@@ -67,18 +101,42 @@ pub fn build_skill_message(skill: &SkillInfo, content: &str) -> String {
 ///
 /// Used in the `<skill_information>` envelope when skills are expanded
 /// at prompt-assembly time (the new zero-round-trip path). Includes the
-/// `args` attribute so the model knows what arguments were provided.
+/// `args` attribute so the model knows what arguments were provided, plus a
+/// host-minted `run_id`.
+///
+/// Prefer [`build_skill_block_with_run_id`] when the same id was already used
+/// for `${RUN_ID}` substitution so envelope and body stay consistent.
 ///
 /// ```text
-/// <skill name="commit" args="fix typo">
+/// <skill name="commit" args="fix typo" run_id="a1b2c3d4">
+/// Host-minted run_id ...
 /// {body}
 /// </skill>
 /// ```
 pub fn build_skill_block(name: &str, args: &str, content: &str) -> String {
+    let run_id = mint_skill_run_id();
+    build_skill_block_with_run_id(name, args, content, &run_id)
+}
+
+/// Like [`build_skill_block`], but reuses a caller-minted `run_id` (slash path
+/// mints once for both `${RUN_ID}` substitution and the envelope attribute).
+pub fn build_skill_block_with_run_id(
+    name: &str,
+    args: &str,
+    content: &str,
+    run_id: &str,
+) -> String {
+    let mut body = content.to_string();
+    if body.contains("${RUN_ID}") {
+        body = body.replace("${RUN_ID}", run_id);
+    }
+    let preamble = skill_run_id_preamble(run_id);
     if args.is_empty() {
-        format!("<skill name=\"{name}\">\n{content}\n</skill>")
+        format!("<skill name=\"{name}\" run_id=\"{run_id}\">\n{preamble}{body}\n</skill>")
     } else {
-        format!("<skill name=\"{name}\" args=\"{args}\">\n{content}\n</skill>")
+        format!(
+            "<skill name=\"{name}\" args=\"{args}\" run_id=\"{run_id}\">\n{preamble}{body}\n</skill>"
+        )
     }
 }
 
@@ -232,6 +290,9 @@ fn escape_xml(s: &str) -> String {
 pub struct SubstitutionContext<'a> {
     pub skill_dir: Option<&'a str>,
     pub session_id: Option<&'a str>,
+    /// Host-minted per-invocation id (see [`mint_skill_run_id`]). Expanded for
+    /// `${RUN_ID}` in skill bodies.
+    pub run_id: Option<&'a str>,
     pub plugin_root: Option<&'a str>,
     pub plugin_data: Option<&'a str>,
 }
@@ -247,6 +308,7 @@ pub struct SubstitutionContext<'a> {
 /// | `$N` | | Shorthand for `$ARGUMENTS[N]` (no upper bound) |
 /// | `${SKILL_DIR}` | `${CLAUDE_SKILL_DIR}` | Directory containing the SKILL.md |
 /// | `${SESSION_ID}` | `${CLAUDE_SESSION_ID}` | Current session ID |
+/// | `${RUN_ID}` | | Host-minted 8-char hex for this skill invocation (artifact paths) |
 /// | `${GROK_PLUGIN_ROOT}` | `${CLAUDE_PLUGIN_ROOT}` | Plugin root dir (plugin-backed skills) |
 /// | `${GROK_PLUGIN_DATA}` | `${CLAUDE_PLUGIN_DATA}` | Plugin data dir (plugin-backed skills) |
 ///
@@ -338,6 +400,13 @@ pub fn apply_substitutions(content: &mut String, args: Option<&str>, ctx: &Subst
         if content.contains("${CLAUDE_SESSION_ID}") {
             *content = content.replace("${CLAUDE_SESSION_ID}", sid);
         }
+    }
+
+    // ${RUN_ID} — host entropy for this skill invocation (artifact uniqueness)
+    if let Some(rid) = ctx.run_id
+        && content.contains("${RUN_ID}")
+    {
+        *content = content.replace("${RUN_ID}", rid);
     }
 
     // Expand plugin-path tokens via the shared helper (single source of truth).
@@ -680,15 +749,26 @@ It has multiple lines."#;
         let content = "# Git Commit Skill\n\nYou are helping the user create a commit.";
         let message = build_skill_message(&skill, content);
 
-        // Assert the exact output so this breaks if any field or structural
-        // detail changes (attribute order, newlines, tags).
-        let expected = "\
-<skill name=\"commit\" description=\"Create a git commit\" path=\"/home/user/.grok/skills/commit/SKILL.md\">
-# Git Commit Skill
-
-You are helping the user create a commit.
-</skill>";
-        assert_eq!(message, expected);
+        // Host mints a fresh run_id per call — assert structure, not a fixed id.
+        assert!(
+            message.starts_with(
+                "<skill name=\"commit\" description=\"Create a git commit\" path=\"/home/user/.grok/skills/commit/SKILL.md\" run_id=\""
+            ),
+            "missing open tag with run_id: {message}"
+        );
+        assert!(message.contains("Host-minted run_id for this skill invocation:"));
+        assert!(message.contains("# Git Commit Skill"));
+        assert!(message.contains("You are helping the user create a commit."));
+        assert!(message.ends_with("</skill>"));
+        // run_id is exactly 8 lowercase hex chars
+        let start = message.find("run_id=\"").unwrap() + "run_id=\"".len();
+        let end = message[start..].find('"').unwrap() + start;
+        let rid = &message[start..end];
+        assert_eq!(rid.len(), 8, "run_id should be 8 hex chars: {rid}");
+        assert!(
+            rid.chars().all(|c| c.is_ascii_hexdigit()),
+            "run_id not hex: {rid}"
+        );
     }
 
     #[test]
@@ -706,11 +786,12 @@ You are helping the user create a commit.
         let content = "Deploy instructions.";
         let message = build_skill_message(&skill, content);
 
-        let expected = "\
-<skill name=\"deploy-v2\" description=\"Deploy \"staging\" & <prod>\" path=\"/path/with spaces/SKILL.md\">
-Deploy instructions.
-</skill>";
-        assert_eq!(message, expected);
+        assert!(message.contains(
+            "name=\"deploy-v2\" description=\"Deploy \"staging\" & <prod>\" path=\"/path/with spaces/SKILL.md\" run_id=\""
+        ));
+        assert!(message.contains("Deploy instructions."));
+        assert!(message.contains("Host-minted run_id"));
+        assert!(message.ends_with("</skill>"));
     }
 
     #[test]
@@ -724,11 +805,11 @@ Deploy instructions.
 
         let message = build_skill_message(&skill, "");
 
-        let expected = "\
-<skill name=\"empty\" description=\"An empty skill\" path=\"/skills/empty/SKILL.md\">
-
-</skill>";
-        assert_eq!(message, expected);
+        assert!(message.starts_with(
+            "<skill name=\"empty\" description=\"An empty skill\" path=\"/skills/empty/SKILL.md\" run_id=\""
+        ));
+        assert!(message.contains("Host-minted run_id"));
+        assert!(message.ends_with("</skill>"));
     }
 
     #[test]
@@ -743,18 +824,14 @@ Deploy instructions.
         let content = "# Code Review\n\nStep 1: Read the diff.\nStep 2: Check for bugs.\n\n## Checklist\n- Tests pass\n- No warnings";
         let message = build_skill_message(&skill, content);
 
-        let expected = "\
-<skill name=\"review\" description=\"Review code\" path=\"/repo/.grok/skills/review/SKILL.md\">
-# Code Review
-
-Step 1: Read the diff.
-Step 2: Check for bugs.
-
-## Checklist
-- Tests pass
-- No warnings
-</skill>";
-        assert_eq!(message, expected);
+        assert!(message.starts_with(
+            "<skill name=\"review\" description=\"Review code\" path=\"/repo/.grok/skills/review/SKILL.md\" run_id=\""
+        ));
+        assert!(message.contains("Host-minted run_id"));
+        assert!(message.contains("# Code Review"));
+        assert!(message.contains("Step 1: Read the diff."));
+        assert!(message.contains("- No warnings"));
+        assert!(message.ends_with("</skill>"));
     }
 
     // ── apply_substitutions ─────────────────────────────────────────
@@ -1161,25 +1238,44 @@ Step 2: Check for bugs.
     #[test]
     fn test_build_skill_block_with_args() {
         let block = build_skill_block("commit", "fix typo", "# Commit\n\nMake a commit.");
-        let expected = "\
-<skill name=\"commit\" args=\"fix typo\">
-# Commit
-
-Make a commit.
-</skill>";
-        assert_eq!(block, expected);
+        assert!(block.starts_with("<skill name=\"commit\" args=\"fix typo\" run_id=\""));
+        assert!(block.contains("# Commit"));
+        assert!(block.contains("Make a commit."));
+        assert!(block.contains("Host-minted run_id"));
+        assert!(block.ends_with("</skill>"));
     }
 
     #[test]
     fn test_build_skill_block_without_args() {
         let block = build_skill_block("review", "", "# Review\n\nReview code.");
-        let expected = "\
-<skill name=\"review\">
-# Review
+        assert!(block.starts_with("<skill name=\"review\" run_id=\""));
+        assert!(block.contains("# Review"));
+        assert!(block.contains("Review code."));
+        assert!(block.ends_with("</skill>"));
+    }
 
-Review code.
-</skill>";
-        assert_eq!(block, expected);
+    #[test]
+    fn test_build_skill_block_with_run_id_reuses_id_and_expands_token() {
+        let block = build_skill_block_with_run_id(
+            "implement",
+            "",
+            "Artifacts use ${RUN_ID} as IMPL_ID.",
+            "deadbeef",
+        );
+        assert!(block.starts_with("<skill name=\"implement\" run_id=\"deadbeef\">"));
+        assert!(block.contains("Host-minted run_id for this skill invocation: `deadbeef`"));
+        assert!(block.contains("Artifacts use deadbeef as IMPL_ID."));
+        assert!(!block.contains("${RUN_ID}"));
+    }
+
+    #[test]
+    fn test_mint_skill_run_id_shape() {
+        let a = mint_skill_run_id();
+        let b = mint_skill_run_id();
+        assert_eq!(a.len(), 8);
+        assert_eq!(b.len(), 8);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "successive mints should almost always differ");
     }
 
     // ── build_skill_information ─────────────────────────────────────
@@ -1200,7 +1296,7 @@ Review code.
                 "<skill name=\"commit\" path=\"/home/user/.grok/skills/commit/SKILL.md\"/>"
             )
         );
-        assert!(result.contains("<skill name=\"commit\" args=\"fix typo\">"));
+        assert!(result.contains("<skill name=\"commit\" args=\"fix typo\" run_id=\""));
     }
 
     #[test]
@@ -1224,8 +1320,8 @@ Review code.
         assert!(result.contains("<skills_referenced>\n"));
         assert!(result.contains("<skill name=\"review\" path="));
         assert!(result.contains("<skill name=\"lint\" path="));
-        assert!(result.contains("<skill name=\"review\" args=\"fix auth\">"));
-        assert!(result.contains("<skill name=\"lint\" args=\"--strict\">"));
+        assert!(result.contains("<skill name=\"review\" args=\"fix auth\" run_id=\""));
+        assert!(result.contains("<skill name=\"lint\" args=\"--strict\" run_id=\""));
     }
 
     #[test]
@@ -1255,6 +1351,21 @@ Review code.
         );
         // Both <skill> content blocks still present.
         assert_eq!(result.matches("<skill name=\"art\" args=").count(), 2);
+        assert_eq!(result.matches("run_id=\"").count(), 2);
+    }
+
+    #[test]
+    fn test_run_id_substitution() {
+        let mut content = "Impl id: ${RUN_ID}".to_string();
+        apply_substitutions(
+            &mut content,
+            None,
+            &SubstitutionContext {
+                run_id: Some("cafebabe"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(content, "Impl id: cafebabe");
     }
 
     #[test]

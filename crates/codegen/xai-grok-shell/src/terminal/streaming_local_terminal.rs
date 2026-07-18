@@ -866,7 +866,7 @@ fn spawn_shell_command(
     #[cfg(unix)]
     {
         let program = crate::terminal::default_shell_path();
-        spawn_with_argv(program, cwd, env, |cmd| {
+        spawn_with_argv(&program, cwd, env, |cmd| {
             cmd.arg("-c").arg(command);
         })
     }
@@ -1444,10 +1444,12 @@ mod tests {
             session_id: acp::SessionId::new(session_id),
         };
 
+        // Prefer `(: >/dev/tty)` over bare `exec 3>/dev/tty` (bash 5.x aborts
+        // on failed exec-only redirects so DETACHED never prints).
         let result = runner
             .run(make_request(
                 &tool_id,
-                "(exec 3>/dev/tty && echo ATTACHED || echo DETACHED) 2>/dev/null",
+                "(: >/dev/tty) 2>/dev/null && echo ATTACHED || echo DETACHED",
             ))
             .await
             .unwrap();

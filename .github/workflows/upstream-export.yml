@@ -1,0 +1,133 @@
+# Watch xai-org/grok-build for force-pushed monorepo exports.
+# Does not auto-merge. Opens/updates a tracking issue for human+agent review.
+name: Upstream export watch
+
+on:
+  schedule:
+    # Twice daily UTC
+    - cron: "17 6,18 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-export-watch
+  cancel-in-progress: true
+
+jobs:
+  detect:
+    name: Detect new xAI export
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure upstream remote
+        run: |
+          git remote add xai-org https://github.com/xai-org/grok-build.git 2>/dev/null || true
+          git remote add upstream https://github.com/xai-org/grok-build.git 2>/dev/null || true
+
+      - name: Detect
+        id: detect
+        run: |
+          set +e
+          out=$(./scripts/detect-upstream-export.sh 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          tip=$(echo "$out" | sed -n 's/^XAI_TIP=//p' | tail -1)
+          tree=$(echo "$out" | sed -n 's/^XAI_TREE=//p' | tail -1)
+          echo "xai_tip=$tip" >> "$GITHUB_OUTPUT"
+          echo "xai_tree=$tree" >> "$GITHUB_OUTPUT"
+          # Persist full log for the issue body
+          echo "$out" > /tmp/detect.log
+          exit 0
+
+      - name: Open or update tracking issue
+        if: steps.detect.outputs.exit_code == '2'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const tip = '${{ steps.detect.outputs.xai_tip }}' || 'unknown';
+            const tree = '${{ steps.detect.outputs.xai_tree }}' || 'unknown';
+            const log = fs.readFileSync('/tmp/detect.log', 'utf8');
+            const title = `Upstream export pending review: ${tip.slice(0, 12)}`;
+            const body = [
+              '## New xAI monorepo export detected',
+              '',
+              'xAI force-pushes orphan snapshots to `xai-org/grok-build`.',
+              '**Surmount history is canonical** — do not Sync fork / reset to upstream.',
+              '',
+              `| Field | Value |`,
+              `|-------|-------|`,
+              `| xAI tip | \`${tip}\` |`,
+              `| xAI tree | \`${tree}\` |`,
+              '',
+              '### Process',
+              '1. Read [docs/upstream-history.md](../blob/main/docs/upstream-history.md)',
+              '2. Run `./scripts/import-upstream-export.sh` (or agent skill `upstream-export-import`)',
+              '3. Review every contribution in the delta; re-apply fork seams',
+              '4. `just ci`; append `docs/upstream-import-log.md`',
+              '5. Signed PR into Surmount `main`',
+              '',
+              '<details><summary>detect log</summary>',
+              '',
+              '```',
+              log.slice(0, 60000),
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const labels = ['upstream-export'];
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-export',
+              per_page: 20,
+            });
+            const existing = issues.find(i => i.title.includes(tip.slice(0, 12)));
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `Re-detected.\n\n\`\`\`\n${log.slice(0, 20000)}\n\`\`\``,
+              });
+              core.info(`Commented on #${existing.number}`);
+            } else {
+              // Ensure label exists (ignore errors)
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: 'upstream-export',
+                });
+              } catch {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: 'upstream-export',
+                  color: '0052CC',
+                  description: 'xAI monorepo export awaiting import review',
+                });
+              }
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels,
+              });
+              core.info(`Opened #${created.data.number}`);
+            }
+
+      - name: Up to date
+        if: steps.detect.outputs.exit_code == '0'
+        run: echo "No new export content."

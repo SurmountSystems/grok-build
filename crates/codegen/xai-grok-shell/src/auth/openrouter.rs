@@ -32,11 +32,48 @@ pub const OPENROUTER_GROK_45_MODEL: &str = "x-ai/grok-4.5";
 /// Context window for Grok 4.5 on OpenRouter.
 pub const OPENROUTER_GROK_45_CONTEXT_WINDOW: u64 = 500_000;
 
-/// HTTP-Referer value OpenRouter uses for app attribution.
-pub const OPENROUTER_HTTP_REFERER: &str = "https://x.ai";
+/// HTTP-Referer: OpenRouter's **primary app id** (must be unique per product).
+/// Do not use `https://x.ai` — that URL is already claimed by other apps and
+/// shows up as "WebSummarizer" (etc.) in OpenRouter Logs → App.
+pub const OPENROUTER_HTTP_REFERER: &str = "https://github.com/SurmountSystems/grok-oss";
 
-/// X-Title value OpenRouter uses for app attribution.
+/// Display name for OpenRouter rankings / Logs → App column.
 pub const OPENROUTER_X_TITLE: &str = "Grok OSS";
+
+/// Preferred OpenRouter title header (docs: `X-OpenRouter-Title`; `X-Title` kept for compat).
+pub const OPENROUTER_X_OPENROUTER_TITLE_HEADER: &str = "X-OpenRouter-Title";
+
+/// Legacy title header still accepted by OpenRouter.
+pub const OPENROUTER_X_TITLE_HEADER: &str = "X-Title";
+
+/// Optional marketplace categories (cli coding agent).
+pub const OPENROUTER_CATEGORIES: &str = "cli-agent";
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    #[test]
+    fn referer_is_surmount_not_xai() {
+        assert!(OPENROUTER_HTTP_REFERER.contains("SurmountSystems/grok-oss"));
+        assert_ne!(OPENROUTER_HTTP_REFERER, "https://x.ai");
+        assert!(!OPENROUTER_HTTP_REFERER.contains("x.ai/cli"));
+    }
+
+    #[test]
+    fn title_is_grok_oss() {
+        assert_eq!(OPENROUTER_X_TITLE, "Grok OSS");
+        assert_eq!(OPENROUTER_X_OPENROUTER_TITLE_HEADER, "X-OpenRouter-Title");
+        assert_eq!(OPENROUTER_X_TITLE_HEADER, "X-Title");
+        assert_eq!(OPENROUTER_CATEGORIES, "cli-agent");
+    }
+
+    #[test]
+    fn model_slug_is_openrouter_xai_path() {
+        assert_eq!(OPENROUTER_GROK_45_MODEL, "x-ai/grok-4.5");
+        assert_eq!(OPENROUTER_GROK_45_CATALOG_ID, "openrouter-grok-4.5");
+    }
+}
 
 /// Whether `base_url` targets OpenRouter (host contains `openrouter.ai`).
 pub fn is_openrouter_base_url(base_url: &str) -> bool {
@@ -86,10 +123,7 @@ pub fn load_openrouter_api_key_default() -> Result<Option<String>, CredentialsSt
 
 /// Whether any OpenRouter credential is available (env, Grok store, or Zed/shared).
 pub fn has_openrouter_api_key() -> bool {
-    load_openrouter_api_key_default()
-        .ok()
-        .flatten()
-        .is_some()
+    load_openrouter_api_key_default().ok().flatten().is_some()
 }
 
 /// Store an OpenRouter API key. Refuses when `OPENROUTER_API_KEY` is set
@@ -118,9 +152,7 @@ pub fn clear_openrouter_api_key(store: &CredentialsStore) -> Result<(), Credenti
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenRouterAuthError {
-    #[error(
-        "{OPENROUTER_API_KEY_ENV} is set; unset it before storing a key in the secret store"
-    )]
+    #[error("{OPENROUTER_API_KEY_ENV} is set; unset it before storing a key in the secret store")]
     EnvVarSet,
     #[error("OpenRouter API key must not be empty")]
     EmptyKey,
@@ -190,7 +222,9 @@ mod tests {
         assert!(is_openrouter_base_url(OPENROUTER_API_URL));
         assert!(is_openrouter_base_url("https://openrouter.ai/api/v1/"));
         assert!(!is_openrouter_base_url("https://api.x.ai/v1"));
-        assert!(!is_openrouter_base_url("https://cli-chat-proxy.grok.com/v1"));
+        assert!(!is_openrouter_base_url(
+            "https://cli-chat-proxy.grok.com/v1"
+        ));
     }
 
     #[test]
@@ -198,7 +232,9 @@ mod tests {
     fn load_prefers_env_over_store() {
         let dir = TempDir::new().unwrap();
         let store = CredentialsStore::at_path(dir.path().join("creds.json"));
-        store.write_bearer(OPENROUTER_API_URL, "from-store").unwrap();
+        store
+            .write_bearer(OPENROUTER_API_URL, "from-store")
+            .unwrap();
 
         let _env = EnvGuard::set(OPENROUTER_API_KEY_ENV, "from-env");
         let key = load_openrouter_api_key(&store).unwrap().unwrap();
@@ -210,7 +246,9 @@ mod tests {
     fn load_falls_back_to_store() {
         let dir = TempDir::new().unwrap();
         let store = CredentialsStore::at_path(dir.path().join("creds.json"));
-        store.write_bearer(OPENROUTER_API_URL, "from-store").unwrap();
+        store
+            .write_bearer(OPENROUTER_API_URL, "from-store")
+            .unwrap();
 
         let _env = EnvGuard::unset(OPENROUTER_API_KEY_ENV);
         // Isolate shared harness probes (empty zed config).
@@ -228,8 +266,10 @@ mod tests {
     fn load_falls_back_to_zed_development_credentials() {
         let grok_dir = TempDir::new().unwrap();
         let store = CredentialsStore::at_path(grok_dir.path().join("creds.json"));
-        // No Grok key, no env.
+        // No Grok key, no env. Re-enable shared harness probes (cargo-ci disables
+        // them so host Zed keychain does not pollute other tests).
         let _env = EnvGuard::unset(OPENROUTER_API_KEY_ENV);
+        let _enable_harness = EnvGuard::unset(harness_secrets::DISABLE_SHARED_HARNESS_ENV);
 
         let zed_dir = TempDir::new().unwrap();
         let path = zed_dir
@@ -265,7 +305,13 @@ mod tests {
     fn store_and_clear() {
         let dir = TempDir::new().unwrap();
         let store = CredentialsStore::at_path(dir.path().join("creds.json"));
+        let zed_empty = dir.path().join("no-zed");
         let _env = EnvGuard::unset(OPENROUTER_API_KEY_ENV);
+        let _zed = EnvGuard::set(
+            harness_secrets::GROK_ZED_CONFIG_DIR_ENV,
+            zed_empty.to_str().unwrap(),
+        );
+        let _no_shared = EnvGuard::set(harness_secrets::DISABLE_SHARED_HARNESS_ENV, "1");
         store_openrouter_api_key(&store, "sk-or-test").unwrap();
         assert_eq!(
             load_openrouter_api_key(&store).unwrap().as_deref(),

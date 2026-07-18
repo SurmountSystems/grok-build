@@ -1935,7 +1935,7 @@ pub fn extract_video_refs(text: &str) -> Vec<ScrollbackVideoRef> {
 // Tests
 // =========================================================================
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod tests {
     use super::*;
 

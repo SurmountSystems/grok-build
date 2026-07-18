@@ -3,3 +3,9 @@
 .DS_Store
 result
 /result
+
+# Nested crate cargo targets (standalone crates like cargo-mem-guard)
+**/target/
+
+# Free-GHA just ci outer-loop marker (touched mid-recipe; never commit)
+.ci-started

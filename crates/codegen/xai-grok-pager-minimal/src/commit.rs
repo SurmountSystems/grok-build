@@ -1239,6 +1239,14 @@ mod tests {
         use ratatui::layout::Rect;
         use similar::ChangeTag;
         use xai_grok_pager::diff::DiffLine;
+        use xai_grok_pager::theme::cache as theme_cache;
+
+        // Serialize against `terminal_native_lock_paints_only_native_colors`,
+        // which engages the process-global terminal-native lock (Reset diff bgs).
+        let _guard = theme_cache::test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        theme_cache::set_terminal_native_lock(false);
 
         let hunk = vec![
             DiffLine {

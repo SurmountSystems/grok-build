@@ -39,6 +39,8 @@ const GROUP_TOOL_VERBS_DEFAULT: bool = true;
 const COLLAPSED_EDIT_BLOCKS_DEFAULT: bool = false;
 /// Next-prompt suggestions (tab autocomplete ghost text) default ON.
 const PROMPT_SUGGESTIONS_DEFAULT: bool = true;
+/// Auto-run follow-up `/implement` from the prior prompt after a turn ends.
+const AUTO_RUN_IMPLEMENT_DEFAULT: bool = true;
 const KEEP_TEXT_SELECTION_DEFAULT: TextSelection = TextSelection::Flash;
 /// Scroll speed default (1-100 scale, matches the legacy `[ui].scroll_speed`).
 const SCROLL_SPEED_DEFAULT: u8 = 50;
@@ -324,6 +326,37 @@ pub fn set_prompt_suggestions(enabled: bool) {
     PROMPT_SUGGESTIONS_LOADED.with(|l| l.set(true));
 }
 
+// -- Auto-run /implement follow-ups ------------------------------------------
+
+thread_local! {
+    static AUTO_RUN_IMPLEMENT_CURRENT: Cell<bool> =
+        const { Cell::new(AUTO_RUN_IMPLEMENT_DEFAULT) };
+    static AUTO_RUN_IMPLEMENT_LOADED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Read cached `auto_run_implement`, seeding from `[ui]` on first call.
+/// Default ON when unset.
+pub fn load_auto_run_implement() -> bool {
+    AUTO_RUN_IMPLEMENT_LOADED.with(|loaded| {
+        if !loaded.get() {
+            AUTO_RUN_IMPLEMENT_CURRENT.with(|c| {
+                c.set(load_bool_from_effective_config(
+                    "auto_run_implement",
+                    AUTO_RUN_IMPLEMENT_DEFAULT,
+                ))
+            });
+            loaded.set(true);
+        }
+    });
+    AUTO_RUN_IMPLEMENT_CURRENT.with(|c| c.get())
+}
+
+/// Replace cached `auto_run_implement`.
+pub fn set_auto_run_implement(enabled: bool) {
+    AUTO_RUN_IMPLEMENT_CURRENT.with(|c| c.set(enabled));
+    AUTO_RUN_IMPLEMENT_LOADED.with(|l| l.set(true));
+}
+
 // -- keep_text_selection (`flash` | `hold`) ----------------------------------
 
 thread_local! {
@@ -559,6 +592,7 @@ pub fn prime(ui: &UiConfig) {
     let _ = load_group_tool_verbs();
     let _ = load_collapsed_edit_blocks();
     let _ = load_prompt_suggestions();
+    let _ = load_auto_run_implement();
     // `default_selected_permission` owns its own cache in `permission_cursor`.
     crate::appearance::permission_cursor::prime();
 }
@@ -684,6 +718,10 @@ mod tests {
             PROMPT_SUGGESTIONS_DEFAULT,
             ui.prompt_suggestions.unwrap_or(PROMPT_SUGGESTIONS_DEFAULT)
         );
+        assert_eq!(
+            AUTO_RUN_IMPLEMENT_DEFAULT,
+            ui.auto_run_implement.unwrap_or(AUTO_RUN_IMPLEMENT_DEFAULT)
+        );
         assert_eq!(KEEP_TEXT_SELECTION_DEFAULT, text_selection_from_ui(&ui));
         assert_eq!(
             SCROLL_MODE_DEFAULT,
@@ -793,6 +831,18 @@ mod tests {
             assert!(!load_prompt_suggestions());
             set_prompt_suggestions(true);
             assert!(load_prompt_suggestions());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn set_then_load_round_trips_auto_run_implement() {
+        std::thread::spawn(|| {
+            set_auto_run_implement(false);
+            assert!(!load_auto_run_implement());
+            set_auto_run_implement(true);
+            assert!(load_auto_run_implement());
         })
         .join()
         .unwrap();

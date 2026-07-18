@@ -167,6 +167,23 @@ mod links {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+        // Only on ratatui Backend when the crate feature is enabled.
+        #[cfg(feature = "scrolling-regions")]
+        fn scroll_region_up(
+            &mut self,
+            _region: std::ops::Range<u16>,
+            _line_count: u16,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+        #[cfg(feature = "scrolling-regions")]
+        fn scroll_region_down(
+            &mut self,
+            _region: std::ops::Range<u16>,
+            _line_count: u16,
+        ) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     fn term(w: u16, h: u16) -> Terminal<RecordingBackend> {

@@ -361,8 +361,8 @@ fn invocation_for(shell: &WindowsShell, command: &str) -> ShellInvocation {
 //   5. Hardcoded `/bin/<name>` — historical behavior, only reached when every
 //      earlier step has failed.
 //
-// The result is cached per kind in a process-wide `OnceLock`, so the cascade
-// is run at most once per shell kind per process.
+// The result is cached per kind in a process-wide `Mutex<Option<String>>` so
+// the cascade re-runs when a previously-resolved path vanishes (Nix GC, etc.).
 
 /// Which Unix shell we're asking about. Bash and zsh are the only kinds
 /// supported by the persistent shell-state backend (the dump scripts are
@@ -403,22 +403,65 @@ pub fn detect_unix_shell_kind() -> UnixShellKind {
     }
 }
 
-/// Absolute path to the requested Unix shell binary, computed via the
-/// cascade above. Cached for the process lifetime.
+/// Process-wide shell binary path cache (one entry per kind).
+///
+/// Uses [`std::sync::Mutex`] rather than [`OnceLock`] so a path that later
+/// vanishes (Nix GC, deleted worktree-linked binary) can be re-resolved
+/// without restarting the agent process.
 #[cfg(unix)]
-pub fn unix_shell_path(kind: UnixShellKind) -> &'static str {
-    use std::sync::OnceLock;
-    static BASH: OnceLock<String> = OnceLock::new();
-    static ZSH: OnceLock<String> = OnceLock::new();
-    let cache = match kind {
-        UnixShellKind::Bash => &BASH,
-        UnixShellKind::Zsh => &ZSH,
-    };
-    cache.get_or_init(|| {
-        let path = resolve_unix_shell_path(kind);
-        tracing::debug!(kind = ?kind, resolved = %path, "resolved Unix shell path");
-        path
-    })
+fn shell_path_cache(kind: UnixShellKind) -> &'static std::sync::Mutex<Option<String>> {
+    use std::sync::{Mutex, OnceLock};
+    static BASH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    static ZSH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    match kind {
+        UnixShellKind::Bash => BASH.get_or_init(|| Mutex::new(None)),
+        UnixShellKind::Zsh => ZSH.get_or_init(|| Mutex::new(None)),
+    }
+}
+
+/// Absolute path to the requested Unix shell binary, computed via the cascade
+/// above. Cached, but **re-resolved** when the cached path no longer exists
+/// (e.g. a Nix store path was GC'd, or a temporary PATH entry vanished).
+///
+/// Returns an owned [`String`] so callers can keep the path across a cache
+/// refresh without dangling references.
+#[cfg(unix)]
+pub fn unix_shell_path(kind: UnixShellKind) -> String {
+    let cache = shell_path_cache(kind);
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref path) = *guard {
+        // Cheap liveness check: if the binary vanished, drop the cache entry
+        // and re-resolve. Avoids process-lifetime ENOENT after GC/PATH churn.
+        if std::path::Path::new(path).is_file() {
+            return path.clone();
+        }
+        tracing::warn!(
+            kind = ?kind,
+            stale = %path,
+            "cached Unix shell path is gone; re-resolving"
+        );
+        *guard = None;
+    }
+    let path = resolve_unix_shell_path(kind);
+    tracing::debug!(kind = ?kind, resolved = %path, "resolved Unix shell path");
+    *guard = Some(path.clone());
+    path
+}
+
+/// Force a fresh resolution even if the cached path still exists as a file.
+/// Use after spawn returns ENOENT (broken symlink, unreadable, wrong kind).
+#[cfg(unix)]
+pub fn refresh_unix_shell_path(kind: UnixShellKind) -> String {
+    let path = resolve_unix_shell_path(kind);
+    let cache = shell_path_cache(kind);
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    tracing::warn!(
+        kind = ?kind,
+        resolved = %path,
+        "forced refresh of Unix shell path"
+    );
+    *guard = Some(path.clone());
+    path
 }
 
 #[cfg(unix)]
@@ -473,8 +516,7 @@ fn resolve_unix_shell_path(kind: UnixShellKind) -> String {
 ///
 /// The probe is spawned via `xai_tty_utils::detach_std_command` so that
 /// the child does NOT inherit the parent's controlling TTY. The resolver
-/// runs lazily inside `unix_shell_path`'s `OnceLock::get_or_init` which
-/// can fire during interactive TUI/pager startup; without detach, a
+/// may run during interactive TUI/pager startup; without detach, a
 /// misbehaving shell binary that emits mouse-tracking escapes or asks
 /// for a controlling tty during `--version` would spew garbage onto the
 /// pager screen. `stdin`, `stdout`, and `stderr` are pinned to `null`
@@ -546,7 +588,10 @@ mod tests {
         // hardcoded `/bin/bash` fallback).
         let p = unix_shell_path(UnixShellKind::Bash);
         assert!(
-            std::path::Path::new(p).file_name().and_then(|n| n.to_str()) == Some("bash"),
+            std::path::Path::new(&p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                == Some("bash"),
             "expected a path ending in 'bash', got {p}"
         );
     }
@@ -554,13 +599,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_shell_path_is_cached() {
-        // Two calls return the same `&'static str` (pointer equality).
+        // Two calls return the same path string while the binary still exists.
         let a = unix_shell_path(UnixShellKind::Bash);
         let b = unix_shell_path(UnixShellKind::Bash);
+        assert_eq!(a, b, "result should be cached");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_unix_shell_path_returns_bash() {
+        let p = refresh_unix_shell_path(UnixShellKind::Bash);
         assert!(
-            std::ptr::eq(a.as_ptr(), b.as_ptr()),
-            "result should be cached"
+            std::path::Path::new(&p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                == Some("bash"),
+            "expected a path ending in 'bash', got {p}"
         );
+        // Subsequent unix_shell_path should see the refreshed value.
+        assert_eq!(unix_shell_path(UnixShellKind::Bash), p);
     }
 
     #[cfg(unix)]

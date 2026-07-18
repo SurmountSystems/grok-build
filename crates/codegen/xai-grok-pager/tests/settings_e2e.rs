@@ -58,6 +58,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "fork_secondary_model",
     "show_thinking_blocks",
     "prompt_suggestions",
+    "auto_run_implement",
     "group_tool_verbs",
     "collapsed_edit_blocks",
     "respect_manual_folds",
@@ -256,6 +257,12 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
             assert_eq!(
                 b, expected,
                 "SetPromptSuggestions value differs from expected"
+            )
+        }
+        ("auto_run_implement", Action::SetAutoRunImplement(b)) => {
+            assert_eq!(
+                b, expected,
+                "SetAutoRunImplement value differs from expected"
             )
         }
         ("group_tool_verbs", Action::SetGroupToolVerbs(b)) => {
@@ -1585,6 +1592,7 @@ fn registry_kind_membership_through_pr_14() {
             "display_refresh_auto_cadence",
             "multiline_mode",
             "prompt_suggestions",
+            "auto_run_implement",
             "respect_manual_folds",
             "show_thinking_blocks",
             "show_timeline",
@@ -1719,6 +1727,7 @@ fn defaults_round_trip_through_registry() {
     );
     xai_grok_pager::appearance::cache::set_show_thinking_blocks(true);
     xai_grok_pager::appearance::cache::set_prompt_suggestions(true);
+    xai_grok_pager::appearance::cache::set_auto_run_implement(true);
     xai_grok_pager::appearance::cache::set_group_tool_verbs(true);
     xai_grok_pager::appearance::cache::set_scroll_mode(
         xai_grok_pager::appearance::ScrollMode::Auto,
@@ -1763,6 +1772,7 @@ fn defaults_round_trip_through_registry() {
             "fork_secondary_model" => SettingValue::String(String::new()),
             "show_thinking_blocks" => SettingValue::Bool(true),
             "prompt_suggestions" => SettingValue::Bool(true),
+            "auto_run_implement" => SettingValue::Bool(true),
             "group_tool_verbs" => SettingValue::Bool(true),
             "collapsed_edit_blocks" => SettingValue::Bool(false),
             "respect_manual_folds" => SettingValue::Bool(false),
@@ -1841,6 +1851,7 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetRespectManualFolds(_))
             | SettingsKeyOutcome::Action(Action::SetShowThinkingBlocks(_))
             | SettingsKeyOutcome::Action(Action::SetPromptSuggestions(_))
+            | SettingsKeyOutcome::Action(Action::SetAutoRunImplement(_))
             | SettingsKeyOutcome::Action(Action::SetGroupToolVerbs(_))
             | SettingsKeyOutcome::Action(Action::SetCollapsedEditBlocks(_))
             | SettingsKeyOutcome::Action(Action::SetInvertScroll(_))
@@ -7177,6 +7188,87 @@ fn prompt_suggestions_space_dispatches_typed_setter() {
     let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
     assert_set_bool_action(outcome, "prompt_suggestions", true);
     xai_grok_pager::appearance::cache::set_prompt_suggestions(true);
+}
+
+// ---------------------------------------------------------------------------
+// auto_run_implement — SHELL-owned Bool (Agent, default true)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_run_implement_space_dispatches_typed_setter() {
+    xai_grok_pager::appearance::cache::set_auto_run_implement(false);
+    let mut s = make_state();
+    navigate_to(&mut s, "auto_run_implement");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "auto_run_implement", true);
+    xai_grok_pager::appearance::cache::set_auto_run_implement(true);
+}
+
+#[test]
+fn auto_run_implement_enter_dispatches_typed_setter() {
+    xai_grok_pager::appearance::cache::set_auto_run_implement(false);
+    let mut s = make_state();
+    navigate_to(&mut s, "auto_run_implement");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert_set_bool_action(outcome, "auto_run_implement", true);
+    xai_grok_pager::appearance::cache::set_auto_run_implement(true);
+}
+
+#[test]
+fn auto_run_implement_mouse_click_two_stage_toggles() {
+    xai_grok_pager::appearance::cache::set_auto_run_implement(false);
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "auto_run_implement") as u16;
+
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        10,
+        row_y,
+    );
+    assert!(
+        matches!(outcome, SettingsKeyOutcome::Changed),
+        "first click on a different row body should only select, got: {outcome:?}"
+    );
+    assert_eq!(s.selected, row_y as usize);
+
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        10,
+        row_y,
+    );
+    assert_set_bool_action(outcome, "auto_run_implement", true);
+    xai_grok_pager::appearance::cache::set_auto_run_implement(true);
+}
+
+#[test]
+fn auto_run_implement_cache_on_dispatches_off() {
+    xai_grok_pager::appearance::cache::set_auto_run_implement(true);
+    let mut s = SettingsModalState::new(
+        Arc::new(SettingsRegistry::defaults()),
+        UiConfig::default(),
+        PagerLocalSnapshot::default(),
+    );
+    navigate_to(&mut s, "auto_run_implement");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "auto_run_implement", false);
+    xai_grok_pager::appearance::cache::set_auto_run_implement(true);
+}
+
+#[test]
+fn auto_run_implement_renders_under_agent_category_shell_owned() {
+    let reg = SettingsRegistry::defaults();
+    let meta = reg
+        .find("auto_run_implement")
+        .expect("auto_run_implement must be registered");
+    assert_eq!(meta.category, SettingCategory::Agent);
+    assert_eq!(meta.owner, SettingOwner::Shell);
+    match &meta.kind {
+        SettingKind::Bool { default } => assert!(*default, "default must be true"),
+        other => panic!("expected Bool kind for auto_run_implement, got {other:?}"),
+    }
 }
 
 #[test]

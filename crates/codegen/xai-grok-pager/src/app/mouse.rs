@@ -423,11 +423,15 @@ impl AgentView {
                             }
                             return InputOutcome::Changed;
                         }
-                        if let Some(id) = self.queue.send_now_click(mouse.column, mouse.row)
-                            && self.session.state.is_turn_running()
-                            && let InputOutcome::Action(action) = self.force_interject_queue_row(id)
-                        {
-                            return InputOutcome::Action(action);
+                        // Always route through force_interject so dead ends
+                        // toast (race: turn ended after button was drawn).
+                        if let Some(id) = self.queue.send_now_click(mouse.column, mouse.row) {
+                            let outcome = self.force_interject_queue_row(id);
+                            if matches!(outcome, InputOutcome::Action(_)) {
+                                return outcome;
+                            }
+                            // Reject/defer already toasted — still redraw.
+                            return InputOutcome::Changed;
                         }
                         self.set_active_pane(AgentPane::Queue, false);
                         self.queue.handle_mouse(
@@ -1242,6 +1246,55 @@ mod tests {
         assert!(!agent.queue.overlay.visible);
         assert!(!agent.queue.overlay.focused);
         assert_eq!(agent.active_pane, AgentPane::Scrollback);
+    }
+
+    /// Clicking Send now after the turn has already gone idle must toast, not
+    /// silently no-op (race: button drawn while running, click arrives late).
+    #[test]
+    fn mouse_send_now_when_idle_toasts_instead_of_silent_noop() {
+        let mut agent = running_agent_local_only();
+        let ids = agent.queue.entry_ids();
+        // Render buttons while "running", then flip idle before click path
+        // (force_interject still reached — outer mouse gate no longer drops).
+        agent.queue.list_state.select_by_id(ids[0]);
+        let area = Rect::new(0, 0, 80, 6);
+        let mut buf = Buffer::empty(area);
+        agent.queue.render(
+            area,
+            &mut buf,
+            true,
+            &crate::appearance::LayoutConfig::default(),
+            None,
+            true, // was running when painted
+        );
+        agent.pane_areas.queue = area;
+        let mut found = None;
+        'find: for row in area.y..area.y + area.height {
+            for col in area.x..area.x + area.width {
+                if agent.queue.send_now_click(col, row) == Some(ids[0]) {
+                    found = Some((col, row));
+                    break 'find;
+                }
+            }
+        }
+        let (col, row) = found.expect("Send now was painted while running");
+        agent.session.state = AgentState::Idle;
+        let outcome = agent.handle_mouse(&MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(
+            matches!(outcome, InputOutcome::Changed),
+            "idle send-now click must not emit an action, got {outcome:?}"
+        );
+        let toast = agent.toast.as_ref().map(|(m, _)| m.as_str());
+        assert_eq!(
+            toast,
+            Some("No turn running — prompt will send when ready"),
+            "must toast why send-now did nothing"
+        );
     }
     /// Send-now `[Interject]` on the lone local row while it is being
     /// DIRTY-edited: the removal must discard the edit via the canonical

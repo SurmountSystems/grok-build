@@ -1216,6 +1216,40 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
+        // SHELL-owned: `[ui].auto_run_implement` + process-wide cache. Default ON
+        // for discoverability — auto-queues a sentence-leading `/implement`
+        // follow-up from the prior user prompt after a successful turn.
+        SettingMeta {
+            key: "auto_run_implement",
+            category: SettingCategory::Agent,
+            owner: SettingOwner::Shell,
+            label: "Auto-run /implement",
+            description: "After a successful turn, automatically run a full multi-line \
+                          /implement block from a user-prompt follow-up or from a trailing \
+                          residual in the assistant reply (line must start with /implement). \
+                          Prefer leaving “Next implement prompt” near the end of the reply.",
+            keywords: &[
+                "implement",
+                "auto",
+                "autorun",
+                "auto-run",
+                "follow-up",
+                "followup",
+                "slash",
+                "loop",
+                "skill",
+                "next",
+                "task",
+                "residual",
+                "multi-line",
+                "multiline",
+            ],
+            kind: SettingKind::Bool {
+                default: ui_default.auto_run_implement.unwrap_or(true),
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
         // SHELL-owned startup-time settings (restart_required: true).
         // The running pager doesn't re-read these mid-session.
         SettingMeta {

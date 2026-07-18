@@ -101,26 +101,28 @@ See ~/.grok/README.md for more information.
     /// Export or upload session trace data
     Trace(crate::trace_cmd::TraceArgs),
     /// Check for updates or install a specific version
+    /// Check freshness vs Surmount main (git SHA), or print how to rebuild.
+    ///
+    /// Grok OSS has no binary release train. `update --check` compares this
+    /// build’s commit to github.com/SurmountSystems/grok-oss `main`.
     Update {
-        /// Check for updates without installing.
+        /// Compare embedded git SHA to Surmount `main` (no install).
         #[arg(long)]
         check: bool,
         /// Emit machine-readable JSON output (for --check).
         #[arg(long)]
         json: bool,
-        /// Force re-download and install even if already up to date.
-        #[arg(long)]
+        /// Force re-download via xAI updater (requires GROK_OSS_ENABLE_XAI_UPDATER=1).
+        #[arg(long, hide = true)]
         force_reinstall: bool,
-        /// Install a specific version (e.g. 0.1.150 or 0.1.151-alpha.2).
-        #[arg(long)]
+        /// Install a specific version via xAI updater (requires GROK_OSS_ENABLE_XAI_UPDATER=1).
+        #[arg(long, hide = true)]
         version: Option<String>,
-        /// Switch to the alpha release channel (faster updates, may have bugs).
-        #[arg(long, conflicts_with_all = ["stable", "enterprise"])]
+        /// xAI channel switch (hidden; requires GROK_OSS_ENABLE_XAI_UPDATER=1).
+        #[arg(long, conflicts_with_all = ["stable", "enterprise"], hide = true)]
         alpha: bool,
-        /// Switch to the stable release channel (default, weekly releases).
-        #[arg(long, conflicts_with_all = ["alpha", "enterprise"])]
+        #[arg(long, conflicts_with_all = ["alpha", "enterprise"], hide = true)]
         stable: bool,
-        /// Switch to the enterprise release channel.
         #[arg(long, conflicts_with_all = ["alpha", "stable"], hide = true)]
         enterprise: bool,
     },
@@ -408,23 +410,21 @@ pub struct LeaderArgs {
     #[command(flatten)]
     pub headless: HeadlessArgs,
 }
-/// Return the version string with channel label for `--version` / `-v` output.
+/// Return the version string for `--version` / `-v` (clap `ArgAction::Version`).
 ///
-/// Uses a `OnceLock` so the formatting happens once and the result lives
-/// for `'static` (required by clap's `ArgAction::Version`).
+/// Grok OSS: upstream package version + short git SHA (no release channel).
+/// Uses a `OnceLock` so the result is `'static` for clap.
 fn version_with_channel() -> &'static str {
     use std::sync::OnceLock;
     static V: OnceLock<String> = OnceLock::new();
-    V.get_or_init(|| {
-        let label = xai_grok_update::channel_label();
-        xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), label)
-    })
+    // env!("VERSION_WITH_COMMIT") is set by this crate's build.rs.
+    V.get_or_init(|| env!("VERSION_WITH_COMMIT").to_string())
 }
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "grok",
+    name = "grok-oss",
     version = version_with_channel(),
-    about = "Grok Build TUI",
+    about = "Grok OSS TUI (unofficial Surmount fork of Grok Build)",
     disable_version_flag = true,
     next_display_order = None,
     help_template = "\
@@ -1184,14 +1184,9 @@ mod tests {
 
     #[test]
     fn login_openrouter_parses_api_key() {
-        let args = PagerArgs::try_parse_from([
-            "grok",
-            "login",
-            "--openrouter",
-            "--api-key",
-            "sk-or-test",
-        ])
-        .expect("login --openrouter parses");
+        let args =
+            PagerArgs::try_parse_from(["grok", "login", "--openrouter", "--api-key", "sk-or-test"])
+                .expect("login --openrouter parses");
         match args.command {
             Some(Command::Login {
                 openrouter: true,

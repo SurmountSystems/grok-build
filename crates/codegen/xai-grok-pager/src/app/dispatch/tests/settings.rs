@@ -1311,6 +1311,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "prompt_suggestions" => {
             let _ = dispatch(Action::SetPromptSuggestions(false), app);
         }
+        "auto_run_implement" => {
+            let _ = dispatch(Action::SetAutoRunImplement(false), app);
+        }
         "respect_manual_folds" => {
             let _ = dispatch(
                 Action::SetRespectManualFolds(

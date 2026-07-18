@@ -161,10 +161,18 @@ async fn list_skill_files(skill: &SkillInfo, limit: usize) -> Vec<String> {
 
 /// Format the `<skill_content>` XML output block.
 fn format_output(skill: &SkillInfo, content: &str, files: &[String]) -> String {
+    use crate::implementations::skills::skill::mint_skill_run_id;
+
     let base_dir = Path::new(&skill.path)
         .parent()
         .map(|p| format!("file://{}", p.display()))
         .unwrap_or_default();
+
+    let run_id = mint_skill_run_id();
+    let mut body = content.trim().to_string();
+    if body.contains("${RUN_ID}") {
+        body = body.replace("${RUN_ID}", &run_id);
+    }
 
     let files_xml: String = files
         .iter()
@@ -173,9 +181,18 @@ fn format_output(skill: &SkillInfo, content: &str, files: &[String]) -> String {
         .join("\n");
 
     let mut out = String::new();
-    out.push_str(&format!("<skill_content name=\"{}\">\n", skill.name));
+    out.push_str(&format!(
+        "<skill_content name=\"{}\" run_id=\"{}\">\n",
+        skill.name, run_id
+    ));
     out.push_str(&format!("# Skill: {}\n\n", skill.name));
-    out.push_str(content.trim());
+    out.push_str(&format!(
+        "Host-minted run_id for this skill invocation: `{run_id}`\n\
+         Use this as IMPL_ID / PLAN_ID / DESIGN_ID / REVIEW_ID / INSTANCE_ID \
+         (or any run-scoped artifact id). Do **not** mint ids via shell, \
+         Python, or model invention.\n\n"
+    ));
+    out.push_str(&body);
     out.push_str("\n\n");
     out.push_str(&format!("Base directory for this skill: {base_dir}\n"));
     out.push_str(
@@ -556,7 +573,10 @@ mod tests {
         assert_eq!(output.tool_result, "Loaded skill: test");
 
         let msg = output.skill_message.unwrap();
-        assert!(msg.contains("<skill_content name=\"test\">"));
+        assert!(
+            msg.contains("<skill_content name=\"test\" run_id=\""),
+            "expected skill_content open tag with run_id, got: {msg}"
+        );
         assert!(msg.contains("# Skill: test"));
         assert!(msg.contains("# Test Skill"));
         assert!(msg.contains("Do the thing."));
@@ -603,7 +623,10 @@ mod tests {
             prompt.contains("Do the thing."),
             "skill body must reach to_prompt_format(), got: {prompt}"
         );
-        assert!(prompt.contains("<skill_content name=\"test\">"));
+        assert!(
+            prompt.contains("<skill_content name=\"test\" run_id=\""),
+            "expected skill_content open tag with run_id, got: {prompt}"
+        );
     }
 
     #[tokio::test]
@@ -756,8 +779,12 @@ mod tests {
         assert!(output.success);
         let msg = output.skill_message.unwrap();
 
-        // Must open with <skill_content name="fmt">
-        assert!(msg.starts_with("<skill_content name=\"fmt\">\n"));
+        // Must open with <skill_content name="fmt" run_id="...">
+        assert!(
+            msg.starts_with("<skill_content name=\"fmt\" run_id=\""),
+            "expected skill_content open tag with run_id, got: {}",
+            msg.lines().next().unwrap_or("")
+        );
         // Must have # Skill: fmt header
         assert!(msg.contains("# Skill: fmt\n"));
         // Must contain the body content
@@ -880,7 +907,10 @@ mod tests {
         assert!(output.error.is_none());
 
         let msg = output.skill_message.unwrap();
-        assert!(msg.contains("<skill_content name=\"empty\">"));
+        assert!(
+            msg.contains("<skill_content name=\"empty\" run_id=\""),
+            "expected skill_content open tag with run_id, got: {msg}"
+        );
         assert!(msg.contains("# Skill: empty"));
         assert!(msg.contains("</skill_content>"));
         // No frontmatter keys leaked into output.

@@ -4760,6 +4760,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
 
 [[package]]
+name = "grok-rate-limit"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13684,6 +13697,7 @@ dependencies = [
  "chrono",
  "eventsource-stream",
  "futures-util",
+ "grok-rate-limit",
  "indexmap",
  "reqwest 0.12.24",
  "serde",
@@ -14152,6 +14166,7 @@ dependencies = [
  "anyhow",
  "dunce",
  "futures",
+ "grok-rate-limit",
  "indicatif",
  "reqwest 0.12.24",
  "semver",

@@ -2304,6 +2304,10 @@ fn cleanup_queue_dir(queue_dir: &Path, max_age: Duration, stats: Option<&UploadQ
         Err(_) => return 0,
     };
     let all_names: HashSet<std::ffi::OsString> = entries.iter().map(|e| e.file_name()).collect();
+    // Phase 1: decide what is stale *before* deleting anything. Pair age comes
+    // from the sidecar; deleting the sidecar first would force the temp onto
+    // mtime and wrongly keep an expired pair (visit-order flake).
+    let mut stale: Vec<(std::path::PathBuf, std::ffi::OsString, std::fs::Metadata)> = Vec::new();
     let mut cleaned = 0u64;
     let mut cleaned_bytes = 0u64;
     for entry in &entries {
@@ -2326,9 +2330,12 @@ fn cleanup_queue_dir(queue_dir: &Path, max_age: Duration, stats: Option<&UploadQ
                 .and_then(|m| m.elapsed().ok())
                 .unwrap_or(Duration::MAX)
         });
-        if age <= max_age {
-            continue;
+        if age > max_age {
+            stale.push((path, name, metadata));
         }
+    }
+    // Phase 2: delete stale entries.
+    for (path, name, metadata) in stale {
         if metadata.is_dir() {
             let size = dir_size(&path).unwrap_or(0);
             if std::fs::remove_dir_all(&path).is_ok() {

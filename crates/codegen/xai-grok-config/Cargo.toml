@@ -33,6 +33,9 @@ core-foundation = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
+# Integration tests (e.g. shell signed_managed_config) inject throwaway keys.
+test-support = []
+default-bazel = ["test-support"]
 
 [lints]
 workspace = true

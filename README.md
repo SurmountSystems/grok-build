@@ -70,7 +70,7 @@ nix build .#grok-oss # → ./result/bin/grok-oss
 CI uses the same flake (see `.github/workflows/ci.yml`). Locally, mirror GH CI with:
 
 ```bash
-just ci        # full nix job (build + checks + openrouter tests)
+just ci        # local mirror of GHA quality (flake-meta + ci-prep + just test)
 just ci-quick  # faster cargo check/tests inside nix develop
 ```
 
@@ -117,13 +117,14 @@ artifact is **`grok-oss`**.
 
 | | Upstream | Grok OSS |
 |--|----------|----------|
-| Repo | [xai-org/grok-build](https://github.com/xai-org/grok-build) | SurmountSystems/grok-oss |
+| Repo | [xai-org/grok-build](https://github.com/xai-org/grok-build) | [SurmountSystems/grok-oss](https://github.com/SurmountSystems/grok-oss) |
 | External PRs | Not accepted | **Welcome** |
 | Binary | `grok` (official installer) | `grok-oss` |
+| Releases | Official channels / installers | **No separate release train** — identity is **upstream version + git SHA**; `grok-oss update --check` vs Surmount `main` |
 | License | Apache-2.0 | Apache-2.0 (same first-party terms) |
 
-Sync: `./scripts/sync-upstream.sh` (see [`FORK.md`](FORK.md)).
-
+Sync and versioning: [`FORK.md`](FORK.md), [`docs/upstream-history.md`](docs/upstream-history.md).  
+Users: `grok-oss update --check`. Maintainers: `just upstream-detect` / `just upstream-import` (never blind-merge xAI force-exports).
 ## Documentation
 
 - Fork process & divergences: [`FORK.md`](FORK.md)

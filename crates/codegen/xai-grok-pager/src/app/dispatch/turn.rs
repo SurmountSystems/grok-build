@@ -417,6 +417,14 @@ pub(crate) fn reconcile_overdue_turn_ends(app: &mut AppView) -> Option<Vec<Effec
                 agent.discard_pending_adoption_updates(&p.prompt_id);
             }
         }
+        // Same auto-implement follow-up path as PromptResponse (settings-
+        // gated). Only on successful non-cancel reconcile exits.
+        let clean_success = !was_cancelling
+            && !matches!(pending.stop_reason.as_deref(), Some("error" | "rate_limit"))
+            && agent.session.current_prompt_id.is_none();
+        if clean_success {
+            crate::app::auto_implement::on_successful_turn_end(agent);
+        }
         effects.extend(maybe_drain_queue(agent));
         drained_ids.push(id);
     }

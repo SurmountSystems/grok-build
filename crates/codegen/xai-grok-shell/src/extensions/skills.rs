@@ -186,10 +186,11 @@ fn discover_auto_sources(cwd: &str, skills: &[SkillInfo]) -> Vec<(String, usize)
     // .claude/skills/ paths. Equivalent locations should be opted in via
     // [paths] extra_skill_dirs in config.toml (written by /import-claude).
     let imported = crate::claude_import::is_claude_import_marked();
+    // `.agents` before `.grok` — same order as skill discovery (agents override).
     let local_dir_names: &[&str] = if imported {
-        &[".grok", ".agents"]
+        &[".agents", ".grok"]
     } else {
-        &[".grok", ".agents", ".claude"]
+        &[".agents", ".grok", ".claude"]
     };
 
     let mut sources: Vec<(String, usize)> = Vec::new();
@@ -221,16 +222,19 @@ fn discover_auto_sources(cwd: &str, skills: &[SkillInfo]) -> Vec<(String, usize)
         }
     }
 
-    for subdir in &subdirs {
-        try_add_source(grok_home.join(subdir), None);
-    }
-
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     if let Some(ref h) = home {
         let home_path = std::path::PathBuf::from(h);
+        // Agents first (override), then Grok home, then optional Claude.
         for subdir in &subdirs {
             try_add_source(home_path.join(".agents").join(subdir), None);
         }
+    }
+    for subdir in &subdirs {
+        try_add_source(grok_home.join(subdir), None);
+    }
+    if let Some(ref h) = home {
+        let home_path = std::path::PathBuf::from(h);
         if !imported {
             for subdir in &subdirs {
                 try_add_source(home_path.join(".claude").join(subdir), None);

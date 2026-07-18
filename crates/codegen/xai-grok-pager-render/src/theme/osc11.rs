@@ -420,9 +420,20 @@ mod tests {
 
     #[test]
     fn detect_returns_none_when_not_tty() {
-        // In CI / test runners stdin is captured; the early `is_terminal`
-        // check must return None without writing anything to stderr.
-        assert_eq!(detect_via_osc11(), None);
+        use std::io::IsTerminal;
+
+        // Only assert the early-return path when stdin is not a TTY. Interactive
+        // `just test` / `cargo test` from a real terminal can have a live TTY
+        // and a responding OSC 11 peer, which correctly yields Some(Dark|Light).
+        if std::io::stdin().is_terminal() {
+            eprintln!("skipping: stdin is a TTY (OSC 11 may succeed)");
+            return;
+        }
+        assert_eq!(
+            detect_via_osc11(),
+            None,
+            "non-TTY stdin must not query OSC 11"
+        );
     }
 
     #[cfg(unix)]

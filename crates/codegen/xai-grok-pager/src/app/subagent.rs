@@ -478,9 +478,20 @@ pub(crate) fn format_activity_label(activity: &crate::acp::tracker::TurnActivity
         TurnActivity::Retrying {
             attempt,
             max_retries,
-            ..
+            reason,
         } => {
-            format!("Retrying ({attempt}/{max_retries})")
+            let head = if *max_retries == u32::MAX {
+                format!("Retrying (#{attempt})")
+            } else {
+                format!("Retrying ({attempt}/{max_retries})")
+            };
+            let brief = reason.trim();
+            if brief.is_empty() {
+                head
+            } else {
+                let one = brief.lines().next().unwrap_or(brief);
+                format!("{head}: {one}")
+            }
         }
         TurnActivity::Waiting(reason) => reason.label(),
     }
@@ -1050,7 +1061,15 @@ mod tests {
                 max_retries: 5,
                 reason: "rate limited".into(),
             }),
-            "Retrying (2/5)",
+            "Retrying (2/5): rate limited",
+        );
+        assert_eq!(
+            format_activity_label(&TurnActivity::Retrying {
+                attempt: 3,
+                max_retries: u32::MAX,
+                reason: "502 Bad Gateway".into(),
+            }),
+            "Retrying (#3): 502 Bad Gateway",
         );
     }
     #[test]

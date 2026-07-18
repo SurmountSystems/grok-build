@@ -435,11 +435,11 @@ async fn retries_on_500_then_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
-// Rate limit exhausts threshold
+// Rate limit with explicit finite budget still exhausts
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rate_limit_exhausts_at_threshold_and_yields_failed() {
+async fn rate_limit_exhausts_when_policy_caps_retries() {
     let counter = Arc::new(AtomicU32::new(0));
     let counter_handler = Arc::clone(&counter);
     let app = Router::new().route(
@@ -465,7 +465,12 @@ async fn rate_limit_exhausts_at_threshold_and_yields_failed() {
     let server = MockServer::spawn(app).await;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let cfg = test_config(server.base_url(), "test-model");
-    let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
+    // Finite policy: prove caps still work when configured.
+    let policy = RetryPolicy {
+        max_retries: 2,
+        rate_limit_retry_threshold: 2,
+    };
+    let handle = SamplerActor::spawn(cfg, policy, event_tx);
 
     let rid = RequestId::from("req-429");
     handle.submit(rid.clone(), user_request("hi"));
@@ -482,10 +487,7 @@ async fn rate_limit_exhausts_at_threshold_and_yields_failed() {
     }
 
     let hits = counter.load(Ordering::SeqCst);
-    // RATE_LIMIT_RETRY_THRESHOLD = 2, so the actor stops after two
-    // attempts (the first attempt + one retry that also 429s = 2
-    // hits). Allow a small slack in case scheduling fires a third
-    // attempt before the threshold check.
+    // max_retries=2 → stop after two attempts (first + one retry).
     assert!((1..=3).contains(&hits), "expected 1-3 hits, got {hits}");
 }
 

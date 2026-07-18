@@ -544,7 +544,9 @@ pub(crate) async fn handle_subagent_request(
         forked_conversation,
         inherited_prefix_len.unwrap_or(0),
     );
-    if context_source != InitialContextSource::Resumed && !verbatim_mirror_fork
+    if !crate::session::is_cursor_user_template(&definition.user_message_template)
+        && context_source != InitialContextSource::Resumed
+        && !verbatim_mirror_fork
         && let Some(ref pi) = effective_runtime.persona_instructions
     {
         let reminder = xai_grok_sampling_types::conversation::ConversationItem::system_reminder(

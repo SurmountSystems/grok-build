@@ -1100,6 +1100,13 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
             .env("GIT_COMMITTER_NAME", "Test")
             .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            // Mask host global/system config (commit.gpgsign, hooks, etc.).
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(std::process::Stdio::null());
         let output = cmd.output().unwrap();
         assert!(
@@ -1113,6 +1120,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         run_git_test(repo, &["init", "--initial-branch=main", "--quiet"]);
+        run_git_test(repo, &["config", "commit.gpgsign", "false"]);
         std::fs::write(repo.join("plugin.json"), r#"{"name":"pinned-plugin"}"#).unwrap();
         run_git_test(repo, &["add", "plugin.json"]);
         run_git_test(repo, &["commit", "-m", "initial", "--quiet"]);

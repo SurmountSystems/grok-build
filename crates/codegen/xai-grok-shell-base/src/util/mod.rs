@@ -53,6 +53,11 @@ fn matches_trusted_base_url(candidate: &str, trusted_base: &str) -> bool {
         && candidate.port_or_known_default() == trusted.port_or_known_default()
         && path_matches
 }
+/// When set (any value), treat loopback `/v1` bases as cli-chat-proxy so unit
+/// tests can bind an axum mock without talking to production. Never set in
+/// production; `just test` / `cargo-ci` sets it for hermetic e2e.
+pub const TRUST_LOOPBACK_CLI_CHAT_PROXY_ENV: &str = "GROK_TRUST_LOOPBACK_CLI_CHAT_PROXY";
+
 /// True for cli-chat-proxy URLs (production, plus local-dev hosts when the
 /// optional non-production feature is enabled). When that feature is on,
 /// runtime env overrides can extend this trust set. Loopback is always

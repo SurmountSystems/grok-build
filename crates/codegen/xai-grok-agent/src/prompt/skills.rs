@@ -48,11 +48,15 @@ pub struct SkillsConfig {
 
 /// List all discovered skills with their metadata.
 ///
-/// Priority order: Local (cwd/.grok/skills, cwd/.agents/skills, cwd/.claude/skills) → Intermediate dirs →
-/// Repo (repo_root/.grok/skills, repo_root/.agents/skills, repo_root/.claude/skills) → User (~/.grok/skills, ~/.agents/skills, ~/.claude/skills)
-/// → additional paths from `config.paths`
-/// → Server (injected `config.server_skill_dirs`)
-/// → Bundled (injected `config.bundled_skill_dirs` + `~/.grok/bundled`; lowest precedence).
+/// Priority order: Local (cwd `.agents` then `.grok`, then vendor dirs) → Intermediate dirs →
+/// Repo (same name order under repo root) → User (`~/.agents/skills` then `~/.grok/skills`,
+/// then vendor homes) → additional paths from `config.paths` → Server → Bundled
+/// (`~/.grok/bundled`; lowest precedence).
+///
+/// **`.agents` before `.grok` at the same tier:** when both exist, the maintained
+/// agent skill tree wins (first-seen-wins name dedup). Grok-owned trees still
+/// supply skills that have no agents copy — regular Grok Build behavior plus
+/// an optional override layer.
 ///
 /// `config.ignore` globs are applied across all sources after collection.
 /// Skills with the same name from higher-priority sources override lower-priority ones.
@@ -168,8 +172,8 @@ pub fn collect_skill_config_dirs(
     };
 
     // Vendor dirs (`.claude`/`.cursor`) are gated by the resolved compat
-    // config; `.grok` and `.agents` are always present. When all cells are on
-    // this list equals the historical `[".grok", ".agents", ".claude", ".cursor"]`.
+    // config; `.agents` and `.grok` are always present (`.agents` first —
+    // see `CompatConfig::skill_config_dirs`).
     let config_dir_names = compat.skill_config_dirs();
 
     // Priority 1 & 2: Walk from cwd up to the git root.
@@ -199,13 +203,16 @@ pub fn collect_skill_config_dirs(
         }
     }
 
-    // Priority 3: Global user dirs. `.grok` comes from `grok_home` (which may
-    // be overridden), so it's handled separately; `.agents` is always added,
-    // while `.claude`/`.cursor` are gated by the skills compat cells.
-    try_add(grok_home);
+    // Priority 3: Global user dirs. Prefer `~/.agents` over `grok_home` so
+    // maintained agent skills override Grok user skills by name. `grok_home`
+    // may be relocated via config; vendor homes stay gated by compat cells.
     #[allow(deprecated)]
     if let Some(home) = std::env::home_dir() {
         try_add(home.join(".agents"));
+    }
+    try_add(grok_home);
+    #[allow(deprecated)]
+    if let Some(home) = std::env::home_dir() {
         if compat.claude.skills {
             try_add(home.join(".claude"));
         }
@@ -2120,6 +2127,75 @@ mod tests {
         assert!(
             names.contains(&"commit"),
             "Expected bundled 'commit' skill, got: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agents_home_skills_shadow_grok_user_skills() {
+        // When both ~/.agents/skills and ~/.grok/skills define the same name,
+        // agents wins (first-seen after Priority-3 order: agents then grok_home).
+        let tmp = tempfile::tempdir().unwrap();
+        let grok_home = tmp.path().join("grok_home");
+        let real_home = tmp.path().join("real_home");
+        let repo_root = tmp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_git_repo(&repo_root);
+
+        write_skill_md(&grok_home.join("skills").join("commit"), "commit");
+        // Agents copy: same frontmatter name, different path — must win.
+        write_skill_md(
+            &real_home.join(".agents").join("skills").join("commit"),
+            "commit",
+        );
+
+        // Point HOME at real_home so collect_skill_config_dirs finds .agents.
+        // grok_home is the separate Grok data root (skills under skills/).
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: test-only; single-threaded for this assertion path.
+        unsafe {
+            std::env::set_var("HOME", &real_home);
+        }
+
+        let raw = list_skills_with_options(
+            Some(repo_root.to_str().unwrap()),
+            None,
+            &grok_home,
+            CompatConfig::default(),
+        )
+        .await;
+
+        if let Some(h) = prev_home {
+            unsafe {
+                std::env::set_var("HOME", h);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+
+        // Both paths are discovered (different files); first-seen must be agents.
+        let first = raw
+            .iter()
+            .find(|s| s.name == "commit")
+            .expect("commit skill present");
+        assert!(
+            first.path.contains(".agents"),
+            "agents path must be first-seen, got {}",
+            first.path
+        );
+
+        let deduped = dedupe_skills(raw);
+        let commits: Vec<_> = deduped.iter().filter(|s| s.name == "commit").collect();
+        assert_eq!(
+            commits.len(),
+            1,
+            "expected one commit after dedup, got {commits:?}"
+        );
+        assert!(
+            commits[0].path.contains(".agents"),
+            "agents must override grok user skill, got path {}",
+            commits[0].path
         );
     }
 

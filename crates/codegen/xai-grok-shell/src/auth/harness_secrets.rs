@@ -60,6 +60,11 @@ pub const ZED_SECRET_SERVICE_LABEL: &str = "zed-github-account";
 /// (contains `development_credentials` in Dev channel).
 pub const GROK_ZED_CONFIG_DIR_ENV: &str = "GROK_ZED_CONFIG_DIR";
 
+/// When set (any value), skip all shared-harness OpenRouter probes (Zed file +
+/// OS keychain). Used by unit tests / `just test` so host Zed credentials do
+/// not pollute AuthStatus and credential-store assertions.
+pub const DISABLE_SHARED_HARNESS_ENV: &str = "GROK_DISABLE_SHARED_HARNESS_SECRETS";
+
 /// File name under Zed's config dir for the development credentials provider.
 pub const ZED_DEVELOPMENT_CREDENTIALS_FILE: &str = "development_credentials";
 
@@ -76,6 +81,9 @@ pub enum SharedKeySource {
 ///
 /// Order: Zed development credentials file → Zed OS store.
 pub fn probe_shared_openrouter_key(api_url: &str) -> Option<(String, SharedKeySource)> {
+    if std::env::var_os(DISABLE_SHARED_HARNESS_ENV).is_some() {
+        return None;
+    }
     let url = api_url.trim_end_matches('/');
     if url.is_empty() {
         return None;
@@ -131,7 +139,7 @@ pub fn zed_config_dir() -> Option<PathBuf> {
             let p = PathBuf::from(flatpak).join("zed");
             return Some(p);
         }
-        return dirs::config_dir().map(|d| d.join("zed"));
+        dirs::config_dir().map(|d| d.join("zed"))
     }
 
     #[cfg(target_os = "macos")]
@@ -158,17 +166,13 @@ pub fn zed_development_credentials_path() -> Option<PathBuf> {
 }
 
 /// Parse Zed `development_credentials` JSON: `HashMap<url, (username, password_bytes)>`.
-pub fn parse_zed_development_credentials(
-    json: &[u8],
-    url: &str,
-) -> Option<String> {
+pub fn parse_zed_development_credentials(json: &[u8], url: &str) -> Option<String> {
     let map: HashMap<String, (String, Vec<u8>)> = serde_json::from_slice(json).ok()?;
     let (username, secret) = map.get(url).or_else(|| {
         // Tolerate trailing-slash mismatch between settings and store key.
         let trimmed = url.trim_end_matches('/');
-        map.iter().find_map(|(k, v)| {
-            (k.trim_end_matches('/') == trimmed).then_some(v)
-        })
+        map.iter()
+            .find_map(|(k, v)| (k.trim_end_matches('/') == trimmed).then_some(v))
     })?;
     if !username.is_empty() && username != BEARER_USERNAME {
         tracing::debug!(
@@ -204,7 +208,7 @@ pub fn zed_windows_credential_target(url: &str) -> String {
 fn read_zed_os_keychain(url: &str) -> Option<String> {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
-        return read_zed_secret_service(url);
+        read_zed_secret_service(url)
     }
     #[cfg(target_os = "windows")]
     {
@@ -230,13 +234,11 @@ fn read_zed_os_keychain(url: &str) -> Option<String> {
 fn read_zed_secret_service(url: &str) -> Option<String> {
     use std::collections::HashMap as Map;
 
-    let ss = dbus_secret_service::SecretService::connect(
-        dbus_secret_service::EncryptionType::Dh,
-    )
-    .or_else(|_| {
-        dbus_secret_service::SecretService::connect(dbus_secret_service::EncryptionType::Plain)
-    })
-    .ok()?;
+    let ss = dbus_secret_service::SecretService::connect(dbus_secret_service::EncryptionType::Dh)
+        .or_else(|_| {
+            dbus_secret_service::SecretService::connect(dbus_secret_service::EncryptionType::Plain)
+        })
+        .ok()?;
 
     let attrs: Map<&str, &str> = Map::from([("url", url)]);
     let search = ss.search_items(attrs).ok()?;
@@ -269,11 +271,11 @@ fn read_zed_secret_service(url: &str) -> Option<String> {
 #[cfg(target_os = "windows")]
 fn read_zed_windows_credential(url: &str) -> Option<String> {
     use std::ptr;
-    use windows::core::PCWSTR;
     use windows::Win32::Foundation::ERROR_NOT_FOUND;
     use windows::Win32::Security::Credentials::{
-        CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
+        CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
     };
+    use windows::core::PCWSTR;
 
     let target = zed_windows_credential_target(url);
     let target_w: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
@@ -352,8 +354,7 @@ mod tests {
     #[test]
     fn parse_zed_dev_credentials_trailing_slash_tolerant() {
         let json = br#"{"https://openrouter.ai/api/v1":["Bearer",[97,98,99]]}"#;
-        let key =
-            parse_zed_development_credentials(json, "https://openrouter.ai/api/v1/").unwrap();
+        let key = parse_zed_development_credentials(json, "https://openrouter.ai/api/v1/").unwrap();
         assert_eq!(key, "abc");
     }
 

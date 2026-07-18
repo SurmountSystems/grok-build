@@ -13,8 +13,10 @@ use std::path::PathBuf;
 pub fn try_resolve_runfiles(_path: &str) -> Option<PathBuf> {
     #[cfg(feature = "bazel")]
     {
+        // runfiles 0.1: method on Runfiles (older crates used rlocation! macro).
         let r = runfiles::Runfiles::create().ok()?;
-        runfiles::rlocation!(r, _path)
+        let path = r.rlocation(_path);
+        path.exists().then_some(path)
     }
     #[cfg(not(feature = "bazel"))]
     {

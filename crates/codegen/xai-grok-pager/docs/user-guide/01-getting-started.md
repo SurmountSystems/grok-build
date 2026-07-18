@@ -18,7 +18,7 @@ You can use it interactively as a full-screen TUI, run it headlessly for scripti
 ### Grok OSS (this fork)
 
 ```bash
-# From a clone of SurmountSystems/grok-oss (or grok-build until renamed)
+# From a clone of SurmountSystems/grok-oss
 cargo install --path crates/codegen/xai-grok-pager-bin --locked --force
 grok-oss --version
 ```

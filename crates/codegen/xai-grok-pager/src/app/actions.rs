@@ -487,6 +487,11 @@ pub enum Action {
     /// cache mirror and persists to `[ui].prompt_suggestions` via
     /// `Effect::PersistSetting`.
     SetPromptSuggestions(bool),
+    /// Set whether a follow-up `/implement` in the prior prompt is auto-run
+    /// after a successful turn. SHELL-owned: updates the process-wide cache
+    /// mirror and persists to `[ui].auto_run_implement` via
+    /// `Effect::PersistSetting`.
+    SetAutoRunImplement(bool),
     /// Set `[scrollback.scroll].respect_manual_folds`. PAGER-owned:
     /// live-applied via `AppView::set_appearance` and persisted to
     /// pager.toml via `Effect::PersistSetting`.

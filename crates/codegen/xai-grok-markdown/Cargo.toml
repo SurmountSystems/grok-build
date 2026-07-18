@@ -55,3 +55,4 @@ playground = ["dep:crossterm", "dep:xai-ratatui-textarea"]
 [[bench]]
 name = "bench"
 harness = false
+

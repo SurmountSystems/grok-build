@@ -1024,6 +1024,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "auto_run_implement" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("auto_run_implement", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_auto_run_implement(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
         "keep_text_selection" => {
             let SettingValue::Enum(s) = value else {
                 return Err(kind_mismatch("keep_text_selection", "Enum", &value));

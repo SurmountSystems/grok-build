@@ -1430,6 +1430,18 @@ pub(super) fn handle_prompt_response(
             }
         }
 
+        // Auto-run a sentence-leading `/implement` follow-up from the prior
+        // user prompt (settings-gated, default on). Before drain so the
+        // enqueue is visible to `maybe_drain_queue`. Skip cancel/error/bash
+        // and when a server adoption already owns the running slot.
+        if result.is_ok()
+            && !was_cancelling
+            && !was_bash_turn
+            && agent.session.current_prompt_id.is_none()
+        {
+            crate::app::auto_implement::on_successful_turn_end(agent);
+        }
+
         let mut effects = maybe_drain_queue(agent);
 
         // Predicted-next-prompt (tab autocomplete): fetch a fresh suggestion

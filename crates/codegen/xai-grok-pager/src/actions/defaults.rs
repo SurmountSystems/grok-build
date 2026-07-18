@@ -626,7 +626,7 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             hint_key_display: None,
             requires_confirmation: false,
             long_help: Some(
-                "Sends a message to the agent mid-turn without cancelling it (interject), so you can steer or add context while it keeps working.\nPlain Enter while a turn is running queues a follow-up for later; this chord merges composer text into the current turn instead.\nWith an empty composer, bare Enter (or this chord) force-sends the top queued follow-up from the prompt — no need to focus the queue pane. On the queue pane, this chord force-sends the selected row.\nReach for it to correct course without losing the turn's progress.",
+                "Send now (cancel-and-send): stops the current turn and runs your message as the next one, so it appears at the bottom of the transcript.\nPlain Enter while a turn is running only queues a follow-up for later; use this chord when you need the agent to take the new message immediately.\nWith text in the composer, the chord cancels and sends that text. With an empty composer, bare Enter (or this chord) force-sends the top queued follow-up — no need to focus the queue pane. On the queue pane, this chord (or [Send now]) force-sends the selected row.\nIf nothing can be sent now, a short toast explains why (never a silent no-op).",
             ),
         },
         ActionDef {

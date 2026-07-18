@@ -6,13 +6,32 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: checkout + read contents only (no write to repo).
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Shared env for free ubuntu-latest (~4 vCPU / 16GB).
+# CI never builds a release package (no nix build .#grok-oss).
+# Single quality job: fmt / clippy / workspace tests (includes offline
+# openrouter_credentials integration tests via cargo test --workspace).
+env:
+  NIX_CONFIG: |
+    download-attempts = 5
+    connect-timeout = 30
+    stalled-download-timeout = 100
+    http-connections = 4
+  CI_SYSTEM: x86_64-linux
+  CI_LOW_MEM: "1"
+  NIX_BUILD_CORES: "2"
+
 jobs:
-  nix:
-    name: just ci
+  # fmt, clippy (-D warnings), full workspace tests -- not a release build.
+  quality:
+    name: just test
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -22,9 +41,70 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v16
 
-      - name: Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@v9
+      - name: Add swap
+        continue-on-error: true
+        run: |
+          set -u
+          free -h || true
+          swapon --show || true
+          SWAPFILE=/mnt/grok-ci-swapfile
+          if swapon --show 2>/dev/null | grep -qF "$SWAPFILE"; then
+            echo "already using $SWAPFILE"
+            exit 0
+          fi
+          sudo swapoff "$SWAPFILE" 2>/dev/null || true
+          sudo rm -f "$SWAPFILE" 2>/dev/null || true
+          if ! sudo fallocate -l 8G "$SWAPFILE" 2>/dev/null; then
+            sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count=8192 status=none || exit 0
+          fi
+          sudo chmod 600 "$SWAPFILE" || exit 0
+          sudo mkswap "$SWAPFILE" || exit 0
+          sudo swapon "$SWAPFILE" || exit 0
+          free -h || true
 
-      # Same entrypoint as local: `just ci` (see justfile).
-      - name: just ci
-        run: nix shell nixpkgs#just -c just ci
+      # Bootstrap flake-pinned just; retry cold flake eval only until .ci-started.
+      - name: just ci-prep && just test
+        run: |
+          set -euo pipefail
+          rm -f .ci-started
+          attempts=4
+          backoff=5
+          n=1
+          while true; do
+            echo "==> quality attempt ${n}/${attempts}"
+            set +e
+            nix shell .#just -c just flake-meta
+            status=$?
+            set -e
+            if [[ "${status}" -ne 0 ]]; then
+              if [[ "${n}" -ge "${attempts}" ]]; then
+                exit "${status}"
+              fi
+              echo "==> flake-meta failed; retry in ${backoff}s" >&2
+              sleep "${backoff}"
+              backoff=$((backoff * 3))
+              n=$((n + 1))
+              continue
+            fi
+            set +e
+            nix shell .#just -c just ci-prep
+            status=$?
+            set -e
+            if [[ "${status}" -ne 0 ]]; then
+              if [[ -f .ci-started ]]; then
+                echo "==> ci-prep already started cargo path; not re-running" >&2
+                exit "${status}"
+              fi
+              if [[ "${n}" -ge "${attempts}" ]]; then
+                exit "${status}"
+              fi
+              echo "==> ci-prep failed; retry in ${backoff}s" >&2
+              sleep "${backoff}"
+              backoff=$((backoff * 3))
+              n=$((n + 1))
+              continue
+            fi
+            # Cargo quality payload once (no outer retry of permanent fails).
+            nix shell .#just -c just test
+            exit $?
+          done

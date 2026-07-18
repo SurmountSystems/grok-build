@@ -31,7 +31,7 @@ pub enum SystemAppearance {
 /// For the extended chain that includes OSC 11 as a startup-only fallback,
 /// see [`detect_with_osc11_fallback`].
 ///
-/// In `#[cfg(test)]` builds, checks the mock override first so that
+/// In `#[cfg(any(test, feature = "test-support"))]` builds, checks the mock override first so that
 /// `SystemAppearanceWatcher`'s polling loop (which calls `detect()`
 /// directly) is also controllable from tests.
 #[must_use]
@@ -107,9 +107,9 @@ pub fn to_theme_kind(
 ///
 /// In test builds, a shorter interval (50ms) is used so polling tests
 /// complete quickly.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Watches for system appearance changes via polling.
@@ -198,7 +198,7 @@ pub fn clear_mock() {
     *MOCK_APPEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod tests {
     use super::super::cache as theme_cache;
     use super::*;

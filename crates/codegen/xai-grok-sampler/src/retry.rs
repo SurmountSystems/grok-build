@@ -5,19 +5,18 @@
 //!
 //! # Retry behavior summary
 //!
-//! **Retried** (up to [`DEFAULT_MAX_RETRIES`] = 15, ~6 min with 30s backoff cap):
+//! **Retried** until success (default budget: [`DEFAULT_MAX_RETRIES`] =
+//! [`u32::MAX`] — effectively unlimited; set `GROK_MAX_RETRIES` to cap):
 //! - 500, 502, 503, 504, 520 (server errors)
 //! - Connection errors (timeout, refused, reset)
 //! - `EventStreamError` / `StreamError` (mid-stream failures)
 //! - `EmptyResponse` (model returned no content/tool calls)
-//!
-//! **Retried with lower cap** ([`RATE_LIMIT_RETRY_THRESHOLD`] = 2):
-//! - 429 (rate limited) — avoids burning long waits
+//! - 429 (rate limited) — honors `Retry-After`, else exponential backoff
 //!
 //! **Special handling** (not counted against retry budget):
 //! - 413 / image processing errors → strip images and retry once
 //!
-//! **Not retried** (Fatal immediately):
+//! **Not retried** (Fatal immediately — not fixable by waiting):
 //! - 400, 401, 403, 404, 408, 422 (client errors)
 //! - `Auth` / `InvalidConfiguration` (credential/config issues)
 //! - `IdleTimeout` (model stuck, retry would stall again)
@@ -28,25 +27,37 @@
 //! - `false` → Fatal immediately, regardless of status code
 //! - `true` / absent → falls through to status-code logic above
 //!
-//! Today CCP's header mirrors the client's `is_retryable()` logic
-//! (4xx except 429 = false, 5xx + 429 = true), so no behavior changes
-//! on merge. The header enables future CCP-side refinements (e.g.
-//! marking content-caused 500s as non-retryable) without client updates.
+//! Backoff: exponential 2s → 4s → 8s → … capped at
+//! [`MAX_BACKOFF`] (60s) with ±20% jitter. Proxied providers (OpenRouter)
+//! need long tails; unlimited retries + cap keeps pressure reasonable.
 
 use std::time::Duration;
 
 use xai_grok_sampling_types::SamplingError;
 
-/// After this many rate-limit (429) retries, escalate to the caller
-/// instead of waiting again. Rate-limit waits can be long and there is
-/// no point burning a long backoff just to be rate-limited again.
-pub const RATE_LIMIT_RETRY_THRESHOLD: u32 = 2;
+/// Legacy name: rate-limit retries used to stop early. With unlimited
+/// defaults this matches [`DEFAULT_MAX_RETRIES`] so 429s keep retrying.
+pub const RATE_LIMIT_RETRY_THRESHOLD: u32 = u32::MAX;
 
-/// Default max retries when no env or model override is set.
-/// With 30s backoff cap this gives ~6 min of retry budget:
-/// retries 1-4 are exponential (2s+4s+8s+16s ≈ 30s), retries
-/// 5-15 are flat at ~30s each (≈ 5.5 min).
-pub const DEFAULT_MAX_RETRIES: u32 = 15;
+/// Default max retries: effectively unlimited. Transient proxy/upstream
+/// failures keep retrying with exponential backoff until success or the
+/// user cancels. Override with `GROK_MAX_RETRIES` or per-model config.
+pub const DEFAULT_MAX_RETRIES: u32 = u32::MAX;
+
+/// Ceiling for **jittered exponential** backoff between retries when the
+/// server did **not** send `Retry-After`. Shared / server-driven waits are
+/// uncapped by default (see `grok-rate-limit` and `extract_retry_after`).
+///
+/// Override with `GROK_MAX_BACKOFF_SECS` if needed; `0` or unset uses this default.
+pub const MAX_BACKOFF_SECS: u64 = 60;
+
+fn max_backoff_secs() -> u64 {
+    std::env::var("GROK_MAX_BACKOFF_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(MAX_BACKOFF_SECS)
+}
 
 /// Resolve max API retries from an optional env override, model config,
 /// or default ([`DEFAULT_MAX_RETRIES`]).
@@ -66,6 +77,11 @@ pub fn resolve_max_retries(model_max_retries: Option<u32>) -> u32 {
     resolve_max_retries_with_env(env_override.as_deref(), model_max_retries)
 }
 
+/// Whether the retry budget is treated as unlimited (no hard stop).
+pub fn is_unlimited_retries(max_retries: u32) -> bool {
+    max_retries == u32::MAX
+}
+
 /// Backoff for doom-loop resamples: near-immediate with a small jitter.
 /// Loops are stochastic at sampling temperature, so a fresh sample is the
 /// remedy — waiting buys nothing beyond de-syncing concurrent resamples.
@@ -81,8 +97,8 @@ pub fn doom_loop_backoff(retry_count: u32) -> Duration {
     Duration::from_millis(hasher.finish() % 251)
 }
 
-/// Exponential backoff (2s, 4s, 8s, ..., capped 30s) with +/-20% jitter
-/// to prevent thundering-herd retry storms.
+/// Exponential backoff (2s, 4s, 8s, ..., capped at [`MAX_BACKOFF_SECS`])
+/// with +/-20% jitter to prevent thundering-herd retry storms.
 pub fn retry_backoff_with_jitter(retry_count: u32) -> Duration {
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,7 +106,8 @@ pub fn retry_backoff_with_jitter(retry_count: u32) -> Duration {
     static JITTER_SEQ: AtomicU64 = AtomicU64::new(0);
 
     let shift = retry_count.saturating_sub(1);
-    let base_ms = 2000u64.checked_shl(shift).unwrap_or(u64::MAX).min(30_000);
+    let cap_ms = max_backoff_secs().saturating_mul(1000);
+    let base_ms = 2000u64.checked_shl(shift).unwrap_or(u64::MAX).min(cap_ms);
     let jitter_range = base_ms / 5;
     let mut hasher = std::hash::DefaultHasher::new();
     JITTER_SEQ.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
@@ -204,12 +221,12 @@ pub fn classify_error(
         };
     }
 
-    // Rate-limited (429): cap retries at the rate-limit threshold to
-    // avoid burning long waits.
+    // Rate-limited (429): honor Retry-After / exponential backoff.
+    // Unlimited budget (default) keeps trying until credits/upstream recover.
     if err.is_rate_limited() {
-        let next_attempt = retry_count + 1;
+        let next_attempt = retry_count.saturating_add(1);
         let effective_cap = max_retries.min(rate_limit_threshold);
-        if next_attempt >= effective_cap {
+        if !is_unlimited_retries(effective_cap) && next_attempt >= effective_cap {
             return RetryDecision::Fatal(clone_error(err));
         }
         let backoff = err
@@ -224,10 +241,10 @@ pub fn classify_error(
 
     // Generic retryable transport / 5xx errors. First retry rebuilds
     // the HTTP client with HTTP/1.1 to escape poisoned HTTP/2 pools;
-    // later retries just back off.
+    // later retries just back off. Unlimited by default.
     if err.is_retryable() {
-        let next_attempt = retry_count + 1;
-        if next_attempt >= max_retries {
+        let next_attempt = retry_count.saturating_add(1);
+        if !is_unlimited_retries(max_retries) && next_attempt >= max_retries {
             return RetryDecision::Fatal(clone_error(err));
         }
         let backoff = err
@@ -494,14 +511,67 @@ mod tests {
     }
 
     #[test]
-    fn backoff_doubles_then_caps_at_thirty_seconds() {
+    fn backoff_doubles_then_caps_at_max_backoff() {
         // retry_count=2: base 4s
         let r2 = retry_backoff_with_jitter(2);
         assert!(r2 >= Duration::from_millis(3200) && r2 <= Duration::from_millis(4800));
 
-        // retry_count=10: base would be 2^10 * 2000 = 2.048s but capped to 30s
+        // retry_count=10: base would exceed cap → MAX_BACKOFF_SECS (60s) ±20%
         let r10 = retry_backoff_with_jitter(10);
-        assert!(r10 >= Duration::from_millis(24_000) && r10 <= Duration::from_millis(36_000));
+        let cap_ms = MAX_BACKOFF_SECS * 1000;
+        assert!(
+            r10 >= Duration::from_millis(cap_ms * 4 / 5)
+                && r10 <= Duration::from_millis(cap_ms * 6 / 5),
+            "expected ~{cap_ms}ms cap, got {r10:?}"
+        );
+    }
+
+    #[test]
+    fn unlimited_retries_never_fatals_on_5xx() {
+        let err = api_err(StatusCode::BAD_GATEWAY, "proxy blip");
+        match classify_error(&err, 100, u32::MAX, RATE_LIMIT_RETRY_THRESHOLD) {
+            RetryDecision::Retry { .. } | RetryDecision::RetryWithClientRebuild { .. } => {}
+            other => panic!("expected Retry under unlimited budget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unlimited_retries_never_fatals_on_429() {
+        let err = api_err(StatusCode::TOO_MANY_REQUESTS, "slow down");
+        match classify_error(&err, 50, u32::MAX, RATE_LIMIT_RETRY_THRESHOLD) {
+            RetryDecision::RetryWithBackoff {
+                is_rate_limited: true,
+                ..
+            } => {}
+            other => panic!("expected rate-limit Retry under unlimited budget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_max_retries_is_unlimited() {
+        assert_eq!(DEFAULT_MAX_RETRIES, u32::MAX);
+        assert!(is_unlimited_retries(DEFAULT_MAX_RETRIES));
+        assert_eq!(resolve_max_retries_with_env(None, None), u32::MAX);
+    }
+
+    #[test]
+    fn resolve_max_retries_env_can_cap() {
+        assert_eq!(resolve_max_retries_with_env(Some("3"), None), 3);
+        assert_eq!(resolve_max_retries_with_env(Some("3"), Some(99)), 3);
+    }
+
+    #[test]
+    fn long_retry_after_on_429_is_used() {
+        let err = api_err_with_retry_after(StatusCode::TOO_MANY_REQUESTS, 3600);
+        match classify_error(&err, 0, u32::MAX, RATE_LIMIT_RETRY_THRESHOLD) {
+            RetryDecision::RetryWithBackoff {
+                backoff,
+                is_rate_limited: true,
+            } => {
+                assert_eq!(backoff, Duration::from_secs(3600));
+            }
+            other => panic!("expected 3600s Retry-After, got {other:?}"),
+        }
     }
 
     #[test]
@@ -610,8 +680,8 @@ mod tests {
     #[test]
     fn classify_rate_limited_capped_at_threshold() {
         let err = api_err(StatusCode::TOO_MANY_REQUESTS, "slow");
-        // retry_count=1, threshold=2 -> next_attempt=2 >= 2 -> Fatal.
-        match classify_error(&err, 1, 5, RATE_LIMIT_RETRY_THRESHOLD) {
+        // Explicit finite threshold: retry_count=1, threshold=2 -> next=2 >= 2 -> Fatal.
+        match classify_error(&err, 1, 5, 2) {
             RetryDecision::Fatal(SamplingError::Api { status, .. }) => {
                 assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
             }

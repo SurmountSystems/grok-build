@@ -101,10 +101,13 @@ mod tests {
     /// Isolate process-global auth sources that `AuthStatus::resolve` consults.
     ///
     /// Uses `GROK_AUTH_PATH` (not `GROK_HOME`) so a OnceLock-cached real home
-    /// with `auth.json` cannot leak into these tests.
-    fn isolate_auth_sources() -> (tempfile::TempDir, [EnvGuard; 7]) {
+    /// with `auth.json` cannot leak into these tests. Also clears OpenRouter
+    /// env + shared-harness probes so a developer machine with
+    /// `OPENROUTER_API_KEY` / Zed keys does not advertise BYOK models.
+    fn isolate_auth_sources() -> (tempfile::TempDir, [EnvGuard; 10]) {
         let dir = tempfile::tempdir().unwrap();
         let auth_path = dir.path().join("no-auth.json");
+        let zed_empty = dir.path().join("no-zed-config");
         let guards = [
             EnvGuard::unset(XAI_API_KEY_ENV_VAR),
             EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR),
@@ -113,6 +116,12 @@ mod tests {
             EnvGuard::unset("GROK_DEPLOYMENT_KEY"),
             EnvGuard::unset("GROK_WS_ORIGIN"),
             EnvGuard::unset("GROK_DISABLE_API_KEY_AUTH"),
+            EnvGuard::unset(crate::auth::OPENROUTER_API_KEY_ENV),
+            EnvGuard::set(
+                crate::auth::GROK_ZED_CONFIG_DIR_ENV,
+                zed_empty.to_str().unwrap(),
+            ),
+            EnvGuard::set(crate::auth::DISABLE_SHARED_HARNESS_ENV, "1"),
         ];
         (dir, guards)
     }

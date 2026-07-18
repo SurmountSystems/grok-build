@@ -32,10 +32,18 @@ rustflags = [
 ]
 
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "force-unwind-tables=yes"]
+rustflags = [
+    "-C", "force-unwind-tables=yes",
+    # Prefer mold over host defaults (e.g. ~/.cargo fuse-ld=wild). Last -fuse-ld wins.
+    "-C", "link-arg=-fuse-ld=mold",
+]
 
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=neoverse-v2", "-C", "force-unwind-tables=yes"]
+rustflags = [
+    "-C", "target-cpu=neoverse-v2",
+    "-C", "force-unwind-tables=yes",
+    "-C", "link-arg=-fuse-ld=mold",
+]
 
 [target.x86_64-unknown-linux-musl]
 rustflags = [
@@ -45,6 +53,7 @@ rustflags = [
     # IMPORTANT: If changing build system (e.g. from cargo to Bazel-only),
     # ensure equivalent linker hardening is applied to production binaries.
     "-C", "link-arg=-Wl,-z,relro,-z,now,-z,noexecstack",
+    "-C", "link-arg=-fuse-ld=mold",
 ]
 
 [target.aarch64-unknown-linux-musl]
@@ -56,6 +65,7 @@ rustflags = [
     # IMPORTANT: If changing build system (e.g. from cargo to Bazel-only),
     # ensure equivalent linker hardening is applied to production binaries.
     "-C", "link-arg=-Wl,-z,relro,-z,now,-z,noexecstack",
+    "-C", "link-arg=-fuse-ld=mold",
 ]
 
 [target.x86_64-pc-windows-msvc]

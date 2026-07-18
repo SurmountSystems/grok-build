@@ -29,6 +29,52 @@ use crate::retry::{
 use crate::stream::{stream_chat_completions, stream_messages, stream_responses};
 use crate::types::RequestId;
 
+use grok_rate_limit::{ProviderKey, RateLimitMeta, SharedRateLimitStore, fingerprint_secret};
+
+fn provider_key_for_config(config: &SamplerConfig) -> ProviderKey {
+    match config.api_key.as_deref() {
+        Some(k) if !k.is_empty() => {
+            ProviderKey::from_base_url_and_key_fingerprint(&config.base_url, &fingerprint_secret(k))
+        }
+        _ => ProviderKey::from_base_url(&config.base_url),
+    }
+}
+
+/// Before each HTTP attempt: honor any shared cross-process cooldown.
+async fn wait_before_attempt(config: &SamplerConfig) {
+    let store = SharedRateLimitStore::process_default();
+    store
+        .wait_if_limited(&provider_key_for_config(config))
+        .await;
+}
+
+/// After a failed attempt: on 429 publish shared cooldown; always wait shared
+/// then apply local backoff for non-429 (429 is fully covered by shared wait).
+async fn sleep_for_retry(config: &SamplerConfig, err: &SamplingError, local_backoff: Duration) {
+    let store = SharedRateLimitStore::process_default();
+    let key = provider_key_for_config(config);
+    if err.is_rate_limited() {
+        let wait = err
+            .retry_after()
+            .map(Duration::from_secs)
+            .unwrap_or(local_backoff);
+        let meta = RateLimitMeta {
+            status: Some(429),
+            reason: Some(err.to_string()),
+        };
+        if let Err(e) = store.observe(&key, wait, meta) {
+            tracing::debug!(error = %e, "shared rate limit observe failed");
+        }
+        store.wait_if_limited(&key).await;
+    } else {
+        // Peers may still have a host-level cooldown; then local exp backoff.
+        store.wait_if_limited(&key).await;
+        if !local_backoff.is_zero() {
+            tokio::time::sleep(local_backoff).await;
+        }
+    }
+}
+
 /// Default per-chunk idle timeout when neither config nor caller
 /// supplies one. Matches the shell's session-level default
 /// (5 minutes -- long enough for cold-start reasoning, short enough
@@ -122,6 +168,13 @@ pub(crate) async fn run_request_task(
     let mut doom_retry_count: u32 = 0;
 
     loop {
+        if cancel_token.is_cancelled() {
+            handle_cancellation(&event_tx, &request_id, &mut completion_tx);
+            return request_id;
+        }
+
+        // Cross-process rate-limit coordination (Grok OSS): wait until peers say open.
+        wait_before_attempt(&config).await;
         if cancel_token.is_cancelled() {
             handle_cancellation(&event_tx, &request_id, &mut completion_tx);
             return request_id;
@@ -231,6 +284,7 @@ pub(crate) async fn run_request_task(
                         doom_retry_count,
                         doom_max_retries,
                         &error,
+                        &config,
                     );
                     tokio::time::sleep(backoff).await;
                     continue;
@@ -320,14 +374,14 @@ async fn apply_retry_decision(
     match decision {
         RetryDecision::Retry { backoff } => {
             *retry_count += 1;
-            emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
-            tokio::time::sleep(backoff).await;
+            emit_retrying(event_tx, request_id, *retry_count, max_retries, err, config);
+            sleep_for_retry(config, err, backoff).await;
             true
         }
         RetryDecision::RetryWithBackoff { backoff, .. } => {
             *retry_count += 1;
-            emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
-            tokio::time::sleep(backoff).await;
+            emit_retrying(event_tx, request_id, *retry_count, max_retries, err, config);
+            sleep_for_retry(config, err, backoff).await;
             true
         }
         RetryDecision::RetryWithImageStrip => {
@@ -339,13 +393,13 @@ async fn apply_retry_decision(
                 return false;
             }
             *retry_count += 1;
-            emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
+            emit_retrying(event_tx, request_id, *retry_count, max_retries, err, config);
             true
         }
         RetryDecision::RetryWithClientRebuild { backoff } => {
             *retry_count += 1;
-            emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
-            tokio::time::sleep(backoff).await;
+            emit_retrying(event_tx, request_id, *retry_count, max_retries, err, config);
+            sleep_for_retry(config, err, backoff).await;
 
             // Rebuild client with HTTP/1.1 fallback to escape poisoned
             // HTTP/2 connection pools.
@@ -375,11 +429,14 @@ async fn apply_retry_decision(
             // cap), mirroring `classify_error`'s Fatal conditions — NOT on a
             // server `x-should-retry: false` or a non-retryable error, which
             // are also Fatal but are not "exhausted".
-            let next_attempt = *retry_count + 1;
+            let next_attempt = (*retry_count).saturating_add(1);
             let server_said_stop = matches!(err.should_retry_header(), Some(false));
+            // Unlimited (u32::MAX) never exhausts by budget.
             let budget_exhausted = !server_said_stop
+                && !retry_mod::is_unlimited_retries(max_retries)
                 && if err.is_rate_limited() {
-                    next_attempt >= max_retries.min(rate_limit_threshold)
+                    let cap = max_retries.min(rate_limit_threshold);
+                    !retry_mod::is_unlimited_retries(cap) && next_attempt >= cap
                 } else {
                     err.is_retryable() && next_attempt >= max_retries
                 };
@@ -693,14 +750,27 @@ fn emit_retrying(
     attempt: u32,
     max_retries: u32,
     err: &SamplingError,
+    config: &SamplerConfig,
 ) {
     let info = SamplingErrorInfo::from(err);
+    let mut reason = err.to_string();
+    if err.is_rate_limited() {
+        let key = provider_key_for_config(config);
+        let rem = SharedRateLimitStore::process_default().remaining(&key);
+        if let Some(secs) = err.retry_after() {
+            reason = format!("{reason} · wait {secs}s (shared across grok-oss processes)");
+        } else if !rem.is_zero() {
+            reason = format!("{reason} · shared wait {}s", rem.as_secs().max(1));
+        } else {
+            reason = format!("{reason} · coordinating with other grok-oss sessions");
+        }
+    }
     let _ = event_tx.send(SamplingEvent::Retrying {
         request_id: request_id.clone(),
         attempt,
         max_retries,
         kind: info.kind,
-        reason: err.to_string(),
+        reason,
         doom_loop_triggers: info.doom_loop_triggers,
         doom_loop_aborted_at_chunk: info.doom_loop_aborted_at_chunk,
     });

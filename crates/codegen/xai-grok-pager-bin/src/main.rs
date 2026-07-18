@@ -2114,9 +2114,16 @@ fn build_update_config() -> UpdateConfig {
     }
     config
 }
-/// Central gate for auto-update checks; add new suppression rules here,
-/// not at call sites.
+/// Centralized gate for all auto-update checks. Add new suppression
+/// rules here — not at each call site.
+///
+/// Grok OSS does **not** use xAI's GCS/npm update channel (`x.ai/cli`,
+/// `@xai-official/grok`). Opt in only with `GROK_OSS_ENABLE_XAI_UPDATER=1`.
 fn should_check_for_updates(no_auto_update_flag: bool) -> bool {
+    // Grok OSS: do not use xAI GCS/npm update channel unless explicitly opted in.
+    if std::env::var_os("GROK_OSS_ENABLE_XAI_UPDATER").is_none() {
+        return false;
+    }
     if cfg!(debug_assertions) {
         return false;
     }

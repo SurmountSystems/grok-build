@@ -1,27 +1,43 @@
 #!/usr/bin/env bash
-# Merge xai-org/grok-build into the current branch (usually main).
-# See FORK.md for policy. Prefer merge over rebase for main.
+# Entry point for "get latest xAI open-source export into Grok OSS".
+#
+# xAI force-pushes orphan monorepo snapshots — a plain `git merge` is wrong.
+# This script detects new content and points you at the import workflow.
+# See docs/upstream-history.md.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
-UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/xai-org/grok-build.git}"
-UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
+echo "=== Grok OSS upstream sync (export-aware) ==="
+echo "Policy: Surmount history is canonical; xAI tip is a content feed."
+echo
 
-if ! git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1; then
-  echo "Adding remote '$UPSTREAM_REMOTE' -> $UPSTREAM_URL"
-  git remote add "$UPSTREAM_REMOTE" "$UPSTREAM_URL"
-fi
+set +e
+./scripts/detect-upstream-export.sh
+code=$?
+set -e
 
-echo "Fetching $UPSTREAM_REMOTE/$UPSTREAM_BRANCH ..."
-git fetch "$UPSTREAM_REMOTE" "$UPSTREAM_BRANCH"
-
-CURRENT="$(git branch --show-current)"
-echo "Merging $UPSTREAM_REMOTE/$UPSTREAM_BRANCH into $CURRENT ..."
-git merge "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" --no-edit \
-  -m "Merge upstream $UPSTREAM_REMOTE/$UPSTREAM_BRANCH into $CURRENT"
-
-echo "Done. Resolve any conflicts (often FORK branding files), then push."
-echo "Update FORK.md divergences checklist if you keep new fork-only changes."
+case $code in
+  0)
+    echo
+    echo "No new export content. Nothing to import."
+    exit 0
+    ;;
+  2)
+    echo
+    echo "New export available."
+    if [[ "${IMPORT_NOW:-}" == "1" ]]; then
+      exec ./scripts/import-upstream-export.sh
+    fi
+    echo "Review the delta, then run:"
+    echo "  ./scripts/import-upstream-export.sh"
+    echo "Or auto-create a review branch:"
+    echo "  IMPORT_NOW=1 ./scripts/sync-upstream.sh"
+    exit 2
+    ;;
+  *)
+    echo "detect-upstream-export failed (exit $code)" >&2
+    exit "$code"
+    ;;
+esac

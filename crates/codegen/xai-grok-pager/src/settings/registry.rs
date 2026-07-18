@@ -549,6 +549,10 @@ pub fn current_value_for(
         "prompt_suggestions" => Some(SettingValue::Bool(
             crate::appearance::cache::load_prompt_suggestions(),
         )),
+        // Live cache (like `prompt_suggestions`).
+        "auto_run_implement" => Some(SettingValue::Bool(
+            crate::appearance::cache::load_auto_run_implement(),
+        )),
         "respect_manual_folds" => Some(SettingValue::Bool(pager.respect_manual_folds)),
         // SHELL — canonicalized from `[ui].hunk_tracker_mode`.
         "hunk_tracker_mode" => Some(SettingValue::Enum(canonical_hunk_tracker_mode(
@@ -946,6 +950,15 @@ mod tests {
                         ui.prompt_suggestions.unwrap_or(true),
                         "prompt_suggestions default drifts from UiConfig::default()"
                     );
+                }
+                // auto_run_implement: Option<bool>; None → true (client default).
+                ("auto_run_implement", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.auto_run_implement.unwrap_or(true),
+                        "auto_run_implement default drifts from UiConfig::default()"
+                    );
+                    assert!(*default, "auto_run_implement must default ON");
                 }
                 ("keep_text_selection", SettingKind::Enum { default, .. }) => {
                     let expected = if ui.keep_text_selection_enabled() {

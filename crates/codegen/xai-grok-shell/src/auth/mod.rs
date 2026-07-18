@@ -37,21 +37,21 @@ pub use flow::{
 pub use jwt::{is_jwt_expired_or_near, parse_jwt_expiration};
 mod meta;
 pub use error::{AuthError, RefreshTokenError, RefreshTokenFailedReason};
+pub use harness_secrets::{
+    DISABLE_SHARED_HARNESS_ENV, GROK_ZED_CONFIG_DIR_ENV, SharedKeySource,
+    probe_shared_openrouter_key, probe_shared_openrouter_key_default,
+};
 pub use manager::{AuthManager, shared_api_key_provider};
 pub use meta::{AuthMeta, GateInfo};
 pub use model::{AuthMode, GrokAuth, lookup_auth};
 pub(crate) use model::{TOKEN_TTL, UserInfo, is_expired, token_suffix};
-pub(crate) use refresh::DiagnosticUploader;
-pub use harness_secrets::{
-    GROK_ZED_CONFIG_DIR_ENV, SharedKeySource, probe_shared_openrouter_key,
-    probe_shared_openrouter_key_default,
-};
 pub use openrouter::{
     OPENROUTER_API_KEY_ENV, OPENROUTER_API_URL, OPENROUTER_GROK_45_CATALOG_ID, OpenRouterAuthError,
     clear_openrouter_api_key, has_openrouter_api_key, load_openrouter_api_key,
     load_openrouter_api_key_default, run_openrouter_login, run_openrouter_logout,
     store_openrouter_api_key,
 };
+pub(crate) use refresh::DiagnosticUploader;
 pub use storage::{
     clear_api_key, read_api_key, read_auth_json, read_token_by_scope, store_api_key,
 };

@@ -23,17 +23,17 @@ pub const DEFAULT_OUTPUT_BYTE_LIMIT: usize = 30_000; // 30k characters
 
 /// Resolved absolute path to bash. On Unix uses the `xai_grok_config` shell
 /// resolution cascade (`$GROK_SHELL` > `$SHELL` > `which` > common dirs >
-/// `/bin/bash`) and is cached process-wide. On non-Unix returns `"/bin/bash"`
-/// — but every caller in this crate is gated behind `#[cfg(unix)]`, so the
-/// non-Unix value should not be observed in practice.
-pub fn default_shell_path() -> &'static str {
+/// `/bin/bash`) and is cached process-wide (re-resolved if the path vanishes).
+/// On non-Unix returns `"/bin/bash"` — but every caller in this crate is gated
+/// behind `#[cfg(unix)]`, so the non-Unix value should not be observed in practice.
+pub fn default_shell_path() -> String {
     #[cfg(unix)]
     {
         xai_grok_config::shell::unix_shell_path(xai_grok_config::shell::UnixShellKind::Bash)
     }
     #[cfg(not(unix))]
     {
-        "/bin/bash"
+        "/bin/bash".to_string()
     }
 }
 

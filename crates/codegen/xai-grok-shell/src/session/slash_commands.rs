@@ -904,8 +904,8 @@ pub(super) async fn build_skill_information_for_refs(
     session_id: &str,
 ) -> Option<String> {
     use xai_grok_tools::implementations::skills::skill::{
-        SkillRef, SubstitutionContext, apply_substitutions, build_skill_block,
-        build_skill_information, load_skill_content,
+        SkillRef, SubstitutionContext, apply_substitutions, build_skill_block_with_run_id,
+        build_skill_information, load_skill_content, mint_skill_run_id,
     };
 
     let mut skill_blocks: Vec<String> = Vec::new();
@@ -925,17 +925,23 @@ pub(super) async fn build_skill_information_for_refs(
                 } else {
                     Some(sk.args.as_str())
                 };
+                // Host-mint once per skill expansion so ${RUN_ID} and the
+                // envelope run_id attribute stay consistent (no model/shell).
+                let run_id = mint_skill_run_id();
                 apply_substitutions(
                     &mut content,
                     args,
                     &SubstitutionContext {
                         skill_dir,
                         session_id: Some(session_id),
+                        run_id: Some(run_id.as_str()),
                         plugin_root: info.plugin_root.as_deref(),
                         plugin_data: info.plugin_data.as_deref(),
                     },
                 );
-                skill_blocks.push(build_skill_block(&sk.name, &sk.args, &content));
+                skill_blocks.push(build_skill_block_with_run_id(
+                    &sk.name, &sk.args, &content, &run_id,
+                ));
             }
             Err(e) => {
                 tracing::warn!(skill = %sk.name, error = %e, "failed to load skill for expansion");
@@ -1341,8 +1347,12 @@ mod tests {
             .expect("skill body must load");
         assert!(info.starts_with("<skill_information>"), "got: {info}");
         assert!(
-            info.contains("<skill name=\"commit\" args=\"fix typo\">"),
+            info.contains("<skill name=\"commit\" args=\"fix typo\" run_id=\""),
             "got: {info}"
+        );
+        assert!(
+            info.contains("Host-minted run_id"),
+            "host must inject run_id preamble: {info}"
         );
         assert!(
             info.contains("Body with fix typo"),
