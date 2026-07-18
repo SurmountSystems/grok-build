@@ -70,15 +70,71 @@ Surmount main (canonical continuous history)
 Git may never see a merge-base with `xai-org/main`. **That is fine.** We use
 **tree identity** (`git rev-parse <export>^{tree}`) as the upstream pin.
 
+## Put Surmount history on their tip (`put-history-on-xai`)
+
+**This is the script for “our history on theirs”.** Import (below) is the
+*opposite* direction (their tree into Surmount).
+
+After each export, rebuild a branch **parented at their tip** that carries
+Surmount’s product narrative. When they force-break history again, re-run —
+nothing depends on a stable xAI parent chain.
+
+```
+xai-org/main @ T2  (orphan / re-rooted tip)
+        │
+        ├── onto-xai/<short>  (MODE=history)     ← put-history-on-xai.sh
+        │     Surmount first-parent commits stacked via commit-tree
+        │     final tree == Surmount main; parents start at T2
+        │
+        └── onto-xai/<short>  (MODE=overlay)
+              single commit: T2 tree + Surmount fork/product seams
+```
+
+| Goal | Command |
+|------|---------|
+| Stack **current branch** on their tip | `./scripts/put-history-on-xai.sh` |
+| Stack published main only | `SURMOUNT_REF=origin/main ./scripts/put-history-on-xai.sh` |
+| One contribution-shaped commit on their tip | `MODE=overlay ./scripts/put-history-on-xai.sh` |
+| Rebuild after next force-export | `./scripts/put-history-on-xai.sh` (replaces `onto-xai/*`) |
+| Log | [`docs/upstream-onto-log.md`](upstream-onto-log.md) |
+
+Default Surmount tip is **HEAD of the branch you are on** (e.g. `merge-2`), so
+in-flight commits are included. Only when you are on `onto-xai/*` / `import/*`
+(or detached) does it fall back to `origin/main`.
+
+`scripts/replay-onto-upstream.sh` is a thin alias of the same script.
+
+**How history mode works:** cherry-pick/format-patch usually fails (export
+trees diverge). We **stack trees** with `git commit-tree`: each Surmount
+first-parent commit after the seed becomes a new commit with the same tree
+and message, parented on the previous stack commit (first parent = xAI tip).
+Result: `git merge-base --is-ancestor xai-org/main onto-xai/…` is true, and
+`git log xai-org/main..onto-xai/…` lists our work.
+
+**Limits (honest):**
+
+- We **cannot** force-push or rewrite `xai-org/main` (pull-only remote).
+- GitHub’s fork compare may still say “different histories” until a PR head
+  is pushed that is a **descendant** of their current tip (onto-xai branches are).
+- History mode tip tree is **pure Surmount**, not “xAI plus delta” — use
+  overlay when you want their latest export files under our seams.
+- Overlay is not a full three-way merge of every file; it overlays known fork
+  paths, product seams, and paths added on Surmount since seed. Re-review
+  before opening a PR to xAI.
+
+**Never** reset Surmount `main` to an onto-xai tip to “match” them.
+
 ## Tools
 
 | Tool | Role |
 |------|------|
+| [`scripts/put-history-on-xai.sh`](../scripts/put-history-on-xai.sh) | **Our history on their tip** → `onto-xai/<short>` (re-run replaces branch) |
+| [`scripts/import-upstream-export.sh`](../scripts/import-upstream-export.sh) | **Their tree into Surmount** → `import/*` content-import review branch |
 | [`scripts/detect-upstream-export.sh`](../scripts/detect-upstream-export.sh) | Fetch xAI tip; compare to last imported tree; exit codes for CI |
-| [`scripts/import-upstream-export.sh`](../scripts/import-upstream-export.sh) | Build a review branch with a clean content import commit (refuses dirty trees; base defaults to `origin/main`, not your feature branch) |
-| [`scripts/sync-upstream.sh`](../scripts/sync-upstream.sh) | Wrapper: detect → print next steps (no lazy merge) |
+| [`scripts/sync-upstream.sh`](../scripts/sync-upstream.sh) | Detect → print both directions (or `PUT_ON_XAI=1` / `IMPORT_NOW=1`) |
+| [`scripts/replay-onto-upstream.sh`](../scripts/replay-onto-upstream.sh) | Alias of `put-history-on-xai.sh` |
 | [`.github/workflows/upstream-export.yml`](../.github/workflows/upstream-export.yml) | Scheduled detection; opens issue when a new export appears |
-| Agent skill `upstream-export-import` | Review checklist for humans/agents |
+| Agent skill `upstream-export-import` | Checklist for both directions |
 
 ### Import safety (in-flight feature work)
 

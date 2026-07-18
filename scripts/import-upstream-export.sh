@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Create a review branch that imports a new xAI monorepo export as a normal
-# Surmount commit (content import), without requiring shared git ancestry.
+# Absorb an xAI monorepo export INTO Surmount as a normal content-import commit.
+#
+# Direction: their tree → Surmount branch import/xai-export-*
+# Opposite (our history ON their tip): ./scripts/put-history-on-xai.sh
 #
 # Does NOT push. Does NOT update main. Does NOT touch your feature branch
 # except to switch away temporarily (returns you when done unless --stay).
@@ -120,10 +122,14 @@ FORK_PATHS=(
   flake.lock
   docs/upstream-history.md
   docs/upstream-import-log.md
+  docs/upstream-onto-log.md
+  docs/git-workflow.md
   packaging
   scripts/detect-upstream-export.sh
   scripts/import-upstream-export.sh
   scripts/sync-upstream.sh
+  scripts/put-history-on-xai.sh
+  scripts/replay-onto-upstream.sh
   .github/workflows/upstream-export.yml
   crates/codegen/grok-rate-limit
 )
