@@ -38,6 +38,25 @@ pub struct PendingRoutstrSpend {
     pub fee_rate_sat_vb: Option<u64>,
 }
 
+/// Pending `/routstr rbf` parameters awaiting `/routstr unlock` re-entry.
+///
+/// Same-input BIP-125 replacement only: original fee/vbytes + prevout specs.
+/// Never BIP-39. Mutually exclusive with [`PendingRoutstrSpend`] (staging one
+/// cancels the other).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRoutstrRbf {
+    pub agent_id: crate::app::agent::AgentId,
+    pub address: String,
+    pub amount_sats: u64,
+    pub original_fee_sats: u64,
+    pub original_vbytes: u64,
+    /// Wire form `txid:vout:amount:address` (parsed again at authorize).
+    pub input_specs: Vec<String>,
+    pub broadcast: bool,
+    /// Explicit user rate, or `None` to resolve at authorize (halfHour/default).
+    pub fee_rate_sat_vb: Option<u64>,
+}
+
 /// State for the "New Worktree" popup dialog on the welcome screen.
 #[derive(Debug, Default)]
 pub struct NewWorktreeDialogState {
@@ -711,11 +730,20 @@ pub struct AppView {
     /// Pending on-chain spend waiting for `/routstr unlock` re-entry.
     ///
     /// Set by `/routstr spend`; cleared on cancel (`/routstr fund`), supersede
-    /// (re-stage spend), or unlock re-entry consumption into the spend effect.
+    /// (re-stage spend or stage rbf), or unlock re-entry consumption into the
+    /// spend effect.
     /// **Not** cleared when an in-flight spend task completes — that would
     /// silently drop a newer stage started while the prior task was running.
     /// Never stores BIP-39 — only payment parameters (+ staging agent_id).
+    /// Mutually exclusive with [`Self::pending_routstr_rbf`].
     pub pending_routstr_spend: Option<PendingRoutstrSpend>,
+    /// Pending same-input RBF waiting for `/routstr unlock` re-entry.
+    ///
+    /// Set by `/routstr rbf`; cleared on cancel (`/routstr fund`), supersede
+    /// (re-stage rbf or stage spend), or unlock consumption into the rbf effect.
+    /// **Not** cleared when an in-flight rbf task completes (same as spend).
+    /// Never stores BIP-39. Mutually exclusive with [`Self::pending_routstr_spend`].
+    pub pending_routstr_rbf: Option<PendingRoutstrRbf>,
     /// Periodic billing poll requested (credits >= 99%).
     pub billing_poll_wanted: bool,
     /// Leader-mode session roster (FleetView dashboard). Populated from
@@ -1415,6 +1443,7 @@ impl AppView {
             routstr_watch_last_scrollback: None,
             routstr_watch_error_streak: 0,
             pending_routstr_spend: None,
+            pending_routstr_rbf: None,
             billing_poll_wanted: false,
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),
@@ -5388,6 +5417,7 @@ pub(crate) mod tests {
             routstr_watch_last_scrollback: None,
             routstr_watch_error_streak: 0,
             pending_routstr_spend: None,
+            pending_routstr_rbf: None,
             billing_poll_wanted: false,
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),

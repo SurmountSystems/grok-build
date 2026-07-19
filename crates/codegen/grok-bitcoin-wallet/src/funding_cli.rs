@@ -769,9 +769,9 @@ pub fn format_spend_fee_meta_lines(
             "Fee rate: requested {requested_fee_rate_sat_vb} sat/vB; effective ~{effective} sat/vB \
              ({fee_sats} sats / {vbytes} vB)."
         ),
-        "Inputs signal RBF (BIP-125). To bump a stuck spend, use `grok routstr rbf` with \
-         --original-fee / --original-vbytes from this meta and each --input line below \
-         (same prevouts). Dry-run fee+vB alone is not enough for a true replace-by-fee."
+        "Inputs signal RBF (BIP-125). To bump a stuck spend, use `grok routstr rbf` or \
+         `/routstr rbf` with original-fee / original-vbytes from this meta and each input \
+         line below (same prevouts). Dry-run fee+vB alone is not enough for a true replace-by-fee."
             .to_owned(),
     ]
 }
@@ -993,6 +993,9 @@ pub fn spend_usage_lines() -> Vec<String> {
          --input <txid:vout:amount:address> [...] [--fee-rate <n>] [--broadcast]"
             .to_owned(),
         "  /routstr spend <address> <sats> [broadcast] [fee=<n>]".to_owned(),
+        "  /routstr rbf <address> <sats> original-fee=<n> original-vbytes=<n> \
+         input=<txid:vout:amount:address> [...] [broadcast] [fee=<n>]"
+            .to_owned(),
         "Default is dry-run (build/sign/extract only). SeedVault unlock + recovery-phrase \
          re-entry required; BIP-39 never goes to chat history or CredentialsStore."
             .to_owned(),
@@ -1001,10 +1004,10 @@ pub fn spend_usage_lines() -> Vec<String> {
          hex before explorer acceptance; on broadcast failure the signed hex is shown for \
          external broadcast."
             .to_owned(),
-        "Fee: omit --fee-rate to use explorer halfHour estimates when available, else \
+        "Fee: omit --fee-rate / fee= to use explorer halfHour estimates when available, else \
          default 5 sat/vB. Inputs signal RBF (BIP-125). To replace a stuck spend, use \
-         `grok routstr rbf` with --original-fee/--original-vbytes and each --input from the \
-         prior dry-run meta (same prevouts; never invents witnesses)."
+         `grok routstr rbf` or `/routstr rbf` with original-fee/original-vbytes and each \
+         input= from the prior dry-run meta (same prevouts; never invents witnesses)."
             .to_owned(),
     ]
 }
@@ -1064,6 +1067,18 @@ pub enum RbfReplaceParseError {
     MissingInputs,
     /// Malformed `--input txid:vout:amount:address`.
     InvalidInput(String),
+    /// TUI/token parse: missing payment address.
+    MissingAddress,
+    /// TUI/token parse: missing amount.
+    MissingAmount,
+    /// TUI/token parse: amount not an integer.
+    InvalidAmount(String),
+    /// TUI/token parse: `original-fee=` omitted.
+    MissingOriginalFee,
+    /// TUI/token parse: `original-vbytes=` omitted.
+    MissingOriginalVbytes,
+    /// TUI/token parse: unknown token (fail closed).
+    UnknownToken(String),
 }
 
 impl std::fmt::Display for RbfReplaceParseError {
@@ -1079,6 +1094,22 @@ impl std::fmt::Display for RbfReplaceParseError {
                  (same prevouts as the stuck tx; from prior spend dry-run meta)"
             ),
             Self::InvalidInput(s) => write!(f, "invalid --input: {s}"),
+            Self::MissingAddress => write!(f, "missing payment address"),
+            Self::MissingAmount => write!(f, "missing amount in sats"),
+            Self::InvalidAmount(s) => write!(f, "invalid amount {s:?} (expected integer sats)"),
+            Self::MissingOriginalFee => write!(
+                f,
+                "missing original-fee=<sats> (absolute fee of the stuck tx)"
+            ),
+            Self::MissingOriginalVbytes => write!(
+                f,
+                "missing original-vbytes=<n> (virtual size of the stuck tx)"
+            ),
+            Self::UnknownToken(s) => write!(
+                f,
+                "unknown rbf token {s:?} (use original-fee=, original-vbytes=, \
+                 input=<txid:vout:amount:address>, broadcast, fee=<sat/vB>)"
+            ),
         }
     }
 }
@@ -1198,6 +1229,102 @@ pub fn parse_rbf_replace_request(
 /// Whether product may attempt network broadcast for this RBF request.
 pub fn rbf_wants_broadcast(req: &RbfReplaceRequest) -> bool {
     req.broadcast
+}
+
+/// Parse TUI free-form tokens after `rbf`:
+/// ```text
+/// <address> <sats> original-fee=<n> original-vbytes=<n>
+///   input=<txid:vout:amount:address> [...] [broadcast] [fee=<n>]
+/// ```
+///
+/// Address is the first token; amount the second; remaining tokens set flags.
+/// Order of optional/required key=value tokens after amount does not matter.
+/// Accepts CLI-style `--original-fee=`, `--input=`, etc. Unknown tokens fail
+/// closed. **No network I/O** — pure offline parse (fee estimates resolve later
+/// at authorize, same as spend).
+pub fn parse_rbf_tokens(
+    tokens: &[&str],
+) -> std::result::Result<RbfReplaceRequest, RbfReplaceParseError> {
+    let mut iter = tokens.iter().copied().filter(|t| !t.is_empty());
+    let address = iter.next().ok_or(RbfReplaceParseError::MissingAddress)?;
+    let amount_raw = iter.next().ok_or(RbfReplaceParseError::MissingAmount)?;
+    let amount_sats: u64 = amount_raw
+        .parse()
+        .map_err(|_| RbfReplaceParseError::InvalidAmount(amount_raw.to_owned()))?;
+
+    let mut broadcast = false;
+    let mut fee_rate: Option<u64> = None;
+    let mut original_fee: Option<u64> = None;
+    let mut original_vbytes: Option<u64> = None;
+    let mut input_specs: Vec<String> = Vec::new();
+
+    for t in iter {
+        let lower = t.to_ascii_lowercase();
+        if lower == "broadcast" || lower == "--broadcast" {
+            broadcast = true;
+            continue;
+        }
+        if let Some(rest) = lower
+            .strip_prefix("fee=")
+            .or_else(|| lower.strip_prefix("fee-rate="))
+            .or_else(|| lower.strip_prefix("--fee-rate="))
+        {
+            let n: u64 = rest.parse().map_err(|_| {
+                RbfReplaceParseError::InvalidFeeRate(format!("not an integer: {rest}"))
+            })?;
+            fee_rate = Some(n);
+            continue;
+        }
+        // Case-insensitive key match but preserve the value part from the original
+        // token so bech32 addresses in input= keep mixed case if present.
+        let (key, value) = if let Some(eq) = t.find('=') {
+            (&t[..eq], &t[eq + 1..])
+        } else {
+            return Err(RbfReplaceParseError::UnknownToken(t.to_owned()));
+        };
+        let key_lower = key.to_ascii_lowercase();
+        match key_lower.as_str() {
+            "original-fee" | "original_fee" | "--original-fee" => {
+                let n: u64 = value.trim().parse().map_err(|_| {
+                    RbfReplaceParseError::InvalidInput(format!(
+                        "original-fee must be integer sats, got {value:?}"
+                    ))
+                })?;
+                original_fee = Some(n);
+            }
+            "original-vbytes" | "original_vbytes" | "--original-vbytes" => {
+                let n: u64 = value.trim().parse().map_err(|_| {
+                    RbfReplaceParseError::InvalidInput(format!(
+                        "original-vbytes must be integer, got {value:?}"
+                    ))
+                })?;
+                original_vbytes = Some(n);
+            }
+            "input" | "--input" => {
+                if value.trim().is_empty() {
+                    return Err(RbfReplaceParseError::InvalidInput(
+                        "empty input= value (expected txid:vout:amount:address)".into(),
+                    ));
+                }
+                input_specs.push(value.trim().to_owned());
+            }
+            _ => {
+                return Err(RbfReplaceParseError::UnknownToken(t.to_owned()));
+            }
+        }
+    }
+
+    let original_fee_sats = original_fee.ok_or(RbfReplaceParseError::MissingOriginalFee)?;
+    let original_vbytes = original_vbytes.ok_or(RbfReplaceParseError::MissingOriginalVbytes)?;
+    parse_rbf_replace_request(
+        address,
+        amount_sats,
+        original_fee_sats,
+        original_vbytes,
+        &input_specs,
+        broadcast,
+        fee_rate,
+    )
 }
 
 /// Lines after a successful local RBF replacement prepare (dry-run default).
@@ -2061,6 +2188,134 @@ mod tests {
             parse_rbf_replace_request("bc1q", 100, 50, 100, &dup, false, None).unwrap_err(),
             RbfReplaceParseError::InvalidInput(_)
         ));
+    }
+
+    #[test]
+    fn parse_rbf_tokens_dry_run_default_and_broadcast() {
+        let inp = sample_rbf_input();
+        let input_tok = format!("input={inp}");
+        let req = parse_rbf_tokens(&[
+            "bc1qdest",
+            "21000",
+            "original-fee=705",
+            "original-vbytes=141",
+            &input_tok,
+        ])
+        .unwrap();
+        assert_eq!(req.payment_address, "bc1qdest");
+        assert_eq!(req.amount_sats, 21_000);
+        assert_eq!(req.original_fee_sats, 705);
+        assert_eq!(req.original_vbytes, 141);
+        assert_eq!(req.inputs.len(), 1);
+        assert!(!req.broadcast);
+        assert!(!req.fee_rate_explicit);
+        assert_eq!(req.fee_rate_sat_vb, DEFAULT_SPEND_FEE_RATE_SAT_VB);
+
+        let req = parse_rbf_tokens(&[
+            "bc1qdest",
+            "100",
+            "original_fee=500",
+            "--original-vbytes=100",
+            &format!("--input={inp}"),
+            "broadcast",
+            "fee=20",
+        ])
+        .unwrap();
+        assert!(req.broadcast);
+        assert!(req.fee_rate_explicit);
+        assert_eq!(req.fee_rate_sat_vb, 20);
+        assert_eq!(req.original_fee_sats, 500);
+        assert_eq!(req.original_vbytes, 100);
+    }
+
+    #[test]
+    fn parse_rbf_tokens_rejects_fee_zero_missing_inputs_zero_vbytes() {
+        let inp = sample_rbf_input();
+        let input_tok = format!("input={inp}");
+        // Explicit fee=0 is rejected offline (parity with spend fee=0).
+        assert!(matches!(
+            parse_rbf_tokens(&[
+                "bc1qdest",
+                "100",
+                "original-fee=50",
+                "original-vbytes=100",
+                &input_tok,
+                "fee=0",
+            ])
+            .unwrap_err(),
+            RbfReplaceParseError::InvalidFeeRate(_)
+        ));
+        // Missing inputs.
+        assert_eq!(
+            parse_rbf_tokens(&["bc1qdest", "100", "original-fee=50", "original-vbytes=100",])
+                .unwrap_err(),
+            RbfReplaceParseError::MissingInputs
+        );
+        // Zero original-vbytes.
+        assert_eq!(
+            parse_rbf_tokens(&[
+                "bc1qdest",
+                "100",
+                "original-fee=50",
+                "original-vbytes=0",
+                &input_tok,
+            ])
+            .unwrap_err(),
+            RbfReplaceParseError::ZeroOriginalVbytes
+        );
+        // Missing original-fee / original-vbytes.
+        assert_eq!(
+            parse_rbf_tokens(&["bc1qdest", "100", "original-vbytes=100", &input_tok]).unwrap_err(),
+            RbfReplaceParseError::MissingOriginalFee
+        );
+        assert_eq!(
+            parse_rbf_tokens(&["bc1qdest", "100", "original-fee=50", &input_tok]).unwrap_err(),
+            RbfReplaceParseError::MissingOriginalVbytes
+        );
+        // original_fee=0 allowed when vbytes/inputs present.
+        let req = parse_rbf_tokens(&[
+            "bc1qdest",
+            "100",
+            "original-fee=0",
+            "original-vbytes=100",
+            &input_tok,
+            "fee=5",
+        ])
+        .unwrap();
+        assert_eq!(req.original_fee_sats, 0);
+        // Unknown token fail closed.
+        assert!(matches!(
+            parse_rbf_tokens(&[
+                "bc1qdest",
+                "100",
+                "original-fee=50",
+                "original-vbytes=100",
+                &input_tok,
+                "typo-flag",
+            ])
+            .unwrap_err(),
+            RbfReplaceParseError::UnknownToken(_)
+        ));
+        // Missing address / amount / zero amount.
+        assert_eq!(
+            parse_rbf_tokens(&[]).unwrap_err(),
+            RbfReplaceParseError::MissingAddress
+        );
+        assert_eq!(
+            parse_rbf_tokens(&["bc1qdest"]).unwrap_err(),
+            RbfReplaceParseError::MissingAmount
+        );
+        assert_eq!(
+            parse_rbf_tokens(&[
+                "bc1qdest",
+                "0",
+                "original-fee=50",
+                "original-vbytes=100",
+                &input_tok,
+            ])
+            .unwrap_err(),
+            RbfReplaceParseError::ZeroAmount
+        );
     }
 
     #[test]

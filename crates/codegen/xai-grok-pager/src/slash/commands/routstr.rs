@@ -25,11 +25,11 @@ impl SlashCommand for RoutstrCommand {
     }
 
     fn description(&self) -> &str {
-        "Routstr balance, local Bitcoin fund, spend, top up, refund, watch"
+        "Routstr balance, local Bitcoin fund, spend, rbf, top up, refund, watch"
     }
 
     fn usage(&self) -> &str {
-        "/routstr [balance|fund|unlock|spend|topup|refund|watch|stop|qr] [args]"
+        "/routstr [balance|fund|unlock|spend|rbf|topup|refund|watch|stop|qr] [args]"
     }
 
     fn takes_args(&self) -> bool {
@@ -38,7 +38,7 @@ impl SlashCommand for RoutstrCommand {
 
     fn arg_placeholder(&self) -> Option<&str> {
         Some(
-            "balance | fund | unlock <phrase> | spend <addr> <sats> [broadcast] | topup [sats] | refund | watch <addr> | stop | qr [addr]",
+            "balance | fund | unlock <phrase> | spend <addr> <sats> [broadcast] | rbf <addr> <sats> original-fee=… | topup [sats] | refund | watch <addr> | stop | qr [addr]",
         )
     }
 
@@ -60,13 +60,20 @@ impl SlashCommand for RoutstrCommand {
                 display: "unlock".to_string(),
                 match_text: "unlock".to_string(),
                 insert_text: "unlock ".to_string(),
-                description: "Re-enter recovery phrase after /routstr fund or spend".to_string(),
+                description: "Re-enter recovery phrase after /routstr fund, spend, or rbf"
+                    .to_string(),
             },
             ArgItem {
                 display: "spend".to_string(),
                 match_text: "spend".to_string(),
                 insert_text: "spend ".to_string(),
                 description: "On-chain spend dry-run (add broadcast to submit)".to_string(),
+            },
+            ArgItem {
+                display: "rbf".to_string(),
+                match_text: "rbf".to_string(),
+                insert_text: "rbf ".to_string(),
+                description: "Same-input RBF dry-run (add broadcast to submit)".to_string(),
             },
             ArgItem {
                 display: "topup".to_string(),
@@ -211,6 +218,42 @@ pub(crate) fn parse_routstr_args(args: &str) -> CommandResult {
                 )),
             }
         }
+        "rbf" => {
+            let rest: Vec<&str> = parts.collect();
+            match grok_bitcoin_wallet::funding_cli::parse_rbf_tokens(&rest) {
+                Ok(req) => {
+                    // Parse only — no fee HTTP. Explicit fee → Some; omit → None
+                    // (resolve halfHour/default in the rbf effect worker).
+                    let fee_rate_sat_vb = if req.fee_rate_explicit {
+                        Some(req.fee_rate_sat_vb)
+                    } else {
+                        None
+                    };
+                    let input_specs: Vec<String> = req
+                        .inputs
+                        .iter()
+                        .map(grok_bitcoin_wallet::funding_cli::format_rbf_input_spec_value)
+                        .collect();
+                    CommandResult::Action(Action::RoutstrRbf {
+                        address: req.payment_address,
+                        amount_sats: req.amount_sats,
+                        original_fee_sats: req.original_fee_sats,
+                        original_vbytes: req.original_vbytes,
+                        input_specs,
+                        broadcast: req.broadcast,
+                        fee_rate_sat_vb,
+                    })
+                }
+                Err(e) => CommandResult::Error(format!(
+                    "{e}\nUsage: /routstr rbf <address> <sats> original-fee=<n> \
+                     original-vbytes=<n> input=<txid:vout:amount:address> [...] \
+                     [broadcast] [fee=<n>]\n\
+                     Same-input BIP-125 only (from prior spend dry-run meta). Dry-run \
+                     by default. BIP-39 is never part of this command — authorize with \
+                     /routstr unlock after rbf is staged."
+                )),
+            }
+        }
         "topup" | "top-up" | "top_up" => {
             let sats = parts.next().and_then(|s| s.parse::<u64>().ok());
             CommandResult::Action(Action::RoutstrTopup { sats })
@@ -233,7 +276,7 @@ pub(crate) fn parse_routstr_args(args: &str) -> CommandResult {
             CommandResult::Action(Action::RoutstrQr { address })
         }
         other => CommandResult::Error(format!(
-            "Unknown /routstr argument: {other}. Use balance, fund, unlock, spend, topup, refund, watch, stop, or qr"
+            "Unknown /routstr argument: {other}. Use balance, fund, unlock, spend, rbf, topup, refund, watch, stop, or qr"
         )),
     }
 }
@@ -312,6 +355,57 @@ mod tests {
             parse_routstr_args("spend"),
             CommandResult::Error(_)
         ));
+        // RBF slash: offline parse, deferred fee, required original-fee/vbytes/inputs.
+        let txid = "ab".repeat(32);
+        let input = format!("{txid}:0:100000:bc1qrecv");
+        match parse_routstr_args(&format!(
+            "rbf bc1qdest 21000 original-fee=705 original-vbytes=141 input={input}"
+        )) {
+            CommandResult::Action(Action::RoutstrRbf {
+                address,
+                amount_sats: 21_000,
+                original_fee_sats: 705,
+                original_vbytes: 141,
+                input_specs,
+                broadcast: false,
+                fee_rate_sat_vb: None,
+            }) => {
+                assert_eq!(address, "bc1qdest");
+                assert_eq!(input_specs.len(), 1);
+                assert_eq!(input_specs[0], input);
+            }
+            other => panic!("expected rbf dry-run deferred fee: {other:?}"),
+        }
+        match parse_routstr_args(&format!(
+            "rbf bc1qdest 100 original-fee=500 original-vbytes=100 input={input} broadcast fee=12"
+        )) {
+            CommandResult::Action(Action::RoutstrRbf {
+                amount_sats: 100,
+                broadcast: true,
+                fee_rate_sat_vb: Some(12),
+                ..
+            }) => {}
+            other => panic!("expected rbf broadcast: {other:?}"),
+        }
+        // fee=0 rejected offline.
+        assert!(matches!(
+            parse_routstr_args(&format!(
+                "rbf bc1qdest 100 original-fee=50 original-vbytes=100 input={input} fee=0"
+            )),
+            CommandResult::Error(_)
+        ));
+        // Missing inputs / zero vbytes / bare rbf.
+        assert!(matches!(
+            parse_routstr_args("rbf bc1qdest 100 original-fee=50 original-vbytes=100"),
+            CommandResult::Error(_)
+        ));
+        assert!(matches!(
+            parse_routstr_args(&format!(
+                "rbf bc1qdest 100 original-fee=50 original-vbytes=0 input={input}"
+            )),
+            CommandResult::Error(_)
+        ));
+        assert!(matches!(parse_routstr_args("rbf"), CommandResult::Error(_)));
     }
 
     #[test]

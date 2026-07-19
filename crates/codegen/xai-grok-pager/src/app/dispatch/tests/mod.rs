@@ -252,6 +252,7 @@ fn test_app() -> AppView {
         routstr_watch_last_scrollback: None,
         routstr_watch_error_streak: 0,
         pending_routstr_spend: None,
+        pending_routstr_rbf: None,
         billing_poll_wanted: false,
         leader_roster: Vec::new(),
         dashboard_local_sessions: Vec::new(),

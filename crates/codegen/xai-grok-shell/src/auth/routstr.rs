@@ -1103,6 +1103,106 @@ pub fn complete_routstr_spend_reentry_for_tui(
     Ok(success)
 }
 
+/// TUI same-input RBF after unlock re-entry (no BIP-39 in returned payload).
+///
+/// Uses original prevouts only — never re-selects confirmed UTXOs. Fee rate
+/// must already be resolved by the caller (effect worker); this path does not
+/// fetch estimates.
+pub fn complete_routstr_rbf_reentry_for_tui(
+    grok_home: &Path,
+    reentry_phrase: &str,
+    password: Option<&str>,
+    payment_address: &str,
+    amount_sats: u64,
+    original_fee_sats: u64,
+    original_vbytes: u64,
+    original_inputs: &[grok_bitcoin_wallet::funding_cli::RbfInputSpec],
+    broadcast: bool,
+    fee_rate_sat_vb: u64,
+) -> Result<RoutstrRbfSuccess, RoutstrCliError> {
+    use grok_bitcoin_wallet::funding_cli::{
+        FundPathDecision, fund_path_decision_from_load, keyring_blocked_message,
+        password_required_message,
+    };
+    use grok_bitcoin_wallet::seed_vault::{
+        MnemonicBackupGate, SeedVault, UnlockSession, VaultPassword,
+    };
+    use std::time::Instant;
+
+    let aead_path = routstr_seed_aead_path(grok_home);
+    let vault = SeedVault::with_aead_path(&aead_path).map_err(RoutstrCliError::Wallet)?;
+    let network_str = std::env::var("GROK_BITCOIN_NETWORK").unwrap_or_else(|_| "mainnet".into());
+
+    let pw;
+    let password_ref = match password.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => {
+            pw = VaultPassword::new(raw.to_owned());
+            Some(&pw)
+        }
+        None => None,
+    };
+
+    let mnemonic = match vault.load(password_ref) {
+        Ok(m) => m,
+        Err(e) => match fund_path_decision_from_load::<()>(Err(e)) {
+            FundPathDecision::NeedPassword => {
+                return Err(RoutstrCliError::Message(password_required_message().into()));
+            }
+            FundPathDecision::KeyringBlocked { reason } => {
+                return Err(RoutstrCliError::Message(keyring_blocked_message(&reason)));
+            }
+            FundPathDecision::NewWallet => {
+                return Err(RoutstrCliError::Message(
+                    "no local wallet found. Run `grok routstr fund` in a private terminal first."
+                        .into(),
+                ));
+            }
+            FundPathDecision::LoadError { message } => {
+                return Err(RoutstrCliError::Message(message));
+            }
+            FundPathDecision::ReturningUnlock => {
+                return Err(RoutstrCliError::Message(
+                    "internal rbf path: unexpected ReturningUnlock on load error".into(),
+                ));
+            }
+        },
+    };
+
+    let mut session = UnlockSession::unlock_default(mnemonic);
+    let unlocked = session
+        .mnemonic(Instant::now())
+        .map_err(RoutstrCliError::Wallet)?;
+    let mut gate = MnemonicBackupGate::new();
+    gate.begin_reentry_without_display(unlocked)
+        .map_err(RoutstrCliError::Wallet)?;
+    if reentry_phrase.trim().is_empty() {
+        session.lock();
+        return Err(RoutstrCliError::Message(
+            "recovery phrase re-entry cancelled; not building RBF replacement".into(),
+        ));
+    }
+    gate.confirm_reentry(reentry_phrase).map_err(|e| {
+        session.lock();
+        RoutstrCliError::Wallet(e)
+    })?;
+    let unlocked = session
+        .mnemonic(Instant::now())
+        .map_err(RoutstrCliError::Wallet)?;
+    let success = complete_routstr_rbf_with_mnemonic(
+        unlocked,
+        &network_str,
+        payment_address,
+        amount_sats,
+        original_fee_sats,
+        original_vbytes,
+        original_inputs,
+        broadcast,
+        fee_rate_sat_vb,
+    )?;
+    session.lock();
+    Ok(success)
+}
+
 /// AEAD seed blob path under grok home (never `provider_credentials.json`).
 pub fn routstr_seed_aead_path(grok_home: &Path) -> std::path::PathBuf {
     grok_home.join("bitcoin").join("seed.aead")

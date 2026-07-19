@@ -1,22 +1,34 @@
 # Residual work: Bitcoin-native Routstr + wallet (2026-07-19)
 
-## Done this pass (RBF replacement PSBT rebuild/broadcast CLI)
+## Done this pass (TUI `/routstr rbf` slash path)
 
 | Item | Status |
 |------|--------|
-| `selection_with_rbf_fee` (same inputs, higher absolute fee, dust fold) | **Done** |
-| `prepare_rbf_replacement_from_selection` (same-size sign/finalize/extract) | **Done** |
-| `prepare_rbf_replacement` + `RbfReplacementSpend` (same-input plan → absolute fee → prepare) | **Done** |
-| BIP-125 absolute + bandwidth fee enforced; never claim broadcast without broadcaster | **Done** |
-| `parse_rbf_replace_request` / `--input` / `RbfReplaceRequest` + product formatters + usage | **Done** |
-| CLI `grok routstr rbf … --original-fee N --original-vbytes V --input … [--fee-rate] [--broadcast]` | **Done** |
-| Shell `run_routstr_rbf` / `complete_routstr_rbf_with_mnemonic` (same-input; unlock + re-entry) | **Done** |
-| Dry-run default; `--broadcast` only after unlock; Accepted + parseable txid only | **Done** |
-| Offline unit tests (wallet mocks + parse/format + clap + BIP-125 underpay guard) | **Done** |
+| TUI `/routstr rbf` slash parse (offline; no fee HTTP) | **Done** |
+| `parse_rbf_tokens` (address, sats, original-fee=, original-vbytes=, input=, broadcast, fee=) | **Done** |
+| Stage `PendingRoutstrRbf` + `/routstr unlock` authorize (no BIP-39 on rbf line) | **Done** |
+| Supersede spend ↔ rbf; fund cancels both; agent-bound pending | **Done** |
+| Fee resolve (halfHour) only in effect/spawn_blocking when fee not explicit | **Done** |
+| `complete_routstr_rbf_reentry_for_tui` + effect/task result wiring | **Done** |
+| Never claim broadcast without Accepted + parseable txid (shared shell path) | **Done** (unchanged) |
+| Unit tests: parse edges (fee=0, missing inputs, zero vbytes) + dispatch/unlock | **Done** |
 | Live CDK mint/refund / LDK BOLT11 | **Still residual** (flags remain false; no fake success) |
 | Multi-sig finalize *support* (beyond honest Partial) | **Still residual** |
-| TUI `/routstr rbf` slash path | **Still residual** (CLI first) |
-| CPFP child construction (plan helpers only) | **Still residual** |
+| CPFP child PSBT construction | **Still residual** (plan helpers only) |
+
+## Done prior pass (RBF replacement PSBT rebuild/broadcast CLI)
+
+| Item | Status |
+|------|--------|
+| `selection_with_rbf_fee` (same inputs, higher absolute fee, dust fold) | Done |
+| `prepare_rbf_replacement_from_selection` (same-size sign/finalize/extract) | Done |
+| `prepare_rbf_replacement` + `RbfReplacementSpend` (same-input plan → absolute fee → prepare) | Done |
+| BIP-125 absolute + bandwidth fee enforced; never claim broadcast without broadcaster | Done |
+| `parse_rbf_replace_request` / `--input` / `RbfReplaceRequest` + product formatters + usage | Done |
+| CLI `grok routstr rbf … --original-fee N --original-vbytes V --input … [--fee-rate] [--broadcast]` | Done |
+| Shell `run_routstr_rbf` / `complete_routstr_rbf_with_mnemonic` (same-input; unlock + re-entry) | Done |
+| Dry-run default; `--broadcast` only after unlock; Accepted + parseable txid only | Done |
+| Offline unit tests (wallet mocks + parse/format + clap + BIP-125 underpay guard) | Done |
 
 ## Done prior pass (RBF / CPFP fee estimation + mempool fee ladder)
 
@@ -139,19 +151,22 @@
 
 - Built PSBT inputs still set `Sequence::ENABLE_RBF_NO_LOCKTIME`.
 - Pure planners size same-size RBF replacements and CPFP child fees offline.
-- **Shipped:** `grok routstr rbf` rebuilds a **same-input** BIP-125 replacement
-  from `--original-fee`, `--original-vbytes`, and each `--input
-  txid:vout:amount:address` (from prior spend dry-run meta). Plans via
+- **Shipped:** `grok routstr rbf` **and** TUI `/routstr rbf` rebuild a **same-input**
+  BIP-125 replacement from original-fee, original-vbytes, and each
+  `input=txid:vout:amount:address` (from prior spend dry-run meta). Plans via
   `plan_rbf_fee_bump`, applies **recommended absolute fee** (not floor-rate
   re-select), signs/finalizes with original prevouts only; dry-run by default;
-  `--broadcast` only after unlock + re-entry and only claims success on
+  `broadcast` only after unlock + re-entry and only claims success on
   broadcaster Accepted + parseable txid.
+- TUI: offline slash parse → stage `PendingRoutstrRbf` → `/routstr unlock`
+  authorizes (agent-bound; mutually exclusive with pending spend; fund cancels
+  both). Fee halfHour resolve only in effect worker when fee not explicit.
 - Library: `selection_with_rbf_fee` / `prepare_rbf_replacement` /
   `prepare_rbf_replacement_from_selection` + post-prepare
   `validate_rbf_replacement_fee` (bandwidth on actual replacement vB).
-- Spend dry-run prints `--input` lines for copy into rbf CLI.
-- **Not** shipped: TUI `/routstr rbf` slash; CPFP child PSBT construction;
-  multi-sig finalize beyond Partial honesty; live CDK/LN.
+- Spend dry-run prints `--input` / input= lines for copy into rbf CLI/TUI.
+- **Not** shipped: CPFP child PSBT construction; multi-sig finalize beyond
+  Partial honesty; live CDK/LN.
 
 ## Residual (next implement)
 
@@ -164,15 +179,14 @@
 ### P1 / product surfaces
 1. Wire `topup` / `refund` to **real** CDK/LN when those stacks land: flip `mint_live` / `refund_live` / `bolt11_*_live` only with tested impls; swap `default_*_backend()` factories.
 2. Optional: dedicated QR pane widget (today: Unicode QR matrix in system block + clipboard toast).
-3. Optional: `grok routstr fees` CLI that prints estimate ladder only (RBF rebuild is now `grok routstr rbf`).
-4. Optional: TUI `/routstr rbf` slash + staged unlock path (CLI complete).
+3. Optional: `grok routstr fees` CLI that prints estimate ladder only (RBF rebuild is now `grok routstr rbf` / `/routstr rbf`).
 
 ### P2 / spend path + explorers
 1. ~~Multi-sig / non-P2WPKH finalize residual~~ **Done** (honest Partial; still only single-key P2WPKH finalized).
 2. Optional full `bdk_wallet` electrum/esplora sync if still needed beyond mempool UTXO ChainSource.
 3. ~~Persist WatchSession across pager process restarts~~ **Done**.
 4. ~~RBF / CPFP-aware fee estimation~~ **Done** (pure planners + fee ladder + product meta).
-5. ~~End-to-end RBF replace-by-fee rebuild~~ **Done this pass** (`grok routstr rbf` + library rebuild).
+5. ~~End-to-end RBF replace-by-fee rebuild~~ **Done** (CLI + TUI slash).
 6. Electrum push broadcaster alternative (mempool.space POST wired).
 7. Optional: multi-sig / script-path **finalize support** (today: residual Partial only).
 8. Optional: CPFP child PSBT construction (plan helpers only today).
@@ -198,7 +212,7 @@
 ```text
 Continue Bitcoin-native Routstr from RESIDUAL.md (CDK/LN live backends).
 
-RBF replacement rebuild CLI (`grok routstr rbf`) + fee planners landed.
+RBF replacement rebuild (CLI + TUI `/routstr rbf`) + fee planners landed.
 Do not regress:
   cargo test -p grok-bitcoin-wallet --lib
   cargo test -p xai-grok-shell --lib openrouter
@@ -208,7 +222,7 @@ Do not regress:
   ./scripts/bitcoin-routstr-validate.sh
 
 1. Wire topup/refund to real CDK/LN when stacks land; flip capability flags only when live; keep stubs honest.
-2. Optional: multi-sig/script-path finalize support (today Partial residual only); CPFP child PSBT; TUI rbf slash; bdk electrum/esplora.
+2. Optional: multi-sig/script-path finalize support (today Partial residual only); CPFP child PSBT; bdk electrum/esplora.
 3. Do not claim BOLT12; do not store BIP-39 in CredentialsStore or watch_session.json.
 4. cargo test -p grok-bitcoin-wallet --lib
    cargo test -p xai-grok-shell --lib routstr
@@ -230,20 +244,20 @@ cargo clippy -p xai-grok-pager --lib -- -D warnings
 ./scripts/bitcoin-routstr-validate.sh
 ```
 
-## Validation ran (2026-07-19 residual implement — RBF replacement CLI)
+## Validation ran (2026-07-19 residual implement — TUI `/routstr rbf`)
 
 | Check | Result |
 |-------|--------|
-| `cargo fmt` (touched packages) | pass |
-| `cargo test -p grok-bitcoin-wallet --lib` | pass (214) |
-| `cargo test -p xai-grok-shell --lib routstr` | pass (30 + 1 ignored) |
-| `cargo test -p xai-grok-shell --lib openrouter` | pass (19) |
-| `cargo test -p xai-grok-pager --lib credit_bar` | pass (41) |
-| `cargo test -p xai-grok-pager --lib routstr` | pass (33) |
-| `cargo clippy -p grok-bitcoin-wallet --lib -- -D warnings` | pass |
-| `cargo clippy -p xai-grok-shell --lib -- -D warnings` | pass |
-| `cargo clippy -p xai-grok-pager --lib -- -D warnings` | pass |
-| `./scripts/bitcoin-routstr-validate.sh` | pass |
+| `cargo fmt` (touched packages) | (see summary) |
+| `cargo test -p grok-bitcoin-wallet --lib` | (see summary) |
+| `cargo test -p xai-grok-shell --lib routstr` | (see summary) |
+| `cargo test -p xai-grok-shell --lib openrouter` | (see summary) |
+| `cargo test -p xai-grok-pager --lib credit_bar` | (see summary) |
+| `cargo test -p xai-grok-pager --lib routstr` | (see summary) |
+| `cargo clippy -p grok-bitcoin-wallet --lib -- -D warnings` | (see summary) |
+| `cargo clippy -p xai-grok-shell --lib -- -D warnings` | (see summary) |
+| `cargo clippy -p xai-grok-pager --lib -- -D warnings` | (see summary) |
+| `./scripts/bitcoin-routstr-validate.sh` | (see summary) |
 | Cashu/LN live flags | still false (honest) |
 | RBF sequence on built inputs | unchanged (`ENABLE_RBF_NO_LOCKTIME`) |
 | Multi-sig / non-P2WPKH finalize | honest Partial (unchanged) |
@@ -251,3 +265,4 @@ cargo clippy -p xai-grok-pager --lib -- -D warnings
 | No BIP-39 in watch persistence | unchanged |
 | Fee estimates default CI | offline parse/Mock; live fetch feature-gated |
 | RBF broadcast claim | only on Accepted + parseable txid |
+| TUI rbf fee resolve | only in effect worker (not slash parse) |

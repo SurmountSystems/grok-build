@@ -4118,6 +4118,63 @@ pub(crate) fn execute(
                 TaskResult::RoutstrSpendCompleted { agent_id, result }
             });
         }
+        Effect::RoutstrRbfComplete {
+            agent_id,
+            grok_home,
+            phrase,
+            password,
+            address,
+            amount_sats,
+            original_fee_sats,
+            original_vbytes,
+            input_specs,
+            broadcast,
+            fee_rate_sat_vb,
+        } => {
+            let phrase = phrase.into_inner();
+            let password = password.map(|p| p.into_inner());
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let fee_rate = match fee_rate_sat_vb {
+                        Some(n) if n > 0 => n,
+                        Some(_) => {
+                            return Err("fee rate must be > 0 sat/vB".to_owned());
+                        }
+                        None => {
+                            xai_grok_shell::auth::resolve_spend_fee_rate_for_product(None)
+                        }
+                    };
+                    // Re-parse input specs in the worker (staged as wire strings).
+                    let mut inputs = Vec::with_capacity(input_specs.len());
+                    for raw in &input_specs {
+                        let spec = grok_bitcoin_wallet::funding_cli::parse_rbf_input_spec(raw)
+                            .map_err(|e| e.to_string())?;
+                        inputs.push(spec);
+                    }
+                    if inputs.is_empty() {
+                        return Err(
+                            "RBF requires at least one input=txid:vout:amount:address".to_owned(),
+                        );
+                    }
+                    xai_grok_shell::auth::complete_routstr_rbf_reentry_for_tui(
+                        &grok_home,
+                        &phrase,
+                        password.as_deref(),
+                        &address,
+                        amount_sats,
+                        original_fee_sats,
+                        original_vbytes,
+                        &inputs,
+                        broadcast,
+                        fee_rate,
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("rbf complete task failed: {e}")));
+                TaskResult::RoutstrRbfCompleted { agent_id, result }
+            });
+        }
         Effect::RoutstrWatchLoop {
             agent_id,
             address,

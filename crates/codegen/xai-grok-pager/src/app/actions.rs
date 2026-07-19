@@ -755,6 +755,18 @@ pub enum Action {
         broadcast: bool,
         fee_rate_sat_vb: Option<u64>,
     },
+    /// Same-input BIP-125 RBF (dry-run default). BIP-39 never on this action —
+    /// stage + `/routstr unlock`. `input_specs` are `txid:vout:amount:address`.
+    /// Fee resolve only at effect time when `fee_rate_sat_vb` is `None`.
+    RoutstrRbf {
+        address: String,
+        amount_sats: u64,
+        original_fee_sats: u64,
+        original_vbytes: u64,
+        input_specs: Vec<String>,
+        broadcast: bool,
+        fee_rate_sat_vb: Option<u64>,
+    },
     /// Commit a read-only list of the queued prompts as a system block
     /// (`/queue`). The surface minimal mode uses in place of the `QueuePane`.
     ShowQueue,
@@ -2137,6 +2149,22 @@ pub enum Effect {
         broadcast: bool,
         fee_rate_sat_vb: Option<u64>,
     },
+    /// Complete pending same-input RBF after unlock re-entry (no BIP-39 in chat).
+    ///
+    /// Fee resolve only in the effect worker when `fee_rate_sat_vb` is `None`.
+    RoutstrRbfComplete {
+        agent_id: AgentId,
+        grok_home: std::path::PathBuf,
+        phrase: SensitiveString,
+        password: Option<SensitiveString>,
+        address: String,
+        amount_sats: u64,
+        original_fee_sats: u64,
+        original_vbytes: u64,
+        input_specs: Vec<String>,
+        broadcast: bool,
+        fee_rate_sat_vb: Option<u64>,
+    },
     /// Background address watch: rate-limited poll loop until stop or confirmed.
     ///
     /// When `skip_sleep` is true, the first poll runs immediately (fund auto-watch
@@ -2842,6 +2870,11 @@ pub enum TaskResult {
     RoutstrSpendCompleted {
         agent_id: AgentId,
         result: Result<xai_grok_shell::auth::RoutstrSpendSuccess, String>,
+    },
+    /// TUI same-input RBF completed or failed (no BIP-39 in payload).
+    RoutstrRbfCompleted {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::auth::RoutstrRbfSuccess, String>,
     },
     /// One address-watch poll snapshot (drop if generation stale).
     RoutstrWatchTick {

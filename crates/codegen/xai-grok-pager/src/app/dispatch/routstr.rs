@@ -259,16 +259,39 @@ fn clear_pending_routstr_spend(app: &mut AppView, reason: &str) -> bool {
     true
 }
 
+/// Cancel a staged RBF if present; notify the staging agent.
+///
+/// Returns `true` when a pending rbf was cleared.
+fn clear_pending_routstr_rbf(app: &mut AppView, reason: &str) -> bool {
+    let Some(pending) = app.pending_routstr_rbf.take() else {
+        return false;
+    };
+    push_system_to_agent(
+        app,
+        pending.agent_id,
+        format!(
+            "Cancelled staged RBF ({reason}): {} sats → {} (original fee {} sats, {} input(s)).",
+            pending.amount_sats,
+            pending.address,
+            pending.original_fee_sats,
+            pending.input_specs.len()
+        ),
+    );
+    true
+}
+
 /// `/routstr fund` — probe vault (async); never mint on keyring errors.
 ///
-/// Also cancels any staged `/routstr spend` so unlock cannot authorize a
-/// stale (possibly broadcast) spend after the user switched to fund.
+/// Also cancels any staged `/routstr spend` or `/routstr rbf` so unlock cannot
+/// authorize a stale (possibly broadcast) money path after the user switched
+/// to fund.
 pub(super) fn dispatch_routstr_fund(app: &mut AppView) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         // No agent view: cannot show system block either.
         return vec![];
     };
     let _ = clear_pending_routstr_spend(app, "running /routstr fund");
+    let _ = clear_pending_routstr_rbf(app, "running /routstr fund");
     push_system_to_agent(
         app,
         id,
@@ -282,13 +305,13 @@ pub(super) fn dispatch_routstr_fund(app: &mut AppView) -> Vec<Effect> {
 
 /// Complete re-entry after `/routstr unlock <phrase>`.
 ///
-/// If a pending spend was staged via `/routstr spend`, unlock authorizes that
-/// spend (not fund). BIP-39 never enters chat history — only the unlock path
-/// carries [`SensitiveString`] into a blocking task.
+/// If a pending spend or rbf was staged, unlock authorizes that path (not fund).
+/// BIP-39 never enters chat history — only the unlock path carries
+/// [`SensitiveString`] into a blocking task.
 ///
-/// Spend completion is bound to the **staging** agent (`pending.agent_id`),
+/// Money-path completion is bound to the **staging** agent (`pending.agent_id`),
 /// not merely the current active view, so switching agents cannot mis-route
-/// a money path.
+/// a money path. Spend and rbf are mutually exclusive pending states.
 pub(super) fn dispatch_routstr_fund_reentry(
     app: &mut AppView,
     phrase: crate::app::actions::SensitiveString,
@@ -343,6 +366,52 @@ pub(super) fn dispatch_routstr_fund_reentry(
             fee_rate_sat_vb: pending.fee_rate_sat_vb,
         }];
     }
+    if let Some(pending) = app.pending_routstr_rbf.take() {
+        if pending.agent_id != id {
+            let staging = pending.agent_id;
+            app.pending_routstr_rbf = Some(pending);
+            push_system_to_agent(
+                app,
+                id,
+                format!(
+                    "Staged RBF belongs to another agent session (agent {staging:?}). \
+                     Switch back to that agent and run /routstr unlock there, or cancel \
+                     with /routstr fund on the staging agent."
+                ),
+            );
+            return vec![];
+        }
+        let mode = if pending.broadcast {
+            "broadcast"
+        } else {
+            "dry-run"
+        };
+        push_system_to_agent(
+            app,
+            pending.agent_id,
+            format!(
+                "Authorizing RBF replacement ({mode}): {} sats → {} (original fee {} sats, {} input(s)). \
+                 Recovery phrase is not stored in chat.",
+                pending.amount_sats,
+                pending.address,
+                pending.original_fee_sats,
+                pending.input_specs.len()
+            ),
+        );
+        return vec![Effect::RoutstrRbfComplete {
+            agent_id: pending.agent_id,
+            grok_home: grok_home(),
+            phrase,
+            password,
+            address: pending.address,
+            amount_sats: pending.amount_sats,
+            original_fee_sats: pending.original_fee_sats,
+            original_vbytes: pending.original_vbytes,
+            input_specs: pending.input_specs,
+            broadcast: pending.broadcast,
+            fee_rate_sat_vb: pending.fee_rate_sat_vb,
+        }];
+    }
     push_system_to_agent(
         app,
         id,
@@ -360,6 +429,8 @@ pub(super) fn dispatch_routstr_fund_reentry(
 ///
 /// `fee_rate_sat_vb`: `Some(n)` is an explicit user rate; `None` is resolved
 /// later in the spend effect (explorer halfHour or default 5) — not here.
+///
+/// Staging spend cancels any pending rbf (and supersedes a prior spend).
 pub(super) fn dispatch_routstr_spend(
     app: &mut AppView,
     address: String,
@@ -372,6 +443,9 @@ pub(super) fn dispatch_routstr_spend(
     };
     if app.pending_routstr_spend.is_some() {
         let _ = clear_pending_routstr_spend(app, "superseded by a new /routstr spend");
+    }
+    if app.pending_routstr_rbf.is_some() {
+        let _ = clear_pending_routstr_rbf(app, "superseded by /routstr spend");
     }
     app.pending_routstr_spend = Some(crate::app::app_view::PendingRoutstrSpend {
         agent_id: id,
@@ -398,8 +472,70 @@ pub(super) fn dispatch_routstr_spend(
             "Staged on-chain spend ({mode}): {amount_sats} sats → {address} (fee rate {fee_line}).\n\
              Authorize with: /routstr unlock <recovery phrase words…>\n\
              Optional AEAD password: /routstr unlock pw:<password> <phrase…>\n\
-             Recovery words are never stored in chat history. Cancel by staging a different spend or running /routstr fund \
-             (fund cancels any staged spend so unlock cannot broadcast a stale one)."
+             Recovery words are never stored in chat history. Cancel by staging a different spend/rbf or running /routstr fund \
+             (fund cancels any staged money path so unlock cannot broadcast a stale one)."
+        ),
+    );
+    vec![]
+}
+
+/// Stage `/routstr rbf` then require unlock re-entry (no BIP-39 on this action).
+///
+/// Same-input BIP-125 only: `input_specs` are `txid:vout:amount:address` from
+/// prior spend dry-run meta. Fee resolve only at authorize when not explicit.
+/// Staging rbf cancels any pending spend (and supersedes a prior rbf).
+pub(super) fn dispatch_routstr_rbf(
+    app: &mut AppView,
+    address: String,
+    amount_sats: u64,
+    original_fee_sats: u64,
+    original_vbytes: u64,
+    input_specs: Vec<String>,
+    broadcast: bool,
+    fee_rate_sat_vb: Option<u64>,
+) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    if app.pending_routstr_rbf.is_some() {
+        let _ = clear_pending_routstr_rbf(app, "superseded by a new /routstr rbf");
+    }
+    if app.pending_routstr_spend.is_some() {
+        let _ = clear_pending_routstr_spend(app, "superseded by /routstr rbf");
+    }
+    let n_inputs = input_specs.len();
+    app.pending_routstr_rbf = Some(crate::app::app_view::PendingRoutstrRbf {
+        agent_id: id,
+        address: address.clone(),
+        amount_sats,
+        original_fee_sats,
+        original_vbytes,
+        input_specs,
+        broadcast,
+        fee_rate_sat_vb,
+    });
+    let mode = if broadcast {
+        "with network broadcast"
+    } else {
+        "dry-run only (not broadcast)"
+    };
+    let fee_line = match fee_rate_sat_vb {
+        Some(n) => format!("{n} sat/vB target"),
+        None => {
+            "explorer halfHour when available, else 5 sat/vB (resolved at authorize)".to_owned()
+        }
+    };
+    push_system_to_agent(
+        app,
+        id,
+        format!(
+            "Staged same-input RBF ({mode}): {amount_sats} sats → {address}\n\
+             Original fee {original_fee_sats} sats / {original_vbytes} vB; {n_inputs} input(s); \
+             target fee rate {fee_line}.\n\
+             Authorize with: /routstr unlock <recovery phrase words…>\n\
+             Optional AEAD password: /routstr unlock pw:<password> <phrase…>\n\
+             Recovery words are never stored in chat history. Cancel by staging a different rbf/spend or running /routstr fund \
+             (fund cancels any staged money path so unlock cannot broadcast a stale one)."
         ),
     );
     vec![]
@@ -425,6 +561,32 @@ pub(super) fn handle_routstr_spend_completed(
                 app,
                 agent_id,
                 format!("Spend failed (not broadcast unless explorer accepted):\n{message}"),
+            );
+        }
+    }
+    vec![]
+}
+
+/// Handle RBF task result (system block only; no secrets).
+///
+/// Same non-clear rule as spend: do not drop a newer staged rbf/spend that may
+/// have been created while this task was in flight.
+pub(super) fn handle_routstr_rbf_completed(
+    app: &mut AppView,
+    agent_id: AgentId,
+    result: Result<xai_grok_shell::auth::RoutstrRbfSuccess, String>,
+) -> Vec<Effect> {
+    match result {
+        Ok(success) => {
+            push_system_to_agent(app, agent_id, success.lines.join("\n"));
+        }
+        Err(message) => {
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!(
+                    "RBF replacement failed (not broadcast unless explorer accepted):\n{message}"
+                ),
             );
         }
     }
@@ -917,6 +1079,335 @@ mod tests {
         assert!(
             !matches!(effects.first(), Some(Effect::RoutstrSpendComplete { .. })),
             "must not complete stale spend: {effects:?}"
+        );
+    }
+
+    fn sample_rbf_input_spec() -> String {
+        format!("{}:0:100000:bc1qrecv", "ab".repeat(32))
+    }
+
+    #[test]
+    fn rbf_stages_pending_without_bip39_and_unlock_routes_to_rbf() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let input = sample_rbf_input_spec();
+        let effects = dispatch(
+            Action::RoutstrRbf {
+                address: "bc1qdest".into(),
+                amount_sats: 21_000,
+                original_fee_sats: 705,
+                original_vbytes: 141,
+                input_specs: vec![input.clone()],
+                broadcast: false,
+                fee_rate_sat_vb: Some(10),
+            },
+            &mut app,
+        );
+        assert!(effects.is_empty());
+        let pending = app.pending_routstr_rbf.as_ref().expect("pending rbf");
+        assert_eq!(pending.address, "bc1qdest");
+        assert_eq!(pending.amount_sats, 21_000);
+        assert_eq!(pending.original_fee_sats, 705);
+        assert_eq!(pending.original_vbytes, 141);
+        assert_eq!(pending.input_specs, vec![input.clone()]);
+        assert!(!pending.broadcast);
+        assert_eq!(pending.fee_rate_sat_vb, Some(10));
+        assert_eq!(pending.agent_id, AgentId(0));
+        assert!(app.pending_routstr_spend.is_none());
+
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::RoutstrRbfComplete {
+                    amount_sats: 21_000,
+                    original_fee_sats: 705,
+                    original_vbytes: 141,
+                    broadcast: false,
+                    agent_id: AgentId(0),
+                    ..
+                })
+            ),
+            "unlock with pending rbf must complete rbf, not fund: {effects:?}"
+        );
+        // Inputs preserved into effect.
+        match effects.first() {
+            Some(Effect::RoutstrRbfComplete { input_specs, .. }) => {
+                assert_eq!(input_specs, &vec![input]);
+            }
+            other => panic!("expected rbf complete: {other:?}"),
+        }
+        assert!(
+            app.pending_routstr_rbf.is_none(),
+            "pending consumed into effect"
+        );
+        let dbg = format!("{:?}", effects.first());
+        assert!(!dbg.contains("abandon"), "Debug leaked phrase: {dbg}");
+    }
+
+    #[test]
+    fn fund_clears_pending_rbf_so_unlock_routes_to_fund() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::RoutstrRbf {
+                address: "bc1qstale".into(),
+                amount_sats: 99_000,
+                original_fee_sats: 500,
+                original_vbytes: 141,
+                input_specs: vec![sample_rbf_input_spec()],
+                broadcast: true,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_rbf.is_some());
+
+        let effects = dispatch(Action::RoutstrFund, &mut app);
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::RoutstrFundProbe { .. })
+        ));
+        assert!(
+            app.pending_routstr_rbf.is_none(),
+            "fund must cancel staged rbf"
+        );
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        assert!(
+            text.to_ascii_lowercase().contains("cancelled staged rbf"),
+            "expected rbf cancel notice: {text}"
+        );
+
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(effects.first(), Some(Effect::RoutstrFundComplete { .. })),
+            "after fund cancel, unlock must fund not rbf: {effects:?}"
+        );
+        assert!(
+            !matches!(effects.first(), Some(Effect::RoutstrRbfComplete { .. })),
+            "must not complete stale rbf: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn spend_and_rbf_supersede_each_other() {
+        let mut app = test_app_with_agent();
+        // Stage spend.
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qspend".into(),
+                amount_sats: 1000,
+                broadcast: false,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_spend.is_some());
+        // Stage rbf → cancels spend.
+        let _ = dispatch(
+            Action::RoutstrRbf {
+                address: "bc1qrbf".into(),
+                amount_sats: 2000,
+                original_fee_sats: 100,
+                original_vbytes: 141,
+                input_specs: vec![sample_rbf_input_spec()],
+                broadcast: false,
+                fee_rate_sat_vb: None,
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_spend.is_none());
+        assert_eq!(
+            app.pending_routstr_rbf.as_ref().map(|p| p.address.as_str()),
+            Some("bc1qrbf")
+        );
+        // Stage spend again → cancels rbf.
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qspend2".into(),
+                amount_sats: 3000,
+                broadcast: true,
+                fee_rate_sat_vb: Some(8),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_rbf.is_none());
+        assert_eq!(
+            app.pending_routstr_spend
+                .as_ref()
+                .map(|p| p.address.as_str()),
+            Some("bc1qspend2")
+        );
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("cancelled staged spend") && lower.contains("cancelled staged rbf"),
+            "expected both cancel notices: {text}"
+        );
+    }
+
+    #[test]
+    fn unlock_rejects_rbf_when_active_agent_differs_from_staging() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        crate::app::dispatch::tests::insert_placeholder_agent(&mut app, AgentId(1));
+        let _ = dispatch(
+            Action::RoutstrRbf {
+                address: "bc1qagent0".into(),
+                amount_sats: 500,
+                original_fee_sats: 50,
+                original_vbytes: 100,
+                input_specs: vec![sample_rbf_input_spec()],
+                broadcast: true,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        assert_eq!(
+            app.pending_routstr_rbf.as_ref().map(|p| p.agent_id),
+            Some(AgentId(0))
+        );
+        app.active_view = ActiveView::Agent(AgentId(1));
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+            },
+            &mut app,
+        );
+        assert!(
+            effects.is_empty(),
+            "cross-agent unlock must not authorize rbf: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_rbf.is_some(),
+            "pending must remain for the staging agent"
+        );
+        assert_eq!(
+            app.pending_routstr_rbf.as_ref().map(|p| p.agent_id),
+            Some(AgentId(0))
+        );
+    }
+
+    #[test]
+    fn rbf_task_complete_does_not_drop_newer_staged_rbf() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let input = sample_rbf_input_spec();
+        let _ = dispatch(
+            Action::RoutstrRbf {
+                address: "bc1qstage-a".into(),
+                amount_sats: 1000,
+                original_fee_sats: 100,
+                original_vbytes: 141,
+                input_specs: vec![input.clone()],
+                broadcast: false,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        let unlock_effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                unlock_effects.first(),
+                Some(Effect::RoutstrRbfComplete {
+                    amount_sats: 1000,
+                    ..
+                })
+            ),
+            "stage A unlock: {unlock_effects:?}"
+        );
+        assert!(app.pending_routstr_rbf.is_none());
+
+        // Re-stage B while A is still "in flight".
+        let _ = dispatch(
+            Action::RoutstrRbf {
+                address: "bc1qstage-b".into(),
+                amount_sats: 2500,
+                original_fee_sats: 200,
+                original_vbytes: 150,
+                input_specs: vec![input],
+                broadcast: true,
+                fee_rate_sat_vb: Some(8),
+            },
+            &mut app,
+        );
+        let pending_b = app
+            .pending_routstr_rbf
+            .as_ref()
+            .expect("stage B must be pending");
+        assert_eq!(pending_b.address, "bc1qstage-b");
+        assert_eq!(pending_b.amount_sats, 2500);
+        assert!(pending_b.broadcast);
+
+        // Completion of A must not wipe B.
+        let _ = handle_routstr_rbf_completed(
+            &mut app,
+            AgentId(0),
+            Ok(xai_grok_shell::auth::RoutstrRbfSuccess {
+                payment_address: "bc1qstage-a".into(),
+                payment_sats: 1000,
+                original_fee_sats: 100,
+                fee_sats: 250,
+                change_sats: 0,
+                txid: "a".repeat(64),
+                raw_hex: "ab".repeat(20),
+                broadcast_txid: None,
+                network_label: "mainnet".into(),
+                fee_rate_sat_vb: 5,
+                lines: vec!["prepared stage A rbf (simulated)".into()],
+            }),
+        );
+        let still = app
+            .pending_routstr_rbf
+            .as_ref()
+            .expect("stage B must survive completion of A");
+        assert_eq!(still.address, "bc1qstage-b");
+        assert_eq!(still.amount_sats, 2500);
+        assert!(still.broadcast);
+        assert_eq!(still.fee_rate_sat_vb, Some(8));
+
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::RoutstrRbfComplete {
+                    amount_sats: 2500,
+                    broadcast: true,
+                    ..
+                })
+            ),
+            "unlock after A complete must still rbf B: {effects:?}"
         );
     }
 
