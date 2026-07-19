@@ -10,6 +10,7 @@ members = [
     "crates/codegen/ptyctl",
     "crates/codegen/ptyctl-cli",
     "crates/codegen/grok-rate-limit",
+    "crates/codegen/grok-bitcoin-wallet",
     "crates/codegen/xai-acp-lib",
     "crates/codegen/xai-agent-lifecycle",
     "crates/codegen/xai-chat-state",

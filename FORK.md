@@ -83,7 +83,7 @@ Keep diffs **small and product-facing** so merges stay tractable:
 |------|-------------|
 | Binary name | `grok-oss` (crate package still `xai-grok-pager-bin`) |
 | Branding / docs | README, FORK.md, CONTRIBUTING, version banner |
-| Features | e.g. OpenRouter as a separate model option |
+| Features | e.g. OpenRouter as a separate model option; Bitcoin-native Routstr (in progress) |
 | Packaging | AUR sources under `packaging/aur/` |
 | Internal crates | **Not** renamed (`xai-grok-*` paths stay for mergeability) |
 
@@ -94,6 +94,10 @@ Keep diffs **small and product-facing** so merges stay tractable:
 - [x] Binary name `grok-oss` and Grok OSS branding
 - [x] AUR packaging sources (`packaging/aur/`)
 - [x] CONTRIBUTING accepts PRs on this fork
+- [ ] Bitcoin-native Routstr Grok 4.5 path (local BIP-39 / BDK / LDK / CDK) —
+    reasoning in [`docs/bitcoin-routstr/`](docs/bitcoin-routstr/); crate
+    stub `grok-bitcoin-wallet` (SeedVault + funding wizard still to build)
+- [x] Novel crate naming: `grok-*` (e.g. `grok-rate-limit`, `grok-bitcoin-wallet`)
 
 ## Nix & CI
 
