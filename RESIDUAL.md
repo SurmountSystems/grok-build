@@ -1,23 +1,38 @@
 # Residual work: Bitcoin-native Routstr + wallet (2026-07-19)
 
-## Done this pass (RBF / CPFP fee estimation + mempool fee ladder)
+## Done this pass (RBF replacement PSBT rebuild/broadcast CLI)
 
 | Item | Status |
 |------|--------|
-| Pure `plan_rbf_fee_bump` / `RbfFeePlan` (BIP-125 same-size guidance) | **Done** |
-| Pure `plan_cpfp_child_fee` / `CpfpFeePlan` + `estimate_cpfp_child_vbytes` | **Done** |
-| `effective_fee_rate_sat_vb`, `rbf_min_fee_increase_sats`, `transaction_vbytes` | **Done** |
-| `PreparedSpend::weight_vbytes` / `effective_fee_rate_sat_vb` / `estimated_vbytes` | **Done** |
-| mempool `GET /api/v1/fees/recommended` URL + pure parse + `FeeEstimates` / `FeePriority` | **Done** |
-| `resolve_spend_fee_rate_sat_vb` (override → estimates → fallback) | **Done** |
-| `MempoolHttpClient::fetch_fee_estimates` (`explorer-http`, rate-limited) | **Done** |
-| Product copy: RBF/CPFP plan lines, fee meta on prepare, fee estimates lines | **Done** |
-| CLI/TUI: non-explicit fee uses live halfHour estimates else default 5 sat/vB | **Done** |
-| `SpendRequest.fee_rate_explicit`; spend usage notes RBF + estimates | **Done** |
-| Unit tests: RBF/CPFP edges, fee parse rejects, product formatters, override | **Done** |
+| `selection_with_rbf_fee` (same inputs, higher absolute fee, dust fold) | **Done** |
+| `prepare_rbf_replacement_from_selection` (same-size sign/finalize/extract) | **Done** |
+| `prepare_rbf_replacement` + `RbfReplacementSpend` (same-input plan → absolute fee → prepare) | **Done** |
+| BIP-125 absolute + bandwidth fee enforced; never claim broadcast without broadcaster | **Done** |
+| `parse_rbf_replace_request` / `--input` / `RbfReplaceRequest` + product formatters + usage | **Done** |
+| CLI `grok routstr rbf … --original-fee N --original-vbytes V --input … [--fee-rate] [--broadcast]` | **Done** |
+| Shell `run_routstr_rbf` / `complete_routstr_rbf_with_mnemonic` (same-input; unlock + re-entry) | **Done** |
+| Dry-run default; `--broadcast` only after unlock; Accepted + parseable txid only | **Done** |
+| Offline unit tests (wallet mocks + parse/format + clap + BIP-125 underpay guard) | **Done** |
 | Live CDK mint/refund / LDK BOLT11 | **Still residual** (flags remain false; no fake success) |
 | Multi-sig finalize *support* (beyond honest Partial) | **Still residual** |
-| Full PSBT RBF rebuild/broadcast path (plan helpers only this pass) | **Still residual** |
+| TUI `/routstr rbf` slash path | **Still residual** (CLI first) |
+| CPFP child construction (plan helpers only) | **Still residual** |
+
+## Done prior pass (RBF / CPFP fee estimation + mempool fee ladder)
+
+| Item | Status |
+|------|--------|
+| Pure `plan_rbf_fee_bump` / `RbfFeePlan` (BIP-125 same-size guidance) | Done |
+| Pure `plan_cpfp_child_fee` / `CpfpFeePlan` + `estimate_cpfp_child_vbytes` | Done |
+| `effective_fee_rate_sat_vb`, `rbf_min_fee_increase_sats`, `transaction_vbytes` | Done |
+| `PreparedSpend::weight_vbytes` / `effective_fee_rate_sat_vb` / `estimated_vbytes` | Done |
+| mempool `GET /api/v1/fees/recommended` URL + pure parse + `FeeEstimates` / `FeePriority` | Done |
+| `resolve_spend_fee_rate_sat_vb` (override → estimates → fallback) | Done |
+| `MempoolHttpClient::fetch_fee_estimates` (`explorer-http`, rate-limited) | Done |
+| Product copy: RBF/CPFP plan lines, fee meta on prepare, fee estimates lines | Done |
+| CLI/TUI: non-explicit fee uses live halfHour estimates else default 5 sat/vB | Done |
+| `SpendRequest.fee_rate_explicit`; spend usage notes RBF + estimates | Done |
+| Unit tests: RBF/CPFP edges, fee parse rejects, product formatters, override | Done |
 
 ## Done prior pass (multi-sig/non-P2WPKH finalize honesty + WatchSession persistence)
 
@@ -120,16 +135,23 @@
 - Unit-test builds of the pager skip durable FS (do not pollute developer home).
 - Wallet crate tests cover serialize/deserialize + full resume lifecycle.
 
-### RBF / CPFP / fee estimates note (this pass)
+### RBF replacement note (this pass)
 
 - Built PSBT inputs still set `Sequence::ENABLE_RBF_NO_LOCKTIME`.
-- Pure planners size same-size RBF replacements and CPFP child fees offline
-  (BIP-125 absolute + incremental + higher floor rate; package target rate).
-- Product prepare appends effective fee rate + RBF signal note (no broadcast claim).
-- Fee ladder from mempool.space-shaped JSON; live fetch only with `explorer-http`.
-- CLI/TUI when user omits fee: halfHour estimate if fetch works, else 5 sat/vB.
-- **Not** shipped: automatic RBF replacement PSBT rebuild/broadcast CLI subcommand;
-  CPFP child construction; multi-sig finalize beyond Partial honesty.
+- Pure planners size same-size RBF replacements and CPFP child fees offline.
+- **Shipped:** `grok routstr rbf` rebuilds a **same-input** BIP-125 replacement
+  from `--original-fee`, `--original-vbytes`, and each `--input
+  txid:vout:amount:address` (from prior spend dry-run meta). Plans via
+  `plan_rbf_fee_bump`, applies **recommended absolute fee** (not floor-rate
+  re-select), signs/finalizes with original prevouts only; dry-run by default;
+  `--broadcast` only after unlock + re-entry and only claims success on
+  broadcaster Accepted + parseable txid.
+- Library: `selection_with_rbf_fee` / `prepare_rbf_replacement` /
+  `prepare_rbf_replacement_from_selection` + post-prepare
+  `validate_rbf_replacement_fee` (bandwidth on actual replacement vB).
+- Spend dry-run prints `--input` lines for copy into rbf CLI.
+- **Not** shipped: TUI `/routstr rbf` slash; CPFP child PSBT construction;
+  multi-sig finalize beyond Partial honesty; live CDK/LN.
 
 ## Residual (next implement)
 
@@ -142,16 +164,18 @@
 ### P1 / product surfaces
 1. Wire `topup` / `refund` to **real** CDK/LN when those stacks land: flip `mint_live` / `refund_live` / `bolt11_*_live` only with tested impls; swap `default_*_backend()` factories.
 2. Optional: dedicated QR pane widget (today: Unicode QR matrix in system block + clipboard toast).
-3. Optional: `grok routstr fees` / fee-bump CLI that prints estimate ladder + RBF plan for a stuck txid (helpers exist; product subcommand residual).
+3. Optional: `grok routstr fees` CLI that prints estimate ladder only (RBF rebuild is now `grok routstr rbf`).
+4. Optional: TUI `/routstr rbf` slash + staged unlock path (CLI complete).
 
 ### P2 / spend path + explorers
 1. ~~Multi-sig / non-P2WPKH finalize residual~~ **Done** (honest Partial; still only single-key P2WPKH finalized).
 2. Optional full `bdk_wallet` electrum/esplora sync if still needed beyond mempool UTXO ChainSource.
 3. ~~Persist WatchSession across pager process restarts~~ **Done**.
-4. ~~RBF / CPFP-aware fee estimation~~ **Done this pass** (pure planners + fee ladder + product meta; automatic replacement PSBT rebuild residual).
-5. Electrum push broadcaster alternative (mempool.space POST wired).
-6. Optional: multi-sig / script-path **finalize support** (today: residual Partial only).
-7. Optional: end-to-end RBF replace-by-fee rebuild from a prior `PreparedSpend` / txid.
+4. ~~RBF / CPFP-aware fee estimation~~ **Done** (pure planners + fee ladder + product meta).
+5. ~~End-to-end RBF replace-by-fee rebuild~~ **Done this pass** (`grok routstr rbf` + library rebuild).
+6. Electrum push broadcaster alternative (mempool.space POST wired).
+7. Optional: multi-sig / script-path **finalize support** (today: residual Partial only).
+8. Optional: CPFP child PSBT construction (plan helpers only today).
 
 ### P3 / LDK
 1. `ldk-node` (or LDK) from BIP-39 seed; BOLT11 pay + invoice create with live capability flags.
@@ -174,7 +198,7 @@
 ```text
 Continue Bitcoin-native Routstr from RESIDUAL.md (CDK/LN live backends).
 
-RBF/CPFP fee planners + mempool fee estimates + product fee meta landed.
+RBF replacement rebuild CLI (`grok routstr rbf`) + fee planners landed.
 Do not regress:
   cargo test -p grok-bitcoin-wallet --lib
   cargo test -p xai-grok-shell --lib openrouter
@@ -184,7 +208,7 @@ Do not regress:
   ./scripts/bitcoin-routstr-validate.sh
 
 1. Wire topup/refund to real CDK/LN when stacks land; flip capability flags only when live; keep stubs honest.
-2. Optional: multi-sig/script-path finalize support (today Partial residual only); RBF replace PSBT rebuild; bdk electrum/esplora.
+2. Optional: multi-sig/script-path finalize support (today Partial residual only); CPFP child PSBT; TUI rbf slash; bdk electrum/esplora.
 3. Do not claim BOLT12; do not store BIP-39 in CredentialsStore or watch_session.json.
 4. cargo test -p grok-bitcoin-wallet --lib
    cargo test -p xai-grok-shell --lib routstr
@@ -206,16 +230,16 @@ cargo clippy -p xai-grok-pager --lib -- -D warnings
 ./scripts/bitcoin-routstr-validate.sh
 ```
 
-## Validation ran (2026-07-19 residual implement — RBF/CPFP fee + estimates)
+## Validation ran (2026-07-19 residual implement — RBF replacement CLI)
 
 | Check | Result |
 |-------|--------|
 | `cargo fmt` (touched packages) | pass |
-| `cargo test -p grok-bitcoin-wallet --lib` | pass (204) |
-| `cargo test -p xai-grok-shell --lib routstr` | pass (27 + 1 ignored) |
+| `cargo test -p grok-bitcoin-wallet --lib` | pass (214) |
+| `cargo test -p xai-grok-shell --lib routstr` | pass (30 + 1 ignored) |
 | `cargo test -p xai-grok-shell --lib openrouter` | pass (19) |
 | `cargo test -p xai-grok-pager --lib credit_bar` | pass (41) |
-| `cargo test -p xai-grok-pager --lib routstr` | pass (32) |
+| `cargo test -p xai-grok-pager --lib routstr` | pass (33) |
 | `cargo clippy -p grok-bitcoin-wallet --lib -- -D warnings` | pass |
 | `cargo clippy -p xai-grok-shell --lib -- -D warnings` | pass |
 | `cargo clippy -p xai-grok-pager --lib -- -D warnings` | pass |
@@ -226,3 +250,4 @@ cargo clippy -p xai-grok-pager --lib -- -D warnings
 | WatchSession durable resume | unchanged |
 | No BIP-39 in watch persistence | unchanged |
 | Fee estimates default CI | offline parse/Mock; live fetch feature-gated |
+| RBF broadcast claim | only on Accepted + parseable txid |

@@ -15,14 +15,14 @@
 //! - [`onchain`]: BIP84 receive address from mnemonic (feature `onchain-address`)
 //! - [`descriptor_wallet`]: BIP84 descriptors + list_unspent + fee-aware select_coins;
 //!   mock + optional mempool `ChainSource` (`explorer-http`); unsigned PSBT build +
-//!   BIP84 P2WPKH sign/finalize/extract; RBF/CPFP fee planners; broadcast via
-//!   [`explorer::TxBroadcaster`]
+//!   BIP84 P2WPKH sign/finalize/extract; RBF/CPFP fee planners; RBF replacement rebuild;
+//!   broadcast via [`explorer::TxBroadcaster`]
 //! - [`lightning`]: capability trait + BOLT12 honesty flag + `default_lightning_backend`
 //! - [`cashu`]: Cashu token newtype + funding wizard + `default_cashu_backend` seams
 //! - [`explorer`]: rate-limited mempool.space client + fee estimates + TxBroadcaster
 //!   (+ optional HTTP)
 //! - [`watcher`]: address/tx poll → FundingWizard confirmations
-//! - [`funding_cli`]: backup gate + unlock; spend fee/RBF copy; topup/refund via
+//! - [`funding_cli`]: backup gate + unlock; spend/RBF CLI copy; topup/refund via
 //!   default backends (CLI/TUI)
 
 #![forbid(unsafe_code)]

@@ -206,6 +206,35 @@ pub enum RoutstrCommand {
         #[arg(long)]
         fee_rate: Option<u64>,
     },
+    /// Rebuild a same-input BIP-125 RBF replacement (higher fee) for a stuck spend.
+    ///
+    /// Dry-run by default. Pass `--original-fee`, `--original-vbytes`, and each
+    /// `--input txid:vout:amount:address` from a prior `spend` dry-run meta
+    /// (same prevouts as the stuck tx). `--broadcast` submits via rate-limited
+    /// mempool.space after SeedVault unlock + recovery-phrase re-entry.
+    Rbf {
+        /// Destination Bitcoin address (same payment intent as the original)
+        address: String,
+        /// Amount to send in satoshis (same payment intent as the original)
+        sats: u64,
+        /// Absolute fee of the original (stuck) transaction in sats
+        #[arg(long)]
+        original_fee: u64,
+        /// Virtual size of the original transaction (from prior prepare meta)
+        #[arg(long)]
+        original_vbytes: u64,
+        /// Original prevout for same-input replace: `txid:vout:amount_sats:address`
+        /// (repeatable; at least one required — copy from spend dry-run meta)
+        #[arg(long = "input", required = true, value_name = "TXID:VOUT:AMOUNT:ADDR")]
+        inputs: Vec<String>,
+        /// Submit the replacement to the network (default: dry-run only)
+        #[arg(long)]
+        broadcast: bool,
+        /// Target fee rate in sat/vB for the replacement (omit for explorer halfHour /
+        /// default 5; product uses BIP-125 recommended absolute fee, not floor rate)
+        #[arg(long)]
+        fee_rate: Option<u64>,
+    },
 }
 /// Arguments for the `wrap` subcommand: the command to run, then its args.
 #[derive(Debug, clap::Args, Clone)]
@@ -1392,6 +1421,162 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
     }
+
+    #[test]
+    fn routstr_rbf_parses_dry_run_and_broadcast() {
+        let sample_input = format!(
+            "{}:0:100000:bc1qtestaddress000000000000000000000",
+            "ab".repeat(32)
+        );
+        let dry = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "rbf",
+            "bc1qtestaddress000000000000000000000",
+            "21000",
+            "--original-fee",
+            "705",
+            "--original-vbytes",
+            "141",
+            "--input",
+            &sample_input,
+        ])
+        .expect("routstr rbf dry-run parses");
+        match dry.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Rbf {
+                        address,
+                        sats: 21_000,
+                        original_fee: 705,
+                        original_vbytes: 141,
+                        ref inputs,
+                        broadcast: false,
+                        fee_rate: None,
+                    },
+            })) => {
+                assert!(address.starts_with("bc1q"));
+                assert_eq!(inputs.len(), 1);
+                assert_eq!(inputs[0], sample_input);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let live = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "rbf",
+            "bc1qtestaddress000000000000000000000",
+            "1000",
+            "--original-fee",
+            "500",
+            "--original-vbytes",
+            "100",
+            "--input",
+            &sample_input,
+            "--broadcast",
+            "--fee-rate",
+            "20",
+        ])
+        .expect("routstr rbf --broadcast parses");
+        match live.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Rbf {
+                        sats: 1000,
+                        original_fee: 500,
+                        original_vbytes: 100,
+                        broadcast: true,
+                        fee_rate: Some(20),
+                        ref inputs,
+                        ..
+                    },
+            })) => {
+                assert_eq!(inputs.len(), 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routstr_rbf_requires_original_flags_and_input() {
+        // Missing --original-fee / --original-vbytes / --input
+        let err = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "rbf",
+            "bc1qtestaddress000000000000000000000",
+            "21000",
+        ])
+        .expect_err("rbf without required flags must fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let err = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "rbf",
+            "bc1qtestaddress000000000000000000000",
+            "21000",
+            "--original-fee",
+            "705",
+            "--original-vbytes",
+            "141",
+            // no --input
+        ])
+        .expect_err("rbf without --input must fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn routstr_rbf_fee_rate_zero_rejected_by_product_parse() {
+        // Clap accepts u64 0; product parse_rbf_replace_request rejects it.
+        let sample_input = format!("{}:0:100000:bc1qrecv", "ab".repeat(32));
+        let parsed = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "rbf",
+            "bc1qtestaddress000000000000000000000",
+            "1000",
+            "--original-fee",
+            "500",
+            "--original-vbytes",
+            "100",
+            "--input",
+            &sample_input,
+            "--fee-rate",
+            "0",
+        ])
+        .expect("clap allows fee_rate 0; product rejects later");
+        match parsed.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Rbf {
+                        fee_rate: Some(0),
+                        ref inputs,
+                        original_fee: 500,
+                        original_vbytes: 100,
+                        ..
+                    },
+            })) => {
+                assert_eq!(inputs.len(), 1);
+                let err = grok_bitcoin_wallet::funding_cli::parse_rbf_replace_request(
+                    "bc1qtestaddress000000000000000000000",
+                    1000,
+                    500,
+                    100,
+                    inputs,
+                    false,
+                    Some(0),
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string().to_ascii_lowercase().contains("fee"),
+                    "{err}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
     #[test]
     fn positional_prompt_conflicts_with_headless_single() {
         let err = PagerArgs::try_parse_from(["grok", "-p", "headless", "interactive"])

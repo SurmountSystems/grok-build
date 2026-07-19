@@ -1969,6 +1969,28 @@ async fn async_main() -> Result<()> {
                         )
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
+                    RoutstrCommand::Rbf {
+                        address,
+                        sats,
+                        original_fee,
+                        original_vbytes,
+                        inputs,
+                        broadcast,
+                        fee_rate,
+                    } => {
+                        let grok_home = xai_grok_shell::util::grok_home::grok_home();
+                        xai_grok_shell::auth::run_routstr_rbf(
+                            &grok_home,
+                            &address,
+                            sats,
+                            original_fee,
+                            original_vbytes,
+                            &inputs,
+                            broadcast,
+                            fee_rate,
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
                 }
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }

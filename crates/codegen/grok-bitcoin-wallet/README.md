@@ -13,11 +13,11 @@ Reasoning: [`docs/bitcoin-routstr/`](../../../docs/bitcoin-routstr/README.md).
 | `seed_vault` | OS keyring + AEAD file; `UnlockSession` TTL; `MnemonicBackupGate` |
 | `nip06` | NIP-06 npub; nsec/hex only via controlled API |
 | `onchain` | BIP84 receive address (bitcoin+bip32) |
-| `descriptor_wallet` | BIP84 descriptors + `list_unspent` / fee-aware `select_coins` + mock/`MempoolChainSource` (`explorer-http`); unsigned PSBT + BIP84 P2WPKH sign/finalize/extract; RBF/CPFP fee planners; `TxBroadcaster` submit |
+| `descriptor_wallet` | BIP84 descriptors + `list_unspent` / fee-aware `select_coins` + mock/`MempoolChainSource` (`explorer-http`); unsigned PSBT + BIP84 P2WPKH sign/finalize/extract; RBF/CPFP fee planners; RBF replacement rebuild; `TxBroadcaster` submit |
 | `address_ux` | PaymentDisplay, BIP21, mempool.space URLs, QR ascii |
 | `explorer` | RateLimitedExplorer; `TxBroadcaster` + fee estimates parse; optional `explorer-http` MempoolHttpClient (GET + fees/recommended + POST `/api/tx`) |
 | `watcher` | Address/tx poll → FundingWizard confirmations (injected producer) |
-| `funding_cli` | Backup gate + unlock before ShowAddress; spend parse + RBF/CPFP guidance lines; topup/refund via `default_*_backend` seams; receive QR lines |
+| `funding_cli` | Backup gate + unlock before ShowAddress; spend/RBF parse + RBF/CPFP guidance lines; topup/refund via `default_*_backend` seams; receive QR lines |
 | `lightning` | `LightningCapability` + `default_lightning_backend()`; invoice/pay outcomes; channel wizard; `BOLT12_SUPPORTED=false` |
 | `cashu` | CashuToken + `CashuBackend` + `default_cashu_backend()`; FundingWizard |
 
@@ -44,6 +44,7 @@ Bitcoin / Lightning / Cashu (Chaumian eCash). Never “crypto.”
 | BIP84 receive address | done |
 | Descriptor wallet + fee-aware UTXO select + PSBT + broadcast | done (sign/finalize/extract + TxBroadcaster; CLI/TUI dry-run default; multi-sig/non-P2WPKH finalize is honest Partial only) |
 | RBF/CPFP fee planners + mempool fee ladder | done (pure BIP-125 / package guidance; product fee meta; live halfHour when `explorer-http`) |
+| RBF replacement rebuild/broadcast CLI | done (same-input `prepare_rbf_replacement` + `grok routstr rbf --input …`; dry-run default; absolute BIP-125 fee; broadcast only after unlock + Accepted) |
 | WatchSession persistence (no BIP-39) | done (`{GROK_HOME}/bitcoin/watch_session.json`; pager resume on restart) |
 | LDK pay / BOLT12 | stub / deferred (`BOLT12_SUPPORTED=false`; optional `ldk` feature flag only) |
 | CDK Cashu mint/spend | capability seams + default backend factory; stubs never claim live mint/refund; optional `cashu-cdk` feature flag only |

@@ -769,16 +769,71 @@ pub fn format_spend_fee_meta_lines(
             "Fee rate: requested {requested_fee_rate_sat_vb} sat/vB; effective ~{effective} sat/vB \
              ({fee_sats} sats / {vbytes} vB)."
         ),
-        "Inputs signal RBF (BIP-125). To bump later, rebuild at a higher fee rate (see RBF plan \
-         helpers) or CPFP a child that spends a change output."
+        "Inputs signal RBF (BIP-125). To bump a stuck spend, use `grok routstr rbf` with \
+         --original-fee / --original-vbytes from this meta and each --input line below \
+         (same prevouts). Dry-run fee+vB alone is not enough for a true replace-by-fee."
             .to_owned(),
     ]
 }
 
+/// Printable `--input txid:vout:amount:address` lines for same-input RBF rebuild.
+///
+/// Call after prepare so the user can copy prevouts into `grok routstr rbf`.
+/// Not secret material (outpoints + amounts + addresses only).
+#[cfg(feature = "onchain-address")]
+pub fn format_spend_rbf_input_lines(
+    inputs: &[crate::descriptor_wallet::WalletUtxo],
+) -> Vec<String> {
+    if inputs.is_empty() {
+        return vec![
+            "RBF inputs: (none recorded — cannot rebuild same-input RBF from this prepare)."
+                .to_owned(),
+        ];
+    }
+    let mut lines = vec![
+        "RBF inputs (pass each line to `grok routstr rbf`; required for stuck-tx replace):"
+            .to_owned(),
+    ];
+    for u in inputs {
+        lines.push(format_rbf_input_cli_flag(u));
+    }
+    lines
+}
+
+/// Single CLI flag form: `--input txid:vout:amount_sats:address`.
+#[cfg(feature = "onchain-address")]
+pub fn format_rbf_input_cli_flag(utxo: &crate::descriptor_wallet::WalletUtxo) -> String {
+    format!(
+        "  --input {}:{}:{}:{}",
+        utxo.outpoint.txid, utxo.outpoint.vout, utxo.amount_sats, utxo.address
+    )
+}
+
+/// Format one input as the value part of `--input` (no flag prefix).
+pub fn format_rbf_input_spec_value(spec: &RbfInputSpec) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        spec.txid, spec.vout, spec.amount_sats, spec.address
+    )
+}
+
 /// Human lines for an [`crate::descriptor_wallet::RbfFeePlan`].
+///
+/// When `include_rebuild_hint` is false (already inside an RBF prepare/broadcast
+/// flow), omits the trailing “Rebuild with grok routstr rbf / Does not broadcast”
+/// sentence that would contradict an in-progress `--broadcast` request.
 #[cfg(feature = "onchain-address")]
 pub fn format_rbf_fee_plan_lines(plan: &crate::descriptor_wallet::RbfFeePlan) -> Vec<String> {
-    vec![
+    format_rbf_fee_plan_lines_inner(plan, true)
+}
+
+/// Same as [`format_rbf_fee_plan_lines`] with optional rebuild/broadcast disclaimer.
+#[cfg(feature = "onchain-address")]
+pub fn format_rbf_fee_plan_lines_inner(
+    plan: &crate::descriptor_wallet::RbfFeePlan,
+    include_rebuild_hint: bool,
+) -> Vec<String> {
+    let mut lines = vec![
         format!(
             "RBF fee bump plan (same-size replacement, {} vB):",
             plan.original_vbytes
@@ -800,9 +855,15 @@ pub fn format_rbf_fee_plan_lines(plan: &crate::descriptor_wallet::RbfFeePlan) ->
             plan.recommended_fee_rate_sat_vb,
             plan.fee_delta_sats
         ),
-        "  Rebuild the spend at the recommended fee rate (or higher). Does not broadcast."
-            .to_owned(),
-    ]
+    ];
+    if include_rebuild_hint {
+        lines.push(
+            "  Rebuild with `grok routstr rbf` using the same --input prevouts and this fee plan. \
+             Does not broadcast."
+                .to_owned(),
+        );
+    }
+    lines
 }
 
 /// Human lines for an [`crate::descriptor_wallet::CpfpFeePlan`].
@@ -861,6 +922,24 @@ pub fn rbf_fee_bump_guidance_lines(
     Ok(format_rbf_fee_plan_lines(&plan))
 }
 
+/// Product claim for broadcast success: only when broadcast was requested **and**
+/// a broadcaster returned a parseable 64-hex txid. Never invents from local prepare.
+///
+/// Unit-testable without network. Returns `None` for dry-run or invalid/missing txid.
+pub fn spend_broadcast_claimed_txid(
+    broadcast_requested: bool,
+    broadcaster_txid: Option<&str>,
+) -> Option<String> {
+    if !broadcast_requested {
+        return None;
+    }
+    let t = broadcaster_txid?.trim();
+    if !crate::explorer::is_valid_txid_hex(t) {
+        return None;
+    }
+    Some(t.to_ascii_lowercase())
+}
+
 /// Pure CPFP guidance; `child_output_count` defaults to 1 when 0.
 #[cfg(feature = "onchain-address")]
 pub fn cpfp_fee_guidance_lines(
@@ -910,6 +989,9 @@ pub fn spend_usage_lines() -> Vec<String> {
     vec![
         "Usage:".to_owned(),
         "  grok routstr spend <address> <sats> [--broadcast] [--fee-rate <n>]".to_owned(),
+        "  grok routstr rbf <address> <sats> --original-fee <sats> --original-vbytes <n> \
+         --input <txid:vout:amount:address> [...] [--fee-rate <n>] [--broadcast]"
+            .to_owned(),
         "  /routstr spend <address> <sats> [broadcast] [fee=<n>]".to_owned(),
         "Default is dry-run (build/sign/extract only). SeedVault unlock + recovery-phrase \
          re-entry required; BIP-39 never goes to chat history or CredentialsStore."
@@ -920,8 +1002,263 @@ pub fn spend_usage_lines() -> Vec<String> {
          external broadcast."
             .to_owned(),
         "Fee: omit --fee-rate to use explorer halfHour estimates when available, else \
-         default 5 sat/vB. Inputs signal RBF (BIP-125); use RBF/CPFP plan helpers to size \
-         a fee bump without inventing witnesses."
+         default 5 sat/vB. Inputs signal RBF (BIP-125). To replace a stuck spend, use \
+         `grok routstr rbf` with --original-fee/--original-vbytes and each --input from the \
+         prior dry-run meta (same prevouts; never invents witnesses)."
+            .to_owned(),
+    ]
+}
+
+/// One original prevout for same-input BIP-125 RBF (no secrets).
+///
+/// Wire form: `txid:vout:amount_sats:address` (see [`parse_rbf_input_spec`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RbfInputSpec {
+    pub txid: String,
+    pub vout: u32,
+    pub amount_sats: u64,
+    pub address: String,
+}
+
+impl RbfInputSpec {
+    /// Convert to a [`crate::descriptor_wallet::WalletUtxo`] for prepare.
+    #[cfg(feature = "onchain-address")]
+    pub fn to_wallet_utxo(&self) -> crate::descriptor_wallet::WalletUtxo {
+        crate::descriptor_wallet::WalletUtxo {
+            outpoint: crate::descriptor_wallet::OutPointRef::new(self.txid.clone(), self.vout),
+            amount_sats: self.amount_sats,
+            address: self.address.clone(),
+            // Confirmations unused for same-input RBF (inputs are already known).
+            confirmations: 0,
+            is_change: false,
+        }
+    }
+}
+
+/// Parsed RBF replace request (no secrets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RbfReplaceRequest {
+    pub payment_address: String,
+    pub amount_sats: u64,
+    /// Absolute fee of the original (stuck) transaction in sats.
+    pub original_fee_sats: u64,
+    /// Virtual size of the original transaction (from prior prepare meta / weight).
+    pub original_vbytes: u64,
+    /// Original prevouts for same-input replace (required; at least one).
+    pub inputs: Vec<RbfInputSpec>,
+    /// When false (product default), build/sign/extract only — do not broadcast.
+    pub broadcast: bool,
+    pub fee_rate_sat_vb: u64,
+    /// True when the user supplied `--fee-rate` (not product default / estimates).
+    pub fee_rate_explicit: bool,
+}
+
+/// Pure parse errors for RBF replace args.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RbfReplaceParseError {
+    InvalidFeeRate(String),
+    ZeroAmount,
+    ZeroOriginalVbytes,
+    EmptyAddress,
+    /// No `--input` specs (true stuck-tx RBF requires original prevouts).
+    MissingInputs,
+    /// Malformed `--input txid:vout:amount:address`.
+    InvalidInput(String),
+}
+
+impl std::fmt::Display for RbfReplaceParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidFeeRate(s) => write!(f, "invalid fee rate: {s}"),
+            Self::ZeroAmount => write!(f, "amount must be > 0 sats"),
+            Self::ZeroOriginalVbytes => write!(f, "--original-vbytes must be > 0"),
+            Self::EmptyAddress => write!(f, "payment address must not be empty"),
+            Self::MissingInputs => write!(
+                f,
+                "RBF requires at least one --input txid:vout:amount:address \
+                 (same prevouts as the stuck tx; from prior spend dry-run meta)"
+            ),
+            Self::InvalidInput(s) => write!(f, "invalid --input: {s}"),
+        }
+    }
+}
+
+/// Parse one `--input` value: `txid:vout:amount_sats:address`.
+///
+/// `txid` must be 64 hex; `vout` and `amount` decimal integers; address is the
+/// remainder after the third colon (bech32 has no colons).
+pub fn parse_rbf_input_spec(raw: &str) -> std::result::Result<RbfInputSpec, RbfReplaceParseError> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(RbfReplaceParseError::InvalidInput(
+            "empty --input (expected txid:vout:amount:address)".into(),
+        ));
+    }
+    let parts: Vec<&str> = s.splitn(4, ':').collect();
+    if parts.len() != 4 {
+        return Err(RbfReplaceParseError::InvalidInput(format!(
+            "expected txid:vout:amount:address, got {raw:?}"
+        )));
+    }
+    let txid = parts[0].trim().to_ascii_lowercase();
+    if !crate::explorer::is_valid_txid_hex(&txid) {
+        return Err(RbfReplaceParseError::InvalidInput(format!(
+            "txid must be 64 hex characters, got len {}",
+            txid.len()
+        )));
+    }
+    let vout: u32 = parts[1].trim().parse().map_err(|_| {
+        RbfReplaceParseError::InvalidInput(format!("invalid vout {:?}", parts[1].trim()))
+    })?;
+    let amount_sats: u64 = parts[2].trim().parse().map_err(|_| {
+        RbfReplaceParseError::InvalidInput(format!(
+            "invalid amount {:?} (expected integer sats)",
+            parts[2].trim()
+        ))
+    })?;
+    if amount_sats == 0 {
+        return Err(RbfReplaceParseError::InvalidInput(
+            "input amount must be > 0 sats".into(),
+        ));
+    }
+    let address = parts[3].trim().to_owned();
+    if address.is_empty() {
+        return Err(RbfReplaceParseError::InvalidInput(
+            "input address must not be empty".into(),
+        ));
+    }
+    Ok(RbfInputSpec {
+        txid,
+        vout,
+        amount_sats,
+        address,
+    })
+}
+
+/// Parse RBF replace args into a [`RbfReplaceRequest`].
+///
+/// `fee_rate_sat_vb: None` → default rate and `fee_rate_explicit = false`.
+/// `Some(n)` with `n > 0` → explicit target rate. `Some(0)` is rejected.
+/// `original_fee_sats` may be 0 (BIP-125 still bumps). `original_vbytes` must be > 0.
+/// `input_specs` must contain at least one valid `txid:vout:amount:address`.
+pub fn parse_rbf_replace_request(
+    address: &str,
+    amount_sats: u64,
+    original_fee_sats: u64,
+    original_vbytes: u64,
+    input_specs: &[String],
+    broadcast: bool,
+    fee_rate_sat_vb: Option<u64>,
+) -> std::result::Result<RbfReplaceRequest, RbfReplaceParseError> {
+    let payment_address = address.trim().to_owned();
+    if payment_address.is_empty() {
+        return Err(RbfReplaceParseError::EmptyAddress);
+    }
+    if amount_sats == 0 {
+        return Err(RbfReplaceParseError::ZeroAmount);
+    }
+    if original_vbytes == 0 {
+        return Err(RbfReplaceParseError::ZeroOriginalVbytes);
+    }
+    if input_specs.is_empty() {
+        return Err(RbfReplaceParseError::MissingInputs);
+    }
+    let mut inputs = Vec::with_capacity(input_specs.len());
+    let mut seen = std::collections::HashSet::new();
+    for raw in input_specs {
+        let spec = parse_rbf_input_spec(raw)?;
+        let key = (spec.txid.clone(), spec.vout);
+        if !seen.insert(key) {
+            return Err(RbfReplaceParseError::InvalidInput(format!(
+                "duplicate input {}:{}",
+                spec.txid, spec.vout
+            )));
+        }
+        inputs.push(spec);
+    }
+    let fee_rate_explicit = fee_rate_sat_vb.is_some();
+    let fee_rate_sat_vb = fee_rate_sat_vb.unwrap_or(DEFAULT_SPEND_FEE_RATE_SAT_VB);
+    if fee_rate_sat_vb == 0 {
+        return Err(RbfReplaceParseError::InvalidFeeRate(
+            "fee rate must be > 0 sat/vB".into(),
+        ));
+    }
+    Ok(RbfReplaceRequest {
+        payment_address,
+        amount_sats,
+        original_fee_sats,
+        original_vbytes,
+        inputs,
+        broadcast,
+        fee_rate_sat_vb,
+        fee_rate_explicit,
+    })
+}
+
+/// Whether product may attempt network broadcast for this RBF request.
+pub fn rbf_wants_broadcast(req: &RbfReplaceRequest) -> bool {
+    req.broadcast
+}
+
+/// Lines after a successful local RBF replacement prepare (dry-run default).
+#[cfg(feature = "onchain-address")]
+pub fn format_rbf_replacement_prepared_lines(
+    payment_address: &str,
+    payment_sats: u64,
+    original_fee_sats: u64,
+    replacement_fee_sats: u64,
+    change_sats: u64,
+    txid: &str,
+    raw_hex: &str,
+    broadcast: bool,
+    plan: &crate::descriptor_wallet::RbfFeePlan,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("Prepared RBF replacement spend: {payment_sats} sats → {payment_address}"),
+        format!(
+            "Original fee: {original_fee_sats} sats → replacement fee: {replacement_fee_sats} sats \
+             (+{} sats)",
+            replacement_fee_sats.saturating_sub(original_fee_sats)
+        ),
+        format!("Change: {change_sats} sats"),
+        format!("Txid (local): {txid}"),
+        "Same-input BIP-125 replacement (original prevouts reused; not a fresh coin select)."
+            .to_owned(),
+    ];
+    // Inside prepare/broadcast: omit rebuild disclaimer (avoids contradicting --broadcast).
+    lines.extend(format_rbf_fee_plan_lines_inner(plan, false));
+    if broadcast {
+        lines.push(
+            "Broadcast requested — submitting RBF replacement via rate-limited explorer…"
+                .to_owned(),
+        );
+    } else {
+        lines.push(
+            "Dry-run only (not broadcast). Re-run with --broadcast to submit the replacement. \
+             The original stuck tx is not cancelled until a higher-fee replacement is accepted."
+                .to_owned(),
+        );
+        lines.extend(format_spend_raw_hex_lines(raw_hex));
+    }
+    lines
+}
+
+/// Usage blurb for `grok routstr rbf`.
+pub fn rbf_usage_lines() -> Vec<String> {
+    vec![
+        "Usage:".to_owned(),
+        "  grok routstr rbf <address> <sats> --original-fee <sats> --original-vbytes <n> \
+         --input <txid:vout:amount:address> [...] [--fee-rate <n>] [--broadcast]"
+            .to_owned(),
+        "Rebuilds a BIP-125 same-input RBF replacement (higher absolute fee) that conflicts \
+         with the stuck mempool tx. Take --original-fee, --original-vbytes, and each --input \
+         from a prior `spend` dry-run meta. Dry-run by default; --broadcast only after unlock \
+         + re-entry."
+            .to_owned(),
+        "Omit --fee-rate to use explorer halfHour estimates when available, else default \
+         5 sat/vB; product uses plan recommended absolute fee (not floor-rate re-select). \
+         Never claims broadcast without explorer Accepted + parseable txid. BIP-39 never \
+         on CLI lines (SeedVault unlock)."
             .to_owned(),
     ]
 }
@@ -1621,6 +1958,7 @@ mod tests {
         assert!(rbf_j.contains("rbf fee bump"));
         assert!(rbf_j.contains("recommended"));
         assert!(rbf_j.contains("does not broadcast"));
+        assert!(rbf_j.contains("grok routstr rbf") || rbf_j.contains("rbf"));
 
         let cpfp = cpfp_fee_guidance_lines(200, 200, 1, 10).unwrap();
         let cpfp_j = cpfp.join("\n").to_ascii_lowercase();
@@ -1637,6 +1975,178 @@ mod tests {
         let usage = spend_usage_lines().join("\n").to_ascii_lowercase();
         assert!(usage.contains("rbf") || usage.contains("bip-125"));
         assert!(usage.contains("fee"));
+        assert!(usage.contains("routstr rbf"));
         assert!(!usage.contains("crypto"));
+    }
+
+    fn sample_rbf_input() -> String {
+        format!("{}:0:100000:bc1qrecv", "ab".repeat(32))
+    }
+
+    #[test]
+    fn parse_rbf_input_spec_roundtrip() {
+        let raw = sample_rbf_input();
+        let spec = parse_rbf_input_spec(&raw).unwrap();
+        assert_eq!(spec.txid, "ab".repeat(32));
+        assert_eq!(spec.vout, 0);
+        assert_eq!(spec.amount_sats, 100_000);
+        assert_eq!(spec.address, "bc1qrecv");
+        assert_eq!(format_rbf_input_spec_value(&spec), raw);
+
+        assert!(matches!(
+            parse_rbf_input_spec("short:0:1:bc1q").unwrap_err(),
+            RbfReplaceParseError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            parse_rbf_input_spec(&format!("{}:x:1:bc1q", "ab".repeat(32))).unwrap_err(),
+            RbfReplaceParseError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            parse_rbf_input_spec(&format!("{}:0:0:bc1q", "ab".repeat(32))).unwrap_err(),
+            RbfReplaceParseError::InvalidInput(_)
+        ));
+    }
+
+    #[test]
+    fn parse_rbf_replace_request_explicit_and_default() {
+        let inputs = vec![sample_rbf_input()];
+        let req =
+            parse_rbf_replace_request("bc1qdest", 21_000, 705, 141, &inputs, false, None).unwrap();
+        assert_eq!(req.payment_address, "bc1qdest");
+        assert_eq!(req.amount_sats, 21_000);
+        assert_eq!(req.original_fee_sats, 705);
+        assert_eq!(req.original_vbytes, 141);
+        assert_eq!(req.inputs.len(), 1);
+        assert!(!req.broadcast);
+        assert!(!req.fee_rate_explicit);
+        assert_eq!(req.fee_rate_sat_vb, DEFAULT_SPEND_FEE_RATE_SAT_VB);
+
+        let req =
+            parse_rbf_replace_request("bc1qdest", 100, 500, 100, &inputs, true, Some(20)).unwrap();
+        assert!(req.broadcast);
+        assert!(req.fee_rate_explicit);
+        assert_eq!(req.fee_rate_sat_vb, 20);
+        assert!(rbf_wants_broadcast(&req));
+    }
+
+    #[test]
+    fn parse_rbf_replace_rejects_zero_and_empty() {
+        let inputs = vec![sample_rbf_input()];
+        assert_eq!(
+            parse_rbf_replace_request("", 100, 50, 100, &inputs, false, None).unwrap_err(),
+            RbfReplaceParseError::EmptyAddress
+        );
+        assert_eq!(
+            parse_rbf_replace_request("bc1q", 0, 50, 100, &inputs, false, None).unwrap_err(),
+            RbfReplaceParseError::ZeroAmount
+        );
+        assert_eq!(
+            parse_rbf_replace_request("bc1q", 100, 50, 0, &inputs, false, None).unwrap_err(),
+            RbfReplaceParseError::ZeroOriginalVbytes
+        );
+        assert_eq!(
+            parse_rbf_replace_request("bc1q", 100, 50, 100, &[], false, None).unwrap_err(),
+            RbfReplaceParseError::MissingInputs
+        );
+        assert!(matches!(
+            parse_rbf_replace_request("bc1q", 100, 50, 100, &inputs, false, Some(0)).unwrap_err(),
+            RbfReplaceParseError::InvalidFeeRate(_)
+        ));
+        // original_fee_sats = 0 is allowed (plan still bumps).
+        let req = parse_rbf_replace_request("bc1q", 100, 0, 100, &inputs, false, Some(5)).unwrap();
+        assert_eq!(req.original_fee_sats, 0);
+        // duplicate inputs rejected
+        let dup = vec![sample_rbf_input(), sample_rbf_input()];
+        assert!(matches!(
+            parse_rbf_replace_request("bc1q", 100, 50, 100, &dup, false, None).unwrap_err(),
+            RbfReplaceParseError::InvalidInput(_)
+        ));
+    }
+
+    #[test]
+    fn spend_broadcast_claimed_txid_only_on_accepted() {
+        let good = "ab".repeat(32);
+        assert_eq!(
+            spend_broadcast_claimed_txid(true, Some(&good)).as_deref(),
+            Some(good.as_str())
+        );
+        assert_eq!(spend_broadcast_claimed_txid(false, Some(&good)), None);
+        assert_eq!(spend_broadcast_claimed_txid(true, None), None);
+        assert_eq!(spend_broadcast_claimed_txid(true, Some("not-a-txid")), None);
+        assert_eq!(spend_broadcast_claimed_txid(true, Some("")), None);
+    }
+
+    #[cfg(feature = "onchain-address")]
+    #[test]
+    fn format_rbf_replacement_prepared_lines_dry_run_and_broadcast() {
+        let plan = crate::descriptor_wallet::plan_rbf_fee_bump(705, 141, 15, 0).unwrap();
+        let hex = "deadbeef";
+        let dry = format_rbf_replacement_prepared_lines(
+            "bc1qdest",
+            25_000,
+            705,
+            plan.recommended_fee_sats,
+            70_000,
+            "aa".repeat(32).as_str(),
+            hex,
+            false,
+            &plan,
+        );
+        let dry_j = dry.join("\n").to_ascii_lowercase();
+        assert!(dry_j.contains("rbf replacement"));
+        assert!(dry_j.contains("dry-run"));
+        assert!(dry_j.contains(hex));
+        assert!(!dry_j.contains("broadcast accepted"));
+        assert!(dry.iter().any(|l| is_spend_raw_hex_output_line(l, hex)));
+
+        let live = format_rbf_replacement_prepared_lines(
+            "bc1qdest",
+            25_000,
+            705,
+            plan.recommended_fee_sats,
+            70_000,
+            "bb".repeat(32).as_str(),
+            hex,
+            true,
+            &plan,
+        );
+        let live_j = live.join("\n").to_ascii_lowercase();
+        assert!(live_j.contains("broadcast requested"));
+        // Broadcast path must not dump hex before accept.
+        assert!(!live.iter().any(|l| l == hex));
+        // Plan rebuild disclaimer must not appear inside prepared (broadcast) flow.
+        assert!(
+            !live_j.contains("does not broadcast"),
+            "rebuild disclaimer should be omitted inside rbf prepare: {live_j}"
+        );
+        assert!(live_j.contains("same-input"));
+    }
+
+    #[test]
+    fn rbf_usage_mentions_original_fee_and_dry_run() {
+        let usage = rbf_usage_lines().join("\n").to_ascii_lowercase();
+        assert!(usage.contains("original-fee"));
+        assert!(usage.contains("original-vbytes"));
+        assert!(usage.contains("--input") || usage.contains("input"));
+        assert!(usage.contains("dry-run") || usage.contains("broadcast"));
+        assert!(!usage.contains("crypto"));
+        assert!(!usage.contains("bip-39 on cli") || usage.contains("never"));
+    }
+
+    #[cfg(feature = "onchain-address")]
+    #[test]
+    fn format_spend_rbf_input_lines_emits_cli_flags() {
+        let utxo = crate::descriptor_wallet::WalletUtxo {
+            outpoint: crate::descriptor_wallet::OutPointRef::new("ab".repeat(32), 1),
+            amount_sats: 50_000,
+            address: "bc1qtest".into(),
+            confirmations: 3,
+            is_change: false,
+        };
+        let lines = format_spend_rbf_input_lines(&[utxo]);
+        let j = lines.join("\n");
+        assert!(j.contains("--input"));
+        assert!(j.contains(&"ab".repeat(32)));
+        assert!(j.contains(":1:50000:bc1qtest"));
     }
 }

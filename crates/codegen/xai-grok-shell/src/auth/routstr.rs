@@ -425,6 +425,26 @@ pub struct RoutstrSpendSuccess {
     pub lines: Vec<String>,
 }
 
+/// Successful local RBF replacement prepare (+ optional broadcast).
+///
+/// `broadcast_txid` is set **only** when a broadcaster returned Accepted with a
+/// parseable txid — never invented from the local replacement txid alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutstrRbfSuccess {
+    pub payment_address: String,
+    pub payment_sats: u64,
+    pub original_fee_sats: u64,
+    pub fee_sats: u64,
+    pub change_sats: u64,
+    pub txid: String,
+    pub raw_hex: String,
+    /// Set only when a broadcaster accepted the replacement (never invented).
+    pub broadcast_txid: Option<String>,
+    pub network_label: String,
+    pub fee_rate_sat_vb: u64,
+    pub lines: Vec<String>,
+}
+
 /// Resolve product spend fee rate (sat/vB) with an injected estimate ladder.
 ///
 /// Pure / offline-testable: no network. Order: explicit override (>0) →
@@ -639,7 +659,8 @@ pub fn complete_routstr_spend_with_mnemonic(
     };
     use grok_bitcoin_wallet::funding_cli::{
         format_spend_broadcast_failed_lines, format_spend_broadcast_success_lines,
-        format_spend_fee_meta_lines, format_spend_prepared_lines,
+        format_spend_fee_meta_lines, format_spend_prepared_lines, format_spend_rbf_input_lines,
+        spend_broadcast_claimed_txid,
     };
 
     let network_label = {
@@ -686,6 +707,8 @@ pub fn complete_routstr_spend_with_mnemonic(
         prepared.weight_vbytes(),
         fee_rate_sat_vb,
     ));
+    // Same-input RBF needs original prevouts; print --input lines for copy into rbf CLI.
+    lines.extend(format_spend_rbf_input_lines(&prepared.selected_inputs));
 
     let broadcast_txid = if broadcast {
         let mut client = grok_bitcoin_wallet::explorer::MempoolHttpClient::with_defaults(btc_net)
@@ -696,7 +719,7 @@ pub fn complete_routstr_spend_with_mnemonic(
                     &res.txid,
                     &network_label,
                 ));
-                Some(res.txid)
+                spend_broadcast_claimed_txid(true, Some(&res.txid))
             }
             Err(e) => {
                 // Failure after local prepare: append full hex so CLI/TUI can
@@ -721,6 +744,271 @@ pub fn complete_routstr_spend_with_mnemonic(
         raw_hex,
         broadcast_txid,
         network_label,
+        lines,
+    })
+}
+
+/// `grok routstr rbf <address> <sats> --original-fee N --original-vbytes V --input ... [--broadcast] [--fee-rate N]`.
+///
+/// Rebuilds a **same-input** BIP-125 RBF replacement at a higher absolute fee.
+/// Requires original prevouts (`--input txid:vout:amount:address` from spend
+/// dry-run meta) — does **not** re-select confirmed UTXOs (those disappear once
+/// the stuck tx is in the mempool).
+/// **Dry-run by default.** Explicit `--broadcast` submits via rate-limited
+/// mempool.space. Same SeedVault unlock + recovery-phrase re-entry as spend.
+/// Never claims broadcast without Accepted + parseable txid.
+///
+/// When `fee_rate_sat_vb` is `None`, uses explorer halfHour estimates when
+/// available; otherwise the wallet default. Explicit `Some(0)` is rejected.
+/// Product uses plan_rbf_fee_bump recommended absolute fee (not floor rate).
+pub fn run_routstr_rbf(
+    grok_home: &Path,
+    payment_address: &str,
+    amount_sats: u64,
+    original_fee_sats: u64,
+    original_vbytes: u64,
+    input_specs: &[String],
+    broadcast: bool,
+    fee_rate_sat_vb: Option<u64>,
+) -> Result<RoutstrRbfSuccess, RoutstrCliError> {
+    use grok_bitcoin_wallet::funding_cli::{
+        FundPathDecision, fund_path_decision_from_load, keyring_blocked_message,
+        parse_rbf_replace_request, password_required_message,
+    };
+    use grok_bitcoin_wallet::seed_vault::{SeedVault, UnlockSession, VaultPassword};
+    use std::time::Instant;
+
+    let mut req = parse_rbf_replace_request(
+        payment_address,
+        amount_sats,
+        original_fee_sats,
+        original_vbytes,
+        input_specs,
+        broadcast,
+        fee_rate_sat_vb,
+    )
+    .map_err(|e| RoutstrCliError::Message(e.to_string()))?;
+    if !req.fee_rate_explicit {
+        req.fee_rate_sat_vb = resolve_spend_fee_rate_for_product(None);
+    }
+
+    let aead_path = routstr_seed_aead_path(grok_home);
+    let vault = SeedVault::with_aead_path(&aead_path).map_err(RoutstrCliError::Wallet)?;
+    let network_str = std::env::var("GROK_BITCOIN_NETWORK").unwrap_or_else(|_| "mainnet".into());
+    let network_label = {
+        let t = network_str.trim();
+        if t.is_empty() { "mainnet" } else { t }
+    }
+    .to_owned();
+
+    let mnemonic = match vault.load(None) {
+        Ok(m) => m,
+        Err(e) => match fund_path_decision_from_load::<()>(Err(e)) {
+            FundPathDecision::NeedPassword => {
+                let pw_raw = read_secret_prompt("Unlock seed file password: ")?;
+                let pw = VaultPassword::new(pw_raw);
+                if pw.expose().is_empty() {
+                    return Err(RoutstrCliError::Message(password_required_message().into()));
+                }
+                vault.load(Some(&pw)).map_err(RoutstrCliError::Wallet)?
+            }
+            FundPathDecision::KeyringBlocked { reason } => {
+                return Err(RoutstrCliError::Message(keyring_blocked_message(&reason)));
+            }
+            FundPathDecision::NewWallet => {
+                return Err(RoutstrCliError::Message(
+                    "no local wallet found. Run `grok routstr fund` first (new-wallet path)."
+                        .into(),
+                ));
+            }
+            FundPathDecision::LoadError { message } => {
+                return Err(RoutstrCliError::Message(message));
+            }
+            FundPathDecision::ReturningUnlock => {
+                return Err(RoutstrCliError::Message(
+                    "internal rbf path: unexpected ReturningUnlock on load error".into(),
+                ));
+            }
+        },
+    };
+
+    eprintln!(
+        "Authorize RBF replacement spend: re-enter your recovery phrase (words are not re-displayed)."
+    );
+    eprint!("Recovery phrase: ");
+    io::stderr().flush()?;
+    let mut reentry = String::new();
+    io::stdin().read_line(&mut reentry)?;
+
+    let mut session = UnlockSession::unlock_default(mnemonic);
+    let unlocked = session
+        .mnemonic(Instant::now())
+        .map_err(RoutstrCliError::Wallet)?;
+    {
+        use grok_bitcoin_wallet::seed_vault::MnemonicBackupGate;
+        let mut gate = MnemonicBackupGate::new();
+        gate.begin_reentry_without_display(unlocked)
+            .map_err(RoutstrCliError::Wallet)?;
+        if reentry.trim().is_empty() {
+            session.lock();
+            return Err(RoutstrCliError::Message(
+                "recovery phrase re-entry cancelled; not building RBF replacement".into(),
+            ));
+        }
+        gate.confirm_reentry(&reentry).map_err(|e| {
+            session.lock();
+            RoutstrCliError::Wallet(e)
+        })?;
+    }
+
+    let unlocked = session
+        .mnemonic(Instant::now())
+        .map_err(RoutstrCliError::Wallet)?;
+
+    let success = complete_routstr_rbf_with_mnemonic(
+        unlocked,
+        &network_str,
+        &req.payment_address,
+        req.amount_sats,
+        req.original_fee_sats,
+        req.original_vbytes,
+        &req.inputs,
+        req.broadcast,
+        req.fee_rate_sat_vb,
+    )?;
+    session.lock();
+
+    for line in &success.lines {
+        if grok_bitcoin_wallet::funding_cli::is_spend_raw_hex_output_line(line, &success.raw_hex) {
+            continue;
+        }
+        eprintln!("{line}");
+    }
+    if success.broadcast_txid.is_none() && !req.broadcast {
+        println!("{}", success.raw_hex);
+        eprintln!(
+            "(Full raw replacement hex written to stdout above for inspection / external broadcast.)"
+        );
+    } else if let Some(ref txid) = success.broadcast_txid {
+        println!("{txid}");
+    }
+
+    let _ = network_label;
+    Ok(success)
+}
+
+/// Core same-input RBF replacement after vault unlock + re-entry (CLI path).
+///
+/// Does **not** print or return BIP-39. Does **not** re-select from chain —
+/// uses `original_inputs` only. Optional broadcast when `explorer-http` is on.
+pub fn complete_routstr_rbf_with_mnemonic(
+    mnemonic: &grok_bitcoin_wallet::mnemonic::MnemonicSecret,
+    network_str: &str,
+    payment_address: &str,
+    amount_sats: u64,
+    original_fee_sats: u64,
+    original_vbytes: u64,
+    original_inputs: &[grok_bitcoin_wallet::funding_cli::RbfInputSpec],
+    broadcast: bool,
+    fee_rate_sat_vb: u64,
+) -> Result<RoutstrRbfSuccess, RoutstrCliError> {
+    use grok_bitcoin_wallet::address_ux::BitcoinNetwork;
+    use grok_bitcoin_wallet::descriptor_wallet::{
+        DEFAULT_RECEIVE_GAP, DescriptorWallet, broadcast_raw_tx, prepare_rbf_replacement,
+    };
+    use grok_bitcoin_wallet::funding_cli::{
+        format_rbf_replacement_prepared_lines, format_spend_broadcast_failed_lines,
+        format_spend_broadcast_success_lines, format_spend_fee_meta_lines,
+        spend_broadcast_claimed_txid,
+    };
+
+    let network_label = {
+        let t = network_str.trim();
+        if t.is_empty() { "mainnet" } else { t }
+    }
+    .to_owned();
+    let btc_net = BitcoinNetwork::from_env_str(&network_label).unwrap_or(BitcoinNetwork::Mainnet);
+
+    let wallet =
+        DescriptorWallet::from_mnemonic_env_network(mnemonic, &network_label, DEFAULT_RECEIVE_GAP)
+            .map_err(RoutstrCliError::Wallet)?;
+
+    if original_inputs.is_empty() {
+        return Err(RoutstrCliError::Message(
+            "RBF requires at least one --input txid:vout:amount:address (same prevouts as stuck tx)"
+                .into(),
+        ));
+    }
+    let utxos: Vec<_> = original_inputs.iter().map(|s| s.to_wallet_utxo()).collect();
+
+    // Same-input absolute-fee path: no chain re-select (confirmed UTXOs vanish in mempool).
+    let rbf = prepare_rbf_replacement(
+        &wallet,
+        mnemonic,
+        &utxos,
+        payment_address,
+        amount_sats,
+        original_fee_sats,
+        original_vbytes,
+        fee_rate_sat_vb,
+        DEFAULT_RECEIVE_GAP,
+    )
+    .map_err(RoutstrCliError::Wallet)?;
+
+    let prepared = &rbf.prepared;
+    let raw_hex = prepared.raw_hex();
+    let txid = prepared.txid_hex();
+    let mut lines = format_rbf_replacement_prepared_lines(
+        payment_address,
+        prepared.payment_sats,
+        rbf.original_fee_sats,
+        prepared.fee_sats,
+        prepared.change_sats,
+        &txid,
+        &raw_hex,
+        broadcast,
+        &rbf.plan,
+    );
+    lines.extend(format_spend_fee_meta_lines(
+        prepared.fee_sats,
+        prepared.weight_vbytes(),
+        rbf.fee_rate_sat_vb,
+    ));
+
+    let broadcast_txid = if broadcast {
+        let mut client = grok_bitcoin_wallet::explorer::MempoolHttpClient::with_defaults(btc_net)
+            .map_err(RoutstrCliError::Wallet)?;
+        match broadcast_raw_tx(&mut client, &raw_hex) {
+            Ok(res) => {
+                lines.extend(format_spend_broadcast_success_lines(
+                    &res.txid,
+                    &network_label,
+                ));
+                spend_broadcast_claimed_txid(true, Some(&res.txid))
+            }
+            Err(e) => {
+                lines.extend(format_spend_broadcast_failed_lines(
+                    &e.to_string(),
+                    &raw_hex,
+                ));
+                return Err(RoutstrCliError::Message(lines.join("\n")));
+            }
+        }
+    } else {
+        spend_broadcast_claimed_txid(false, None)
+    };
+
+    Ok(RoutstrRbfSuccess {
+        payment_address: payment_address.to_owned(),
+        payment_sats: prepared.payment_sats,
+        original_fee_sats: rbf.original_fee_sats,
+        fee_sats: prepared.fee_sats,
+        change_sats: prepared.change_sats,
+        txid,
+        raw_hex,
+        broadcast_txid,
+        network_label,
+        fee_rate_sat_vb: rbf.fee_rate_sat_vb,
         lines,
     })
 }
@@ -1466,5 +1754,49 @@ routstr_enabled = false
         let req = parse_spend_request("bc1qtest", 100, false, Some(8)).unwrap();
         assert!(req.fee_rate_explicit);
         assert_eq!(req.fee_rate_sat_vb, 8);
+    }
+
+    #[test]
+    fn run_routstr_rbf_parse_rejects_zero_fee_and_zero_vbytes() {
+        use grok_bitcoin_wallet::funding_cli::{RbfReplaceParseError, parse_rbf_replace_request};
+        let input = format!("{}:0:100000:bc1qrecv", "ab".repeat(32));
+        let inputs = vec![input];
+        assert!(matches!(
+            parse_rbf_replace_request("bc1qtest", 100, 500, 141, &inputs, false, Some(0)),
+            Err(RbfReplaceParseError::InvalidFeeRate(_))
+        ));
+        assert_eq!(
+            parse_rbf_replace_request("bc1qtest", 100, 500, 0, &inputs, false, Some(10)),
+            Err(RbfReplaceParseError::ZeroOriginalVbytes)
+        );
+        assert_eq!(
+            parse_rbf_replace_request("bc1qtest", 0, 500, 141, &inputs, false, None),
+            Err(RbfReplaceParseError::ZeroAmount)
+        );
+        assert_eq!(
+            parse_rbf_replace_request("bc1qtest", 100, 500, 141, &[], false, None),
+            Err(RbfReplaceParseError::MissingInputs)
+        );
+        let req =
+            parse_rbf_replace_request("bc1qtest", 100, 705, 141, &inputs, false, None).unwrap();
+        assert!(!req.fee_rate_explicit);
+        assert!(!req.broadcast);
+        assert_eq!(req.inputs.len(), 1);
+        let req =
+            parse_rbf_replace_request("bc1qtest", 100, 705, 141, &inputs, true, Some(12)).unwrap();
+        assert!(req.fee_rate_explicit);
+        assert!(req.broadcast);
+        assert_eq!(req.fee_rate_sat_vb, 12);
+        assert_eq!(req.original_fee_sats, 705);
+        assert_eq!(req.original_vbytes, 141);
+    }
+
+    #[test]
+    fn rbf_broadcast_claim_helper_matches_product_gate() {
+        use grok_bitcoin_wallet::funding_cli::spend_broadcast_claimed_txid;
+        let txid = "cd".repeat(32);
+        assert!(spend_broadcast_claimed_txid(true, Some(&txid)).is_some());
+        assert!(spend_broadcast_claimed_txid(false, Some(&txid)).is_none());
+        assert!(spend_broadcast_claimed_txid(true, Some("bad")).is_none());
     }
 }

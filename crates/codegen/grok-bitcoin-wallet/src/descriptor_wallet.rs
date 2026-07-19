@@ -10,6 +10,8 @@
 //! - BIP84 P2WPKH sign + finalize for inputs resolvable in a derivation gap
 //! - extract + raw-hex helpers; network broadcast via [`crate::explorer::TxBroadcaster`]
 //! - pure RBF / CPFP fee planners ([`plan_rbf_fee_bump`], [`plan_cpfp_child_fee`])
+//! - same-input RBF replacement ([`prepare_rbf_replacement`],
+//!   [`prepare_rbf_replacement_from_selection`], [`selection_with_rbf_fee`])
 //!
 //! Seed material stays in [`crate::mnemonic::MnemonicSecret`] / SeedVault only;
 //! this module never persists BIP-39. Signing zeroizes intermediate seed bytes
@@ -1321,6 +1323,8 @@ pub struct PreparedSpend {
     pub change_sats: u64,
     pub input_count: usize,
     pub output_count: usize,
+    /// Prevouts used for this spend (for same-input RBF). Not secret material.
+    pub selected_inputs: Vec<WalletUtxo>,
 }
 
 impl std::fmt::Debug for PreparedSpend {
@@ -1332,6 +1336,7 @@ impl std::fmt::Debug for PreparedSpend {
             .field("change_sats", &self.change_sats)
             .field("input_count", &self.input_count)
             .field("output_count", &self.output_count)
+            .field("selected_inputs", &self.selected_inputs.len())
             .finish()
     }
 }
@@ -1434,6 +1439,7 @@ pub fn prepare_bip84_p2wpkh_spend(
         change_sats,
         input_count,
         output_count,
+        selected_inputs: selection.selected.clone(),
     })
 }
 
@@ -1484,6 +1490,376 @@ pub fn select_and_prepare_bip84_spend(
         network: wallet.network(),
     };
     prepare_bip84_p2wpkh_spend(&selection, &params, mnemonic, "", address_gap.max(1))
+}
+
+/// Result of an RBF replacement rebuild (local prepare only; no broadcast claim).
+#[derive(Clone)]
+pub struct RbfReplacementSpend {
+    pub prepared: PreparedSpend,
+    pub plan: RbfFeePlan,
+    /// Target fee rate used when sizing the plan (sat/vB).
+    pub fee_rate_sat_vb: u64,
+    pub original_fee_sats: u64,
+    pub original_vbytes: u64,
+}
+
+impl std::fmt::Debug for RbfReplacementSpend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RbfReplacementSpend")
+            .field("txid", &self.prepared.txid_hex())
+            .field("fee_sats", &self.prepared.fee_sats)
+            .field("original_fee_sats", &self.original_fee_sats)
+            .field("fee_rate_sat_vb", &self.fee_rate_sat_vb)
+            .field("fee_delta_sats", &self.fee_delta_sats())
+            .finish()
+    }
+}
+
+impl RbfReplacementSpend {
+    /// `prepared.fee_sats - original_fee_sats` (always > 0 on success).
+    pub fn fee_delta_sats(&self) -> u64 {
+        self.prepared
+            .fee_sats
+            .saturating_sub(self.original_fee_sats)
+    }
+}
+
+/// Minimum absolute replacement fee for BIP-125 bandwidth on the **replacement**
+/// size: `original_fee + max(1, replacement_vbytes * incremental)`.
+///
+/// Does not encode higher-feerate or target-rate floors — use [`plan_rbf_fee_bump`]
+/// for full same-size guidance, then re-check with this after prepare if size changed.
+pub fn bip125_min_replacement_fee_sats(
+    original_fee_sats: u64,
+    replacement_vbytes: u64,
+    incremental_relay_sat_vb: u64,
+) -> u64 {
+    let inc = rbf_min_fee_increase_sats(replacement_vbytes, incremental_relay_sat_vb);
+    original_fee_sats
+        .saturating_add(inc)
+        .max(original_fee_sats.saturating_add(1))
+}
+
+/// Fail closed if `replacement_fee_sats` does not satisfy BIP-125 absolute +
+/// incremental-bandwidth floors for the actual replacement size.
+///
+/// Also requires `replacement_fee_sats >= plan_min_fee_sats` when that floor is
+/// provided (typically [`RbfFeePlan::min_replacement_fee_sats`] or recommended).
+pub fn validate_rbf_replacement_fee(
+    original_fee_sats: u64,
+    replacement_fee_sats: u64,
+    replacement_vbytes: u64,
+    incremental_relay_sat_vb: u64,
+    plan_min_fee_sats: u64,
+) -> Result<()> {
+    if replacement_vbytes == 0 {
+        return Err(WalletError::Onchain(
+            "replacement vbytes must be > 0 for BIP-125 fee check".into(),
+        ));
+    }
+    if replacement_fee_sats <= original_fee_sats {
+        return Err(WalletError::Onchain(format!(
+            "RBF replacement fee {replacement_fee_sats} sats is not greater than original \
+             {original_fee_sats} sats (BIP-125 absolute fee must increase)"
+        )));
+    }
+    let min_by_bandwidth = bip125_min_replacement_fee_sats(
+        original_fee_sats,
+        replacement_vbytes,
+        incremental_relay_sat_vb,
+    );
+    let required = min_by_bandwidth
+        .max(plan_min_fee_sats)
+        .max(original_fee_sats.saturating_add(1));
+    if replacement_fee_sats < required {
+        return Err(WalletError::Onchain(format!(
+            "RBF replacement fee {replacement_fee_sats} sats is below BIP-125 floor {required} sats \
+             (original {original_fee_sats} + bandwidth on {replacement_vbytes} vB; plan min \
+             {plan_min_fee_sats}). Raise --fee-rate or free more change"
+        )));
+    }
+    Ok(())
+}
+
+/// Rebuild a [`CoinSelection`] from the original stuck spend's inputs + fee.
+///
+/// Used for same-input RBF (product CLI `--input` specs). Folds dust change into
+/// fee when reconstructing so PSBT build stays valid.
+pub fn coin_selection_from_rbf_inputs(
+    inputs: &[WalletUtxo],
+    payment_sats: u64,
+    original_fee_sats: u64,
+) -> Result<CoinSelection> {
+    if inputs.is_empty() {
+        return Err(WalletError::Onchain(
+            "RBF requires at least one original input (--input txid:vout:amount:address)".into(),
+        ));
+    }
+    if payment_sats == 0 {
+        return Err(WalletError::Onchain(
+            "RBF payment amount must be > 0 sats".into(),
+        ));
+    }
+    let mut seen = HashSet::with_capacity(inputs.len());
+    let mut total = 0u64;
+    for utxo in inputs {
+        if utxo.amount_sats == 0 {
+            return Err(WalletError::Onchain(format!(
+                "RBF input {}:{} has zero amount",
+                utxo.outpoint.txid, utxo.outpoint.vout
+            )));
+        }
+        if utxo.address.trim().is_empty() {
+            return Err(WalletError::Onchain(format!(
+                "RBF input {}:{} has empty address",
+                utxo.outpoint.txid, utxo.outpoint.vout
+            )));
+        }
+        if !seen.insert((utxo.outpoint.txid.clone(), utxo.outpoint.vout)) {
+            return Err(WalletError::Onchain(format!(
+                "duplicate RBF input {}:{}",
+                utxo.outpoint.txid, utxo.outpoint.vout
+            )));
+        }
+        total = total.saturating_add(utxo.amount_sats);
+    }
+    let needed = payment_sats.saturating_add(original_fee_sats);
+    if total < needed {
+        return Err(WalletError::Onchain(format!(
+            "insufficient value in original inputs for RBF: need {needed} sats \
+             (payment {payment_sats} + original fee {original_fee_sats}), have {total}"
+        )));
+    }
+    let mut change = total - needed;
+    let mut fee = original_fee_sats;
+    if change > 0 && change < DUST_P2WPKH_SATS {
+        fee = fee.saturating_add(change);
+        change = 0;
+    }
+    Ok(CoinSelection {
+        selected: inputs.to_vec(),
+        total_input_sats: total,
+        change_sats: change,
+        target_sats: payment_sats,
+        fee_sats: fee,
+    })
+}
+
+/// Raise absolute fee on a prior selection while keeping the **same inputs** and
+/// **same payment amount** (true same-size RBF when output count stays equal).
+///
+/// Reduces change to fund the higher fee; folds dust change into fee. Fails when
+/// `new_fee_sats` is not strictly greater than the original fee, or when inputs
+/// cannot cover payment + new fee.
+pub fn selection_with_rbf_fee(
+    selection: &CoinSelection,
+    new_fee_sats: u64,
+) -> Result<CoinSelection> {
+    if selection.selected.is_empty() {
+        return Err(WalletError::Onchain("RBF selection has no inputs".into()));
+    }
+    if selection.target_sats == 0 {
+        return Err(WalletError::Onchain(
+            "RBF payment amount (target_sats) must be > 0".into(),
+        ));
+    }
+    if new_fee_sats <= selection.fee_sats {
+        return Err(WalletError::Onchain(format!(
+            "RBF replacement fee {new_fee_sats} sats must be greater than original fee {} sats",
+            selection.fee_sats
+        )));
+    }
+    let needed = selection.target_sats.saturating_add(new_fee_sats);
+    if selection.total_input_sats < needed {
+        return Err(WalletError::Onchain(format!(
+            "insufficient funds for RBF fee bump: need {needed} sats (payment {} + fee {new_fee_sats}), have {} sats in inputs",
+            selection.target_sats, selection.total_input_sats
+        )));
+    }
+    let mut change = selection.total_input_sats - needed;
+    let mut fee = new_fee_sats;
+    if change > 0 && change < DUST_P2WPKH_SATS {
+        fee = fee.saturating_add(change);
+        change = 0;
+    }
+    // Dust fold can only increase fee further; still require strictly greater.
+    if fee <= selection.fee_sats {
+        return Err(WalletError::Onchain(format!(
+            "RBF fee after dust fold ({fee}) is not greater than original {}",
+            selection.fee_sats
+        )));
+    }
+    Ok(CoinSelection {
+        selected: selection.selected.clone(),
+        total_input_sats: selection.total_input_sats,
+        change_sats: change,
+        target_sats: selection.target_sats,
+        fee_sats: fee,
+    })
+}
+
+/// Same-size RBF rebuild from a prior selection: bump absolute fee via
+/// [`selection_with_rbf_fee`], then BIP84 sign/finalize/extract.
+///
+/// `new_fee_sats` should come from [`plan_rbf_fee_bump`] recommended (or higher).
+/// **Does not broadcast.**
+pub fn prepare_rbf_replacement_from_selection(
+    original: &CoinSelection,
+    params: &SpendParams,
+    new_fee_sats: u64,
+    mnemonic: &MnemonicSecret,
+    passphrase: &str,
+    address_gap: u32,
+) -> Result<PreparedSpend> {
+    let bumped = selection_with_rbf_fee(original, new_fee_sats)?;
+    prepare_bip84_p2wpkh_spend(&bumped, params, mnemonic, passphrase, address_gap.max(1))
+}
+
+/// Product BIP-125 RBF: **same original inputs**, absolute fee from
+/// [`plan_rbf_fee_bump`], sign/finalize/extract.
+///
+/// Does **not** re-select from a chain source (confirmed UTXOs after broadcast of
+/// the stuck tx are gone / not the conflicting set). Caller must pass the original
+/// prevouts (`--input txid:vout:amount:address` from spend dry-run meta).
+///
+/// Enforces absolute fee increase and incremental bandwidth on the **actual**
+/// replacement weight, not only a floor(rate) re-select. Inputs signal RBF via
+/// [`Sequence::ENABLE_RBF_NO_LOCKTIME`].
+///
+/// **Does not broadcast.**
+pub fn prepare_rbf_replacement(
+    wallet: &DescriptorWallet,
+    mnemonic: &MnemonicSecret,
+    original_inputs: &[WalletUtxo],
+    payment_address: &str,
+    amount_sats: u64,
+    original_fee_sats: u64,
+    original_vbytes: u64,
+    target_fee_rate_sat_vb: u64,
+    address_gap: u32,
+) -> Result<RbfReplacementSpend> {
+    if amount_sats == 0 {
+        return Err(WalletError::Onchain(
+            "RBF payment amount must be > 0 sats".into(),
+        ));
+    }
+    if target_fee_rate_sat_vb == 0 {
+        return Err(WalletError::Onchain(
+            "RBF target fee rate must be > 0 sat/vB".into(),
+        ));
+    }
+    if original_vbytes == 0 {
+        return Err(WalletError::Onchain(
+            "original vbytes must be > 0 for RBF plan".into(),
+        ));
+    }
+    if original_inputs.is_empty() {
+        return Err(WalletError::Onchain(
+            "RBF requires original inputs (--input); re-select from chain is not a stuck-tx replacement"
+                .into(),
+        ));
+    }
+
+    let plan = plan_rbf_fee_bump(
+        original_fee_sats,
+        original_vbytes,
+        target_fee_rate_sat_vb,
+        0,
+    )
+    .map_err(|e| WalletError::Onchain(format!("RBF fee plan: {e}")))?;
+
+    let original_sel =
+        coin_selection_from_rbf_inputs(original_inputs, amount_sats, original_fee_sats)?;
+
+    // Absolute recommended fee from the plan (not floor(rate) * vb, which can underpay).
+    let mut target_fee = plan.recommended_fee_sats;
+    // If dust fold raised reconstructed original fee above plan input, still bump past it.
+    if target_fee <= original_sel.fee_sats {
+        target_fee = original_sel.fee_sats.saturating_add(
+            rbf_min_fee_increase_sats(original_vbytes, plan.incremental_relay_sat_vb).max(1),
+        );
+    }
+
+    let change_address_for = |change_sats: u64| -> Result<Option<String>> {
+        if change_sats == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            wallet
+                .change_addresses()
+                .first()
+                .cloned()
+                .ok_or_else(|| WalletError::Onchain("wallet has no change address".into()))?,
+        ))
+    };
+
+    let params_for = |change_sats: u64| -> Result<SpendParams> {
+        Ok(SpendParams {
+            payment_address: payment_address.to_owned(),
+            change_address: change_address_for(change_sats)?,
+            network: wallet.network(),
+        })
+    };
+
+    let bumped = selection_with_rbf_fee(&original_sel, target_fee)?;
+    let params = params_for(bumped.change_sats)?;
+    let mut prepared =
+        prepare_bip84_p2wpkh_spend(&bumped, &params, mnemonic, "", address_gap.max(1))?;
+
+    // Re-check BIP-125 against actual replacement weight; retry once with higher fee if needed.
+    let plan_floor = plan.min_replacement_fee_sats.max(plan.recommended_fee_sats);
+    if let Err(e) = validate_rbf_replacement_fee(
+        original_fee_sats,
+        prepared.fee_sats,
+        prepared.weight_vbytes(),
+        plan.incremental_relay_sat_vb,
+        plan_floor,
+    ) {
+        let needed = bip125_min_replacement_fee_sats(
+            original_fee_sats,
+            prepared.weight_vbytes(),
+            plan.incremental_relay_sat_vb,
+        )
+        .max(plan_floor)
+        .max(prepared.fee_sats.saturating_add(1));
+        let retry = selection_with_rbf_fee(&original_sel, needed).map_err(|_| e)?;
+        let retry_params = params_for(retry.change_sats)?;
+        prepared =
+            prepare_bip84_p2wpkh_spend(&retry, &retry_params, mnemonic, "", address_gap.max(1))?;
+        validate_rbf_replacement_fee(
+            original_fee_sats,
+            prepared.fee_sats,
+            prepared.weight_vbytes(),
+            plan.incremental_relay_sat_vb,
+            plan_floor,
+        )?;
+    }
+
+    // Same-input invariant: every original outpoint must appear in the replacement.
+    for orig in original_inputs {
+        let found = prepared.selected_inputs.iter().any(|u| {
+            u.outpoint.txid == orig.outpoint.txid && u.outpoint.vout == orig.outpoint.vout
+        });
+        if !found {
+            return Err(WalletError::Onchain(format!(
+                "RBF replacement dropped original input {}:{} (internal error)",
+                orig.outpoint.txid, orig.outpoint.vout
+            )));
+        }
+    }
+    if prepared.selected_inputs.len() != original_inputs.len() {
+        return Err(WalletError::Onchain(
+            "RBF replacement must use exactly the original input set (no extra inputs)".into(),
+        ));
+    }
+
+    Ok(RbfReplacementSpend {
+        prepared,
+        plan,
+        fee_rate_sat_vb: target_fee_rate_sat_vb,
+        original_fee_sats,
+        original_vbytes,
+    })
 }
 
 /// Parse a 64-hex [`OutPointRef`] into a bitcoin [`OutPoint`].
@@ -2897,6 +3273,359 @@ mod tests {
         assert!(
             msg.contains("fee rate") && (msg.contains("> 0") || msg.contains("must be")),
             "expected fee-rate rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn selection_with_rbf_fee_same_inputs_higher_fee() {
+        let sel = CoinSelection {
+            selected: vec![WalletUtxo {
+                outpoint: OutPointRef::new(valid_txid('a'), 0),
+                amount_sats: 100_000,
+                address: "a".into(),
+                confirmations: 6,
+                is_change: false,
+            }],
+            total_input_sats: 100_000,
+            change_sats: 74_295,
+            target_sats: 25_000,
+            fee_sats: 705, // 141 vb * 5
+        };
+        let bumped = selection_with_rbf_fee(&sel, 1_410).unwrap();
+        assert_eq!(bumped.selected.len(), 1);
+        assert_eq!(bumped.target_sats, 25_000);
+        assert_eq!(bumped.fee_sats, 1_410);
+        assert_eq!(bumped.change_sats, 100_000 - 25_000 - 1_410);
+        assert_eq!(bumped.total_input_sats, 100_000);
+
+        // Not strictly greater → error.
+        let err = selection_with_rbf_fee(&sel, 705).unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("greater"));
+        let err = selection_with_rbf_fee(&sel, 100).unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("greater"));
+
+        // Insufficient for huge fee.
+        let err = selection_with_rbf_fee(&sel, 80_000).unwrap_err();
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains("insufficient"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn selection_with_rbf_fee_folds_dust_change() {
+        // Payment 9_000, fee bump leaves 200 sats change (< dust 294).
+        let sel = CoinSelection {
+            selected: vec![WalletUtxo {
+                outpoint: OutPointRef::new(valid_txid('b'), 0),
+                amount_sats: 10_000,
+                address: "a".into(),
+                confirmations: 1,
+                is_change: false,
+            }],
+            total_input_sats: 10_000,
+            change_sats: 500,
+            target_sats: 9_000,
+            fee_sats: 500,
+        };
+        // new_fee = 800 → change = 200 → fold into fee → fee 1000, change 0.
+        let bumped = selection_with_rbf_fee(&sel, 800).unwrap();
+        assert_eq!(bumped.change_sats, 0);
+        assert_eq!(bumped.fee_sats, 1_000);
+        assert!(bumped.fee_sats > sel.fee_sats);
+    }
+
+    #[test]
+    fn prepare_rbf_replacement_from_selection_signs() {
+        let m = import_mnemonic(VECTOR).unwrap();
+        let w = DescriptorWallet::from_mnemonic(&m, Network::Bitcoin, 3).unwrap();
+        let recv = w.primary_receive_address().unwrap().to_owned();
+        let change = w.change_addresses()[0].clone();
+        let pay_to = derive_bip84_receive_address(&m, Network::Bitcoin, 1).unwrap();
+        let original = CoinSelection {
+            selected: vec![WalletUtxo {
+                outpoint: OutPointRef::new(valid_txid('c'), 0),
+                amount_sats: 100_000,
+                address: recv,
+                confirmations: 6,
+                is_change: false,
+            }],
+            total_input_sats: 100_000,
+            change_sats: 74_295,
+            target_sats: 25_000,
+            fee_sats: 705,
+        };
+        let params = SpendParams {
+            payment_address: pay_to,
+            change_address: Some(change),
+            network: Network::Bitcoin,
+        };
+        let prep =
+            prepare_rbf_replacement_from_selection(&original, &params, 1_410, &m, "", 5).unwrap();
+        assert_eq!(prep.payment_sats, 25_000);
+        assert_eq!(prep.fee_sats, 1_410);
+        assert!(prep.fee_sats > original.fee_sats);
+        assert!(!prep.raw_hex().is_empty());
+        assert_eq!(prep.txid_hex().len(), 64);
+        assert_eq!(prep.input_count, 1);
+        assert_eq!(prep.selected_inputs.len(), 1);
+        assert_eq!(prep.selected_inputs[0].outpoint.txid, valid_txid('c'));
+    }
+
+    #[test]
+    fn prepare_rbf_replacement_same_inputs_bumps_absolute_fee() {
+        let m = import_mnemonic(VECTOR).unwrap();
+        let w = DescriptorWallet::from_mnemonic(&m, Network::Bitcoin, 3).unwrap();
+        let recv = w.primary_receive_address().unwrap().to_owned();
+        let pay_to = derive_bip84_receive_address(&m, Network::Bitcoin, 1).unwrap();
+        let chain = MockChainSource::with_utxos(vec![WalletUtxo {
+            outpoint: OutPointRef::new(valid_txid('d'), 0),
+            amount_sats: 100_000,
+            address: recv.clone(),
+            confirmations: 6,
+            is_change: false,
+        }]);
+        let orig = select_and_prepare_bip84_spend(&w, &chain, &m, &pay_to, 25_000, 5, 5).unwrap();
+        let orig_fee = orig.fee_sats;
+        let orig_vb = orig.weight_vbytes();
+        assert!(!orig.selected_inputs.is_empty());
+
+        let rbf = prepare_rbf_replacement(
+            &w,
+            &m,
+            &orig.selected_inputs,
+            &pay_to,
+            25_000,
+            orig_fee,
+            orig_vb,
+            15,
+            5,
+        )
+        .unwrap();
+        assert_eq!(rbf.prepared.payment_sats, 25_000);
+        assert!(rbf.prepared.fee_sats > orig_fee);
+        assert!(rbf.prepared.fee_sats >= rbf.plan.recommended_fee_sats);
+        validate_rbf_replacement_fee(
+            orig_fee,
+            rbf.prepared.fee_sats,
+            rbf.prepared.weight_vbytes(),
+            rbf.plan.incremental_relay_sat_vb,
+            rbf.plan.min_replacement_fee_sats,
+        )
+        .unwrap();
+        // Same outpoints as original (true BIP-125 conflict set).
+        assert_eq!(
+            rbf.prepared.selected_inputs.len(),
+            orig.selected_inputs.len()
+        );
+        assert_eq!(
+            rbf.prepared.selected_inputs[0].outpoint,
+            orig.selected_inputs[0].outpoint
+        );
+        assert_ne!(rbf.prepared.txid_hex(), orig.txid_hex());
+    }
+
+    #[test]
+    fn prepare_rbf_replacement_rejects_empty_inputs_and_bad_args() {
+        let m = import_mnemonic(VECTOR).unwrap();
+        let w = DescriptorWallet::from_mnemonic(&m, Network::Bitcoin, 3).unwrap();
+        let pay_to = derive_bip84_receive_address(&m, Network::Bitcoin, 1).unwrap();
+        let err =
+            prepare_rbf_replacement(&w, &m, &[], &pay_to, 25_000, 700, 140, 10, 5).unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(msg.contains("input") || msg.contains("original"), "{err}");
+
+        let utxo = WalletUtxo {
+            outpoint: OutPointRef::new(valid_txid('e'), 0),
+            amount_sats: 100_000,
+            address: w.primary_receive_address().unwrap().to_owned(),
+            confirmations: 6,
+            is_change: false,
+        };
+        let err = prepare_rbf_replacement(&w, &m, &[utxo.clone()], &pay_to, 0, 700, 140, 10, 5)
+            .unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("amount"));
+
+        let err = prepare_rbf_replacement(&w, &m, &[utxo.clone()], &pay_to, 25_000, 700, 0, 10, 5)
+            .unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("vbytes"));
+
+        let err =
+            prepare_rbf_replacement(&w, &m, &[utxo], &pay_to, 25_000, 700, 140, 0, 5).unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("fee rate"));
+    }
+
+    #[test]
+    fn validate_rbf_replacement_fee_rejects_floor_rate_underpay() {
+        // Counterexample from review: original_fee=1000, vb=141 → recommended 1141,
+        // floor rate 8 → estimated 1128 underpays BIP-125 bandwidth (+141).
+        let plan = plan_rbf_fee_bump(1000, 141, 5, 1).unwrap();
+        assert_eq!(plan.recommended_fee_sats, 1141);
+        assert_eq!(plan.recommended_fee_rate_sat_vb, 8); // floor
+        let underpay = 8 * 141; // 1128
+        assert!(underpay < plan.min_replacement_fee_sats);
+        let err =
+            validate_rbf_replacement_fee(1000, underpay, 141, 1, plan.min_replacement_fee_sats)
+                .unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("bip-125")
+                || err.to_string().to_ascii_lowercase().contains("floor"),
+            "{err}"
+        );
+        validate_rbf_replacement_fee(
+            1000,
+            plan.recommended_fee_sats,
+            141,
+            1,
+            plan.min_replacement_fee_sats,
+        )
+        .unwrap();
+
+        // original_fee=999, vb=200 → delta must be ≥ 200, not 1.
+        let plan2 = plan_rbf_fee_bump(999, 200, 5, 1).unwrap();
+        assert!(plan2.min_replacement_fee_sats >= 999 + 200);
+        assert!(
+            validate_rbf_replacement_fee(999, 1000, 200, 1, plan2.min_replacement_fee_sats)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn prepare_rbf_meets_bip125_when_floor_rate_would_underpay() {
+        // Same inputs + absolute plan fee path must not underpay like floor-rate re-select.
+        let m = import_mnemonic(VECTOR).unwrap();
+        let w = DescriptorWallet::from_mnemonic(&m, Network::Bitcoin, 3).unwrap();
+        let recv = w.primary_receive_address().unwrap().to_owned();
+        let pay_to = derive_bip84_receive_address(&m, Network::Bitcoin, 1).unwrap();
+        let inputs = vec![WalletUtxo {
+            outpoint: OutPointRef::new(valid_txid('a'), 0),
+            amount_sats: 100_000,
+            address: recv,
+            confirmations: 6,
+            is_change: false,
+        }];
+        // original_fee=1000, vb=141, target 5 → plan wants 1141 absolute.
+        let rbf =
+            prepare_rbf_replacement(&w, &m, &inputs, &pay_to, 25_000, 1000, 141, 5, 5).unwrap();
+        assert!(
+            rbf.prepared.fee_sats >= rbf.plan.recommended_fee_sats,
+            "fee {} < recommended {}",
+            rbf.prepared.fee_sats,
+            rbf.plan.recommended_fee_sats
+        );
+        assert!(rbf.prepared.fee_sats >= 1141);
+        assert_eq!(
+            rbf.prepared.selected_inputs[0].outpoint.txid,
+            valid_txid('a')
+        );
+    }
+
+    #[test]
+    fn prepare_rbf_multi_input_keeps_exact_original_outpoints() {
+        // Documents product invariant: replacement must conflict with stuck tx
+        // (same outpoints), not pick alternate confirmed coins.
+        let m = import_mnemonic(VECTOR).unwrap();
+        let w = DescriptorWallet::from_mnemonic(&m, Network::Bitcoin, 5).unwrap();
+        let recv0 = w.receive_addresses()[0].clone();
+        let recv1 = w.receive_addresses()[1].clone();
+        let pay_to = derive_bip84_receive_address(&m, Network::Bitcoin, 2).unwrap();
+        let inputs = vec![
+            WalletUtxo {
+                outpoint: OutPointRef::new(valid_txid('2'), 0),
+                amount_sats: 40_000,
+                address: recv0,
+                confirmations: 6,
+                is_change: false,
+            },
+            WalletUtxo {
+                outpoint: OutPointRef::new(valid_txid('3'), 1),
+                amount_sats: 40_000,
+                address: recv1,
+                confirmations: 6,
+                is_change: false,
+            },
+        ];
+        let rbf =
+            prepare_rbf_replacement(&w, &m, &inputs, &pay_to, 30_000, 800, 200, 12, 5).unwrap();
+        assert_eq!(rbf.prepared.selected_inputs.len(), 2);
+        let mut got: Vec<_> = rbf
+            .prepared
+            .selected_inputs
+            .iter()
+            .map(|u| (u.outpoint.txid.clone(), u.outpoint.vout))
+            .collect();
+        got.sort();
+        let mut want = vec![(valid_txid('2'), 0u32), (valid_txid('3'), 1u32)];
+        want.sort();
+        assert_eq!(got, want);
+        assert!(rbf.prepared.fee_sats > 800);
+        assert!(rbf.prepared.fee_sats >= rbf.plan.recommended_fee_sats);
+    }
+
+    #[test]
+    fn prepare_rbf_insufficient_funds_when_bump_exceeds_value() {
+        let m = import_mnemonic(VECTOR).unwrap();
+        let w = DescriptorWallet::from_mnemonic(&m, Network::Bitcoin, 3).unwrap();
+        let recv = w.primary_receive_address().unwrap().to_owned();
+        let pay_to = derive_bip84_receive_address(&m, Network::Bitcoin, 1).unwrap();
+        // Payment leaves almost no room for fee bump.
+        let inputs = vec![WalletUtxo {
+            outpoint: OutPointRef::new(valid_txid('4'), 0),
+            amount_sats: 10_500,
+            address: recv,
+            confirmations: 6,
+            is_change: false,
+        }];
+        let err =
+            prepare_rbf_replacement(&w, &m, &inputs, &pay_to, 10_000, 400, 141, 50, 5).unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(msg.contains("insufficient") || msg.contains("fee"), "{err}");
+    }
+
+    #[test]
+    fn prepare_rbf_broadcast_never_claimed_without_broadcaster() {
+        let m = import_mnemonic(VECTOR).unwrap();
+        let w = DescriptorWallet::from_mnemonic(&m, Network::Bitcoin, 3).unwrap();
+        let recv = w.primary_receive_address().unwrap().to_owned();
+        let pay_to = derive_bip84_receive_address(&m, Network::Bitcoin, 1).unwrap();
+        let inputs = vec![WalletUtxo {
+            outpoint: OutPointRef::new(valid_txid('f'), 0),
+            amount_sats: 100_000,
+            address: recv,
+            confirmations: 6,
+            is_change: false,
+        }];
+        let rbf =
+            prepare_rbf_replacement(&w, &m, &inputs, &pay_to, 25_000, 500, 100, 20, 5).unwrap();
+        let hex = rbf.prepared.raw_hex();
+        let mut mock = crate::explorer::MockTxBroadcaster::new();
+        mock.push_ok(rbf.prepared.txid_hex());
+        let res = broadcast_raw_tx(&mut mock, &hex).unwrap();
+        assert_eq!(res.txid, rbf.prepared.txid_hex());
+        mock.push_err("policy reject");
+        let err = broadcast_raw_tx(&mut mock, &hex).unwrap_err();
+        assert!(err.to_string().contains("policy"));
+    }
+
+    #[test]
+    fn coin_selection_from_rbf_inputs_rejects_duplicates_and_shortfall() {
+        let u = WalletUtxo {
+            outpoint: OutPointRef::new(valid_txid('5'), 0),
+            amount_sats: 50_000,
+            address: "bc1q".into(),
+            confirmations: 1,
+            is_change: false,
+        };
+        let err = coin_selection_from_rbf_inputs(&[u.clone(), u.clone()], 10_000, 500).unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("duplicate"));
+
+        let err = coin_selection_from_rbf_inputs(&[u], 49_000, 2_000).unwrap_err();
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains("insufficient")
         );
     }
 
