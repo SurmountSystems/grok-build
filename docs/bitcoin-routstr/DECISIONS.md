@@ -33,7 +33,7 @@ them.
 
 **Decision:** One mnemonic; NIP-06 for Nostr; no random nsec by default.
 
-**Consequences:** NIP-06 is “unrecommended” in NIP text for some clients — still
+**Consequences:** NIP-06 is “unrecommended” in NIP text for some clients. Still
 correct for our single-backup story; document advanced nsec import later.
 
 ---
@@ -90,7 +90,7 @@ txid/address deep links; trait for future local node/index backends.
 **Decision:** `routstr_enabled` default true. Mnemonic only after explicit
 “Create Bitcoin wallet” + backup confirm.
 
-**Consequences:** Catalog visible before wallet exists; top-up guides create.
+**Consequences:** Catalog visible before wallet exists; top up guides create the wallet.
 
 ---
 

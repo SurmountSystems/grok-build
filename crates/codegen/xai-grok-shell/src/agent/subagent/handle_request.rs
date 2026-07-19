@@ -768,6 +768,9 @@ pub(crate) async fn handle_subagent_request(
     let credentials = xai_chat_state::Credentials {
         api_key: effective_sampling_config.api_key.clone(),
         failover_api_keys: effective_sampling_config.failover_api_keys.clone(),
+        failover_providers: crate::agent::config::failover_providers_to_chat_state(
+            &effective_sampling_config.failover_providers,
+        ),
         auth_type: inherited_auth_type,
         alpha_test_key: ctx.alpha_test_key.clone(),
         client_version: effective_sampling_config.client_version.clone(),

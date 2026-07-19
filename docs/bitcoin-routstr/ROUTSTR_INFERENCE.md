@@ -21,7 +21,7 @@ Primary calls: `POST /v1/chat/completions` (streaming supported).
 Models: `GET /v1/models` (confirm Grok 4.5 slug at implement time).
 
 Live OpenAPI (verify often): `https://api.routstr.com/openapi.json`  
-Balance/invoice paths observed: `/v1/balance/*`, `/lightning/invoice` — **prefer
+Balance/invoice paths observed: `/v1/balance/*`, `/lightning/invoice`. **Prefer
 live OpenAPI over stale Mintlify names** (`/v1/wallet/*` in older docs).
 
 ## Auth material
@@ -30,7 +30,7 @@ live OpenAPI over stale Mintlify names** (`/v1/wallet/*` in older docs).
 |----------|--------|-------|
 | `sk-…` | Lightning invoice paid / Cashu create balance | `CredentialsStore` (hot) |
 | `cashuA…` | CDK / user paste | Prefer spend; short-term store if needed |
-| Local seed | BIP-39 | **SeedVault only** — never CredentialsStore JSON |
+| Local seed | BIP-39 | **SeedVault only.** Never CredentialsStore JSON |
 
 Env: `ROUTSTR_API_KEY` / `ROUTSTR_API_KEYS` (multi-key failover, same pattern as
 OpenRouter). Env wins; refuse store write when env set.
@@ -53,7 +53,7 @@ For Routstr base URLs:
 4. **No** fallthrough to `XAI_API_KEY` / xAI session  
 
 Sampler: existing Bearer + `failover_api_keys`; **402** ⇒ credit exhausted ⇒
-top-up UX (Cashu/LN wizard).
+top up UX (Cashu/LN wizard).
 
 ## Balance UI
 
@@ -67,14 +67,15 @@ Routstr prepaid economics use **Cashu**. Grok will use **CDK** to mint/hold/spen
 tokens toward inference so the path from local LN → eCash → completion is
 automated. First docs mention: “Cashu (Chaumian eCash).”
 
-## CLI (planned)
+## CLI
 
 ```bash
 grok login --routstr          # paste sk- or cashuA
 grok logout --routstr
-grok routstr balance
-grok routstr topup --sats N   # wizard: invoice and/or local pay
-grok routstr refund
+grok routstr balance          # requires key; fetches /v1/balance/info
+grok routstr topup --sats N   # guidance until CDK/LN pay path
+grok routstr refund           # guidance until CDK refund path
+grok routstr fund             # backup gate + unlock → BIP84 receive address
 ```
 
 ## References

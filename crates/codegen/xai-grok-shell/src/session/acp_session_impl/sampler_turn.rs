@@ -307,9 +307,13 @@ impl SessionActor {
                 extra_headers.insert("x-compaction-at".to_string(), value.to_string());
             }
         }
+        let failover_providers = crate::agent::config::failover_providers_from_chat_state(
+            &creds.failover_providers,
+        );
         SamplingConfig {
             api_key: creds.api_key,
             failover_api_keys: creds.failover_api_keys,
+            failover_providers,
             base_url: cfg.base_url,
             model: cfg.model,
             max_completion_tokens: cfg.max_completion_tokens,

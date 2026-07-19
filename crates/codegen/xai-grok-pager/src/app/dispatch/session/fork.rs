@@ -222,6 +222,7 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
             app.credit_balance.clone(),
             app.auto_topup.clone(),
             app.openrouter_credit_balance,
+            app.routstr_credit_balance,
         );
         agent
             .prompt
@@ -365,6 +366,7 @@ pub(in crate::app::dispatch) fn dispatch_project_selected(
             app.credit_balance.clone(),
             app.auto_topup.clone(),
             app.openrouter_credit_balance,
+            app.routstr_credit_balance,
         );
     }
     effects.push(Effect::CreateSession {
@@ -559,6 +561,7 @@ pub(in crate::app::dispatch) fn handle_worktree_forked(
             app.credit_balance.clone(),
             app.auto_topup.clone(),
             app.openrouter_credit_balance,
+            app.routstr_credit_balance,
         );
         return vec![Effect::LoadSession {
             agent_id,

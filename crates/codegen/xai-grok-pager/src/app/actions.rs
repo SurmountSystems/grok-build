@@ -2669,6 +2669,8 @@ pub enum TaskResult {
         autotopup: crate::views::credit_bar::AutoTopupFetch,
         /// OpenRouter account credits when a key is available (`None` = keep cache).
         openrouter_balance: Option<crate::views::credit_bar::OpenRouterCreditBalance>,
+        /// Routstr account balance (msats) when a key is available (`None` = keep cache).
+        routstr_balance: Option<crate::views::credit_bar::RoutstrCreditBalance>,
     },
     /// App-level billing data (welcome screen).
     AppBillingFetched {
@@ -2676,6 +2678,8 @@ pub enum TaskResult {
         autotopup: crate::views::credit_bar::AutoTopupFetch,
         /// OpenRouter account credits when a key is available (`None` = keep cache).
         openrouter_balance: Option<crate::views::credit_bar::OpenRouterCreditBalance>,
+        /// Routstr account balance (msats) when a key is available (`None` = keep cache).
+        routstr_balance: Option<crate::views::credit_bar::RoutstrCreditBalance>,
     },
     GateRefreshed {
         settings: Option<xai_grok_shell::util::config::RemoteSettings>,

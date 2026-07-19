@@ -96,6 +96,7 @@ impl AgentView {
             credit_balance: None,
             auto_topup: None,
             openrouter_credit_balance: None,
+            routstr_credit_balance: None,
             goal_state: None,
             parked_wait_marker_for: None,
             end_work_announced: false,
@@ -751,23 +752,26 @@ impl AgentView {
     /// Apply Build coding-credit balance only for non-chat agents.
     /// Gateway/chat-kind sessions keep credits unset so bars/warnings stay off.
     ///
-    /// `openrouter` is the app-level OR account balance (copied onto the agent
-    /// so the prompt footer can render without reading `AppView`).
+    /// `openrouter` / `routstr` are app-level provider balances (copied onto the
+    /// agent so the prompt footer can render without reading `AppView`).
     pub fn apply_credit_balance(
         &mut self,
         balance: Option<crate::views::credit_bar::CreditBalance>,
         auto_topup: Option<crate::views::credit_bar::AutoTopupInfo>,
         openrouter: Option<crate::views::credit_bar::OpenRouterCreditBalance>,
+        routstr: Option<crate::views::credit_bar::RoutstrCreditBalance>,
     ) {
         if self.chat_kind {
             self.credit_balance = None;
             self.auto_topup = None;
             self.openrouter_credit_balance = None;
+            self.routstr_credit_balance = None;
             return;
         }
         self.credit_balance = balance;
         self.auto_topup = auto_topup;
         self.openrouter_credit_balance = openrouter;
+        self.routstr_credit_balance = routstr;
     }
     /// Record a key event to the input flight recorder.
     ///

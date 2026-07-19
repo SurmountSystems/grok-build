@@ -1882,6 +1882,7 @@ async fn async_main() -> Result<()> {
                 oauth,
                 device_auth,
                 openrouter,
+                routstr,
                 api_key,
                 devbox,
             } => {
@@ -1894,6 +1895,13 @@ async fn async_main() -> Result<()> {
                     println!();
                     xai_grok_shell::instrumentation::finalize_and_exit(0);
                 }
+                if routstr {
+                    let grok_home = xai_grok_shell::util::grok_home::grok_home();
+                    xai_grok_shell::auth::run_routstr_login(&grok_home, api_key.as_deref())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    println!();
+                    xai_grok_shell::instrumentation::finalize_and_exit(0);
+                }
                 let config = xai_grok_shell::config::load_effective_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
                 let config = AgentConfig::new_from_toml_cfg(&config)
@@ -1902,11 +1910,20 @@ async fn async_main() -> Result<()> {
                 println!();
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
-            Command::Logout { openrouter } => {
+            Command::Logout {
+                openrouter,
+                routstr,
+            } => {
                 init_tracing_simple("cli");
                 if openrouter {
                     let grok_home = xai_grok_shell::util::grok_home::grok_home();
                     xai_grok_shell::auth::run_openrouter_logout(&grok_home)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    xai_grok_shell::instrumentation::finalize_and_exit(0);
+                }
+                if routstr {
+                    let grok_home = xai_grok_shell::util::grok_home::grok_home();
+                    xai_grok_shell::auth::run_routstr_logout(&grok_home)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     xai_grok_shell::instrumentation::finalize_and_exit(0);
                 }
@@ -1915,6 +1932,32 @@ async fn async_main() -> Result<()> {
                 let config = AgentConfig::new_from_toml_cfg(&config)
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 xai_grok_shell::auth::run_cli_logout(&config)?;
+                xai_grok_shell::instrumentation::finalize_and_exit(0);
+            }
+            Command::Routstr(routstr_args) => {
+                init_tracing_simple("cli");
+                let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
+                use xai_grok_pager::app::RoutstrCommand;
+                match routstr_args.command {
+                    RoutstrCommand::Balance => {
+                        xai_grok_shell::auth::run_routstr_balance()
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                    RoutstrCommand::Topup { sats } => {
+                        xai_grok_shell::auth::run_routstr_topup(sats)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                    RoutstrCommand::Refund => {
+                        xai_grok_shell::auth::run_routstr_refund()
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                    RoutstrCommand::Fund => {
+                        let grok_home = xai_grok_shell::util::grok_home::grok_home();
+                        xai_grok_shell::auth::run_routstr_fund(&grok_home)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                }
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
             Command::Wrap(ref wrap_args) => {

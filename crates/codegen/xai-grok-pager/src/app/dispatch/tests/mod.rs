@@ -242,6 +242,7 @@ fn test_app() -> AppView {
         credit_balance: None,
         auto_topup: None,
         openrouter_credit_balance: None,
+        routstr_credit_balance: None,
         billing_poll_wanted: false,
         leader_roster: Vec::new(),
         dashboard_local_sessions: Vec::new(),

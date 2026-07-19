@@ -1416,6 +1416,18 @@ pub(super) async fn fetch_openrouter_credit_balance(
         balance_cents: cents,
     })
 }
+
+/// Fetch Routstr account balance (msats) for the footer when a key is configured.
+///
+/// Returns `None` on missing key / transport / parse errors so callers keep
+/// any previously cached balance.
+pub(super) async fn fetch_routstr_credit_balance(
+) -> Option<crate::views::credit_bar::RoutstrCreditBalance> {
+    let msats = xai_grok_shell::auth::fetch_routstr_balance_msats().await?;
+    Some(crate::views::credit_bar::RoutstrCreditBalance {
+        balance_msats: msats,
+    })
+}
 /// Fetch the user's auto top-up rule via the `x.ai/auto-topup-rule` extension.
 /// A transport failure yields [`AutoTopupFetch::Unchanged`] so the caller keeps
 /// any cached rule rather than treating the blip as "no auto top-up".

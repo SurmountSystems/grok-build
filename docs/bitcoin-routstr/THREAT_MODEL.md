@@ -1,4 +1,4 @@
-# Threat model — Bitcoin wallet + Routstr float
+# Threat model: Bitcoin wallet + Routstr float
 
 ## Why this exists
 
@@ -12,7 +12,7 @@ components are separated.
 
 | Asset | Sensitivity | Storage rule |
 |-------|-------------|--------------|
-| BIP-39 mnemonic (12-word default) | **Critical** — roots BDK + LDK + NIP-06 | `SeedVault` only: OS keyring primary; optional password AEAD file; **never** plaintext JSON |
+| BIP-39 mnemonic (12-word default) | **Critical** (roots BDK + LDK + NIP-06) | `SeedVault` only: OS keyring primary; optional password AEAD file; **never** plaintext JSON |
 | BIP-39 passphrase (if used) | Critical | Same as mnemonic; never logged |
 | BDK descriptors / wallet DB | High | `$GROK_HOME/bitcoin/…` mode 0600; not a substitute for seed protection |
 | LDK channel state / keys_seed | Critical | Derived from seed; data dir locked |
@@ -43,7 +43,7 @@ storage. Product copy and refund UX must say so.
 
 | Threat | Full stop? | Our controls |
 |--------|------------|--------------|
-| Malware / root on user machine | No | Keyring, zeroize, no secret Debug, short unlock TTL — **cannot** stop host compromise |
+| Malware / root on user machine | No | Keyring, zeroize, no secret Debug, short unlock TTL. **Cannot** stop host compromise |
 | Entropy observation at seed gen | No | `getrandom` CSPRNG; honest docs; offline-import path for high value |
 | Disk theft of `$GROK_HOME` | Partial | Seed not in plaintext file; hot `sk-` file fallback residual risk |
 | Backup / cloud sync of home dir | Partial | Same; warn against syncing grok home with live wallet |
@@ -58,12 +58,12 @@ storage. Product copy and refund UX must say so.
 
 1. **Single BIP-39** derives on-chain (BDK), Lightning (LDK), and Nostr (NIP-06).
 2. **Seed never plaintext on disk.**
-3. **Explicit wallet create** — no silent mnemonic on first CLI launch.
-4. **Backup ritual** — show words once; confirm re-entry; we cannot recover lost seeds.
-5. **Every payment address UI** — text + **QR** + **copy**; txids link to mempool.space (or configured explorer).
-6. **Hot vs local separation** — Routstr `sk-`/Cashu float ≠ SeedVault funds.
-7. **Language honesty** — no “crypto”; Cashu = Chaumian eCash; no fake BOLT12.
-8. **Entropy honesty** — OS CSPRNG; no claim of observer-free generation on a shared host.
+3. **Explicit wallet create.** No silent mnemonic on first CLI launch.
+4. **Backup ritual.** Show words once; confirm re-entry; we cannot recover lost seeds.
+5. **Every payment address UI.** Text + **QR** + **copy**; txids link to mempool.space (or configured explorer).
+6. **Hot vs local separation.** Routstr `sk-`/Cashu float ≠ SeedVault funds.
+7. **Language honesty.** No “crypto”; Cashu = Chaumian eCash; no fake BOLT12.
+8. **Entropy honesty.** OS CSPRNG; no claim of observer-free generation on a shared host.
 
 ## Non-claims (do not put in marketing)
 
@@ -90,5 +90,5 @@ documentation; a follow-up should stop plaintext mirrors for new secrets.
 ## Incident expectations
 
 If seed material is logged or written plaintext: treat as **severity-0**, rotate
-guidance (user must move funds to a new seed — we cannot rotate for them), and
+guidance (user must move funds to a new seed; we cannot rotate for them), and
 fix the bug before further wallet features ship.

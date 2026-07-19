@@ -6,7 +6,7 @@ One **BIP-39** mnemonic (English, **12 words** default) is the root of:
 
 | Child | Standard / stack | Purpose |
 |-------|------------------|---------|
-| On-chain keys | BDK descriptors (BIP84 or BIP86 — pick at implement; document) | Receive/send mainnet Bitcoin |
+| On-chain keys | BDK descriptors (BIP84 or BIP86; pick at implement; document) | Receive/send mainnet Bitcoin |
 | Lightning | LDK / `ldk-node` seed API from BIP-39 seed bytes | Channels, BOLT11 (BOLT12 when enabled) |
 | Nostr | **NIP-06** `m/44'/1237'/0'/0/0` via `nostr` nip06 | `npub` public; `nsec` only when unlocked |
 

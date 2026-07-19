@@ -84,6 +84,9 @@ impl SessionActor {
             .update_credentials(xai_chat_state::Credentials {
                 api_key: sampling_config.api_key.clone(),
                 failover_api_keys: sampling_config.failover_api_keys.clone(),
+                failover_providers: crate::agent::config::failover_providers_to_chat_state(
+                    &sampling_config.failover_providers,
+                ),
                 auth_type: crate::agent::config::resolve_chat_state_auth_type(
                     sampling_config.model.as_str(),
                     session_key.as_deref(),

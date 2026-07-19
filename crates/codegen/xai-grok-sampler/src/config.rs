@@ -23,6 +23,20 @@ pub enum AuthScheme {
     XApiKey,
 }
 
+/// A full provider endpoint used when the active host is credit-exhausted
+/// and same-host [`SamplerConfig::failover_api_keys`] are gone.
+///
+/// Distinct from multi-key failover: this changes `base_url` + `model` + key
+/// (e.g. OpenRouter → `https://api.x.ai/v1` Grok API).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailoverProvider {
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub auth_scheme: AuthScheme,
+}
+
 /// All knobs that control a single sampling request.
 ///
 /// The session typically owns one `SamplerConfig` per active model
@@ -52,8 +66,16 @@ pub struct SamplerConfig {
     /// spending-limit error ([`xai_grok_sampling_types::SamplingError::is_credit_exhausted`]).
     /// Order is preference; keys already equal to `api_key` are ignored.
     /// Empty (default) disables multi-key failover.
+    ///
+    /// Same-host only. For a different host/model (e.g. OpenRouter → xAI Grok
+    /// API), use [`Self::failover_providers`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failover_api_keys: Vec<String>,
+    /// Cross-provider credit failover (different `base_url` / model / key).
+    /// Tried after same-host [`Self::failover_api_keys`] are exhausted.
+    /// Typical case: OpenRouter 402 → first-party Grok API with remaining pool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover_providers: Vec<FailoverProvider>,
     pub base_url: String,
     pub model: String,
     pub max_completion_tokens: Option<u32>,
@@ -139,6 +161,7 @@ impl Default for SamplerConfig {
         Self {
             api_key: None,
             failover_api_keys: Vec::new(),
+            failover_providers: Vec::new(),
             base_url: String::new(),
             model: String::new(),
             max_completion_tokens: None,

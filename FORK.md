@@ -36,7 +36,7 @@ git remote -v
 # xai-org  → xai-org/grok-build
 ```
 
-## Open PRs: merge `main` in — never rebase
+## Open PRs: merge `main` in, never rebase
 
 Catching up a **published** feature branch with `main` is a **merge**, not a
 rebase. Rebase rewrites SHAs and forces a force-push, which confuses in-flight
@@ -94,16 +94,18 @@ Keep diffs **small and product-facing** so merges stay tractable:
 - [x] Binary name `grok-oss` and Grok OSS branding
 - [x] AUR packaging sources (`packaging/aur/`)
 - [x] CONTRIBUTING accepts PRs on this fork
-- [ ] Bitcoin-native Routstr Grok 4.5 path (local BIP-39 / BDK / LDK / CDK) —
-    reasoning in [`docs/bitcoin-routstr/`](docs/bitcoin-routstr/); crate
-    stub `grok-bitcoin-wallet` (SeedVault + funding wizard still to build)
+- [x] Bitcoin-native Routstr foundations (full BDK/LDK/CDK still residual):
+    Reasoning in [`docs/bitcoin-routstr/`](docs/bitcoin-routstr/);
+    `grok-bitcoin-wallet` (BIP-39, SeedVault, NIP-06, BIP84 addr, wizards);
+    shell `auth/routstr.rs` + catalog `routstr-grok-4.5` + `login --routstr`.
+    Remaining: [`RESIDUAL.md`](RESIDUAL.md)
 - [x] Novel crate naming: `grok-*` (e.g. `grok-rate-limit`, `grok-bitcoin-wallet`)
 
 ## Nix & CI
 
-- [`flake.nix`](flake.nix) — fenix (pinned via `rust-toolchain.toml`) + crane
+- [`flake.nix`](flake.nix), fenix (pinned via `rust-toolchain.toml`) + crane
   package `grok-oss`, `devShell`, and checks.
-- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — `nix build .#grok-oss`
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml), `nix build .#grok-oss`
   and focused cargo checks/tests on PRs to `main`.
 
 ```bash
@@ -143,7 +145,7 @@ subset.
   `main` (or a packaging recipe that builds from it) is the default.
 
 Optional lightweight tags (`v…-oss`) may still appear for AUR/package recipes
-when a distro needs a fixed ref—not as a second product version line.
+when a distro needs a fixed ref, not as a second product version line.
 
 ### Build identity
 
@@ -178,7 +180,7 @@ download a binary. If behind, rebuild or reinstall:
 git pull && just install    # or just install-nix / AUR / your package
 ```
 
-The CLI is the user interface for freshness — not a justfile recipe.
+The CLI is the user interface for freshness, not a justfile recipe.
 
 ### Multi-session rate limits
 
@@ -195,5 +197,5 @@ stampeding the API. Transient retries stay **unlimited by default**; optional
 
 ## License
 
-Same as upstream first-party code: **Apache License 2.0** — see [`LICENSE`](LICENSE).
+Same as upstream first-party code: **Apache License 2.0**, see [`LICENSE`](LICENSE).
 Third-party notices: [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES).

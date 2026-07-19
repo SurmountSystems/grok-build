@@ -56,6 +56,7 @@ fn dispatch_billing(
             subscription_tier,
             autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
             openrouter_balance: None,
+            routstr_balance: None,
         }),
         app,
     );
@@ -333,6 +334,21 @@ fn is_credit_limit_error_matches_legacy_403_and_pool_402() {
 }
 
 #[test]
+fn is_openrouter_credit_error_detects_or_wording() {
+    use super::super::billing::is_openrouter_credit_error;
+    assert!(is_openrouter_credit_error(
+        "API error (status 402 Payment Required): You requested up to 65536 tokens, but can only afford 59432. Request URL: https://openrouter.ai/api/v1/chat/completions"
+    ));
+    assert!(is_openrouter_credit_error(
+        "This request requires more credits, or fewer max_tokens."
+    ));
+    assert!(!is_openrouter_credit_error(
+        "Grok Build usage balance exhausted"
+    ));
+    assert!(!is_openrouter_credit_error("You hit your weekly limit."));
+}
+
+#[test]
 fn upsell_non_max_sets_no_freeform() {
     let mut app = test_app_with_agent();
     open_upsell_qa(
@@ -554,6 +570,67 @@ fn billing_fetched_none_balance_shows_no_data_message() {
 }
 
 #[test]
+fn billing_fetched_routstr_only_usage_summary() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    dispatch(
+        Action::TaskComplete(TaskResult::BillingFetched {
+            agent_id: AgentId(0),
+            balance: None,
+            silent: false,
+            subscription_tier: None,
+            autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
+            openrouter_balance: None,
+            routstr_balance: Some(crate::views::credit_bar::RoutstrCreditBalance {
+                balance_msats: 2_500_000,
+            }),
+        }),
+        &mut app,
+    );
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    assert_eq!(
+        app.routstr_credit_balance.map(|r| r.balance_msats),
+        Some(2_500_000)
+    );
+    assert!(app.billing_poll_wanted);
+    let agent = app.agents.get(&AgentId(0)).unwrap();
+    let idx = agent_scrollback_len(&app) - 1;
+    let text = match &agent.scrollback.entry(idx).unwrap().block {
+        crate::scrollback::block::RenderBlock::System(sys) => sys.text.clone(),
+        other => panic!("expected System block, got {other:?}"),
+    };
+    assert_eq!(text, "Routstr balance: 2500 sats");
+}
+
+#[test]
+fn billing_fetched_openrouter_only_usage_summary() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    dispatch(
+        Action::TaskComplete(TaskResult::BillingFetched {
+            agent_id: AgentId(0),
+            balance: None,
+            silent: false,
+            subscription_tier: None,
+            autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
+            openrouter_balance: Some(crate::views::credit_bar::OpenRouterCreditBalance {
+                balance_cents: 6386,
+            }),
+            routstr_balance: None,
+        }),
+        &mut app,
+    );
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    let agent = app.agents.get(&AgentId(0)).unwrap();
+    let idx = agent_scrollback_len(&app) - 1;
+    let text = match &agent.scrollback.entry(idx).unwrap().block {
+        crate::scrollback::block::RenderBlock::System(sys) => sys.text.clone(),
+        other => panic!("expected System block, got {other:?}"),
+    };
+    assert_eq!(text, "OpenRouter credits: $63.86");
+}
+
+#[test]
 fn billing_fetched_none_balance_clears_cached() {
     let mut app = test_app_with_agent();
     // Seed a known balance + polling, as a prior successful fetch would.
@@ -641,6 +718,7 @@ fn billing_fetched_stores_autotopup_on_app_and_agent() {
             subscription_tier: None,
             autotopup: crate::views::credit_bar::AutoTopupFetch::Resolved(autotopup),
             openrouter_balance: None,
+            routstr_balance: None,
         }),
         &mut app,
     );
@@ -671,6 +749,7 @@ fn billing_fetched_unchanged_autotopup_keeps_cached_rule() {
             subscription_tier: None,
             autotopup: resolved,
             openrouter_balance: None,
+            routstr_balance: None,
         }),
         &mut app,
     );
@@ -683,6 +762,7 @@ fn billing_fetched_unchanged_autotopup_keeps_cached_rule() {
             subscription_tier: None,
             autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
             openrouter_balance: None,
+            routstr_balance: None,
         }),
         &mut app,
     );
@@ -712,6 +792,7 @@ fn billing_fetched_cleared_autotopup_resets_cache() {
                 },
             ),
             openrouter_balance: None,
+            routstr_balance: None,
         }),
         &mut app,
     );
@@ -725,6 +806,7 @@ fn billing_fetched_cleared_autotopup_resets_cache() {
             subscription_tier: None,
             autotopup: crate::views::credit_bar::AutoTopupFetch::Cleared,
             openrouter_balance: None,
+            routstr_balance: None,
         }),
         &mut app,
     );
@@ -746,6 +828,7 @@ fn app_billing_fetched_stores_autotopup() {
                 crate::views::credit_bar::AutoTopupInfo::disabled(),
             ),
             openrouter_balance: None,
+            routstr_balance: None,
         }),
         &mut app,
     );

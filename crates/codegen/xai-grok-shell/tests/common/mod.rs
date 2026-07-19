@@ -32,6 +32,7 @@ pub fn test_sampler_config(
     SamplerConfig {
         api_key: Some("test-api-key".to_string()),
         failover_api_keys: Vec::new(),
+        failover_providers: Vec::new(),
         base_url: base_url.to_string(),
         model: "test-model".to_string(),
         max_completion_tokens: Some(1000),

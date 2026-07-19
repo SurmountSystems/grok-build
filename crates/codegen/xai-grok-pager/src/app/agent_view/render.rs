@@ -2191,13 +2191,20 @@ impl AgentView {
             .models
             .current_model_id_str()
             .is_some_and(xai_grok_shell::auth::is_openrouter_catalog_id);
-        let warning = crate::views::credit_bar::usage_warning_for_session_with_openrouter(
+        let routstr_model = self
+            .session
+            .models
+            .current_model_id_str()
+            .is_some_and(xai_grok_shell::auth::is_routstr_catalog_id);
+        let warning = crate::views::credit_bar::usage_warning_for_session_with_providers(
             self.credit_balance.as_ref(),
             self.auto_topup.as_ref(),
             self.openrouter_credit_balance.as_ref(),
+            self.routstr_credit_balance.as_ref(),
             usage_visible,
             self.chat_kind,
             openrouter_model,
+            routstr_model,
         );
         let usage_warning_text: Option<String> = warning.as_ref().map(|(t, _)| t.clone());
         let usage_warning = usage_warning_text.as_deref();

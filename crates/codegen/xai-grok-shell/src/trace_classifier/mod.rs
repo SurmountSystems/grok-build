@@ -1124,6 +1124,7 @@ async fn build_sampler_client(
     let config = xai_grok_sampler::SamplerConfig {
         api_key: Some(resolved),
         failover_api_keys: Vec::new(),
+        failover_providers: Vec::new(),
         base_url,
         model,
         max_completion_tokens: Some(LAZINESS_MAX_OUTPUT_TOKENS),

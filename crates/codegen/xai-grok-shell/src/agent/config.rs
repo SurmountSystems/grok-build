@@ -3189,18 +3189,26 @@ pub fn resolve_model_list(
         let defaults = default_model_entries(&cfg.endpoints);
         tracing::debug!(count = defaults.len(), "loaded default models");
         resolved.extend(defaults);
+        // ADR-008: routstr_enabled defaults on; when false, drop catalog inject.
+        if !routstr_catalog_enabled(Some(&cfg.features)) {
+            resolved.shift_remove(crate::auth::routstr::ROUTSTR_GROK_45_CATALOG_ID);
+            resolved.retain(|_, e| !crate::auth::routstr::is_routstr_base_url(&e.info.base_url));
+        }
     }
     if let Some(mut prefetched) = prefetched {
         tracing::debug!(count = prefetched.len(), "loaded prefetched models");
         let default_cw = DEFAULT_CONTEXT_WINDOW;
-        // Preserve additive third-party defaults (e.g. OpenRouter) that the
+        // Preserve additive third-party defaults (OpenRouter, Routstr) that the
         // remote catalog does not list — prefetched replaces first-party
         // defaults but must not erase provider options we ship client-side.
         let preserved: Vec<(String, ModelEntry)> = resolved
             .iter()
             .filter(|(k, e)| {
                 !prefetched.contains_key(*k)
-                    && crate::auth::openrouter::is_openrouter_base_url(&e.info.base_url)
+                    && matches!(
+                        third_party_provider_for_url(&e.info.base_url),
+                        ThirdPartyProvider::OpenRouter | ThirdPartyProvider::Routstr
+                    )
             })
             .map(|(k, e)| (k.clone(), e.clone()))
             .collect();
@@ -3497,6 +3505,13 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
     let openrouter = openrouter_grok_45_default_entry();
     map.entry(crate::auth::openrouter::OPENROUTER_GROK_45_CATALOG_ID.to_owned())
         .or_insert(openrouter);
+    // Additive Routstr Bitcoin/Lightning path (not the product default model).
+    // Omitted when `[features] routstr_enabled = false` (checked at resolve time
+    // via `routstr_catalog_enabled`); defaults always include the entry so
+    // `default_model_entries` stays self-contained for tests.
+    let routstr = routstr_grok_45_default_entry();
+    map.entry(crate::auth::routstr::ROUTSTR_GROK_45_CATALOG_ID.to_owned())
+        .or_insert(routstr);
     map
 }
 
@@ -3561,6 +3576,67 @@ fn openrouter_grok_45_default_entry() -> ModelEntryConfig {
         laziness_detector: LazinessDetectorPerModelConfig::default(),
     }
 }
+
+/// Built-in Routstr Grok 4.5 catalog entry (chat completions, BYOK / Cashu).
+fn routstr_grok_45_default_entry() -> ModelEntryConfig {
+    use crate::auth::routstr::{
+        ROUTSTR_API_KEY_ENV, ROUTSTR_API_URL, ROUTSTR_GROK_45_CATALOG_ID,
+        ROUTSTR_GROK_45_CONTEXT_WINDOW, ROUTSTR_GROK_45_MODEL, ROUTSTR_HTTP_REFERER,
+        ROUTSTR_X_TITLE,
+    };
+    let mut extra_headers = IndexMap::new();
+    extra_headers.insert("HTTP-Referer".to_owned(), ROUTSTR_HTTP_REFERER.to_owned());
+    extra_headers.insert("X-Title".to_owned(), ROUTSTR_X_TITLE.to_owned());
+    ModelEntryConfig {
+        id: Some(ROUTSTR_GROK_45_CATALOG_ID.to_owned()),
+        model: ROUTSTR_GROK_45_MODEL.to_owned(),
+        base_url: ROUTSTR_API_URL.to_owned(),
+        api_base_url: None,
+        name: Some("Grok 4.5 (Routstr)".to_owned()),
+        description: Some(
+            "Grok 4.5 via Routstr. Pay with Bitcoin / Lightning / Cashu (Chaumian eCash)"
+                .to_owned(),
+        ),
+        context_window: NonZeroU64::new(ROUTSTR_GROK_45_CONTEXT_WINDOW)
+            .expect("routstr context window is non-zero"),
+        auto_compact_threshold_percent: None,
+        system_prompt_label: None,
+        temperature: Some(0.7),
+        top_p: Some(0.95),
+        max_completion_tokens: None,
+        api_backend: ApiBackend::ChatCompletions,
+        auth_scheme: None,
+        agent_type: default_agent_type(),
+        inference_idle_timeout_secs: None,
+        max_retries: None,
+        api_key: None,
+        env_key: Some(EnvKeys::single(ROUTSTR_API_KEY_ENV)),
+        extra_headers,
+        use_concise: false,
+        hidden: false,
+        supported_in_api: true,
+        reasoning_effort: None,
+        supports_reasoning_effort: false,
+        reasoning_efforts: Vec::new(),
+        supports_backend_search: false,
+        compactions_remaining: None,
+        compaction_at_tokens: None,
+        show_model_fingerprint: false,
+        stream_tool_calls: None,
+        laziness_detector: LazinessDetectorPerModelConfig::default(),
+    }
+}
+
+/// Whether the Routstr catalog entry should appear (default on).
+///
+/// Reads `[features].routstr_enabled` when present on a loaded config; unit
+/// tests and paths without config treat missing as enabled.
+pub fn routstr_catalog_enabled(features: Option<&Features>) -> bool {
+    features
+        .map(|f| f.routstr_enabled.unwrap_or(true))
+        .unwrap_or(true)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntryConfig {
     /// Stable unique identifier for this catalog entry. When present,
@@ -4047,21 +4123,39 @@ impl ModelEntry {
         }
     }
     /// Non-empty `api_key`, else first non-empty resolved `env_key`, else
-    /// (OpenRouter base URLs) the secret store. `None` → fall through to
-    /// session / global key — except OpenRouter entries, which never fall
-    /// through (see [`resolve_credentials`]).
+    /// (OpenRouter / Routstr base URLs) the secret store. `None` → fall through
+    /// to session / global key — except OpenRouter/Routstr entries, which never
+    /// fall through (see [`resolve_credentials`]).
     pub(crate) fn own_credential(&self) -> Option<String> {
-        let openrouter = crate::auth::openrouter::is_openrouter_base_url(&self.info.base_url);
-        collect_own_credentials(self.api_key.as_deref(), self.env_key.as_ref(), openrouter)
+        let provider = third_party_provider_for_url(&self.info.base_url);
+        collect_own_credentials(self.api_key.as_deref(), self.env_key.as_ref(), provider)
             .into_iter()
             .next()
     }
     /// `true` when the model has a non-empty `api_key`, an `env_key` that
-    /// resolves, or (OpenRouter) a key in the secret store.
+    /// resolves, or (OpenRouter/Routstr) a key in the secret store.
     /// Probes `std::env::var` / secret store at call time — result is not
     /// stable across env or store changes.
     pub fn has_own_credentials(&self) -> bool {
         self.own_credential().is_some()
+    }
+}
+
+/// Third-party BYOK hosts that must not fall through to xAI session / `XAI_API_KEY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThirdPartyProvider {
+    None,
+    OpenRouter,
+    Routstr,
+}
+
+pub(crate) fn third_party_provider_for_url(base_url: &str) -> ThirdPartyProvider {
+    if crate::auth::openrouter::is_openrouter_base_url(base_url) {
+        ThirdPartyProvider::OpenRouter
+    } else if crate::auth::routstr::is_routstr_base_url(base_url) {
+        ThirdPartyProvider::Routstr
+    } else {
+        ThirdPartyProvider::None
     }
 }
 impl std::ops::Deref for ModelEntry {
@@ -4413,6 +4507,10 @@ pub struct Features {
     /// `None` = defer to env / default (true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_recursive_config_watch: Option<bool>,
+    /// Bitcoin-native Routstr Grok 4.5 catalog entry + balance chrome.
+    /// `None` = default **on**. Set `false` to omit Routstr from the picker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routstr_enabled: Option<bool>,
 }
 /// Resolved credentials for a model session.
 pub struct ResolvedCredentials {
@@ -4420,6 +4518,9 @@ pub struct ResolvedCredentials {
     /// Extra API keys for credit-exhaustion failover (same host / auth scheme).
     /// Never includes `api_key`; may be empty.
     pub failover_api_keys: Vec<String>,
+    /// Cross-provider credit failover (e.g. OpenRouter → first-party Grok API).
+    /// Never points at the same `base_url` as the primary; may be empty.
+    pub failover_providers: Vec<xai_grok_sampler::FailoverProvider>,
     pub base_url: String,
     pub auth_type: xai_chat_state::AuthType,
     pub auth_scheme: AuthScheme,
@@ -4431,17 +4532,17 @@ pub(crate) fn first_own_credential(
     api_key: Option<&str>,
     env_key: Option<&EnvKeys>,
 ) -> Option<String> {
-    collect_own_credentials(api_key, env_key, /* openrouter */ false)
+    collect_own_credentials(api_key, env_key, ThirdPartyProvider::None)
         .into_iter()
         .next()
 }
 
 /// Ordered unique BYOK keys: inline `api_key` (may be a comma-list), then every
-/// value from `env_key` names, then (OpenRouter only) secret-store key.
+/// value from `env_key` names, then (OpenRouter / Routstr) secret-store key.
 pub(crate) fn collect_own_credentials(
     api_key: Option<&str>,
     env_key: Option<&EnvKeys>,
-    openrouter: bool,
+    provider: ThirdPartyProvider,
 ) -> Vec<String> {
     let mut keys = Vec::new();
     if let Some(raw) = api_key {
@@ -4454,27 +4555,44 @@ pub(crate) fn collect_own_credentials(
             push_unique_key(&mut keys, v);
         }
     }
-    // Also accept OPENROUTER_API_KEYS as an explicit multi-key env (in addition
-    // to comma-lists inside OPENROUTER_API_KEY).
-    if openrouter && let Ok(extra) = std::env::var(crate::auth::openrouter::OPENROUTER_API_KEYS_ENV)
-    {
-        for part in split_api_key_list(&extra) {
-            push_unique_key(&mut keys, part);
-        }
-    }
-    if openrouter {
-        // Prefer reading the Grok secret store directly so a stored key remains
-        // available as failover even when OPENROUTER_API_KEY is set in the env.
-        let store = crate::auth::credentials_store::CredentialsStore::default_store();
-        let url = crate::auth::openrouter::openrouter_credential_url(None);
-        if let Ok(Some((_, store_key))) = store.read(&url) {
-            push_unique_key(&mut keys, store_key);
-        } else if keys.is_empty() {
-            // Fall back to full resolution (env already empty; may hit Zed harness).
-            if let Ok(Some(k)) = crate::auth::openrouter::load_openrouter_api_key_default() {
-                push_unique_key(&mut keys, k);
+    // Explicit multi-key env vars (in addition to comma-lists inside the primary env).
+    match provider {
+        ThirdPartyProvider::OpenRouter => {
+            if let Ok(extra) = std::env::var(crate::auth::openrouter::OPENROUTER_API_KEYS_ENV) {
+                for part in split_api_key_list(&extra) {
+                    push_unique_key(&mut keys, part);
+                }
+            }
+            // Prefer reading the Grok secret store directly so a stored key remains
+            // available as failover even when OPENROUTER_API_KEY is set in the env.
+            let store = crate::auth::credentials_store::CredentialsStore::default_store();
+            let url = crate::auth::openrouter::openrouter_credential_url(None);
+            if let Ok(Some((_, store_key))) = store.read(&url) {
+                push_unique_key(&mut keys, store_key);
+            } else if keys.is_empty() {
+                // Fall back to full resolution (env already empty; may hit Zed harness).
+                if let Ok(Some(k)) = crate::auth::openrouter::load_openrouter_api_key_default() {
+                    push_unique_key(&mut keys, k);
+                }
             }
         }
+        ThirdPartyProvider::Routstr => {
+            if let Ok(extra) = std::env::var(crate::auth::routstr::ROUTSTR_API_KEYS_ENV) {
+                for part in split_api_key_list(&extra) {
+                    push_unique_key(&mut keys, part);
+                }
+            }
+            let store = crate::auth::credentials_store::CredentialsStore::default_store();
+            let url = crate::auth::routstr::routstr_credential_url(None);
+            if let Ok(Some((_, store_key))) = store.read(&url) {
+                push_unique_key(&mut keys, store_key);
+            } else if keys.is_empty() {
+                if let Ok(Some(k)) = crate::auth::routstr::load_routstr_api_key_default() {
+                    push_unique_key(&mut keys, k);
+                }
+            }
+        }
+        ThirdPartyProvider::None => {}
     }
     keys
 }
@@ -4485,21 +4603,98 @@ fn split_primary_failover(keys: Vec<String>) -> (Option<String>, Vec<String>) {
     (primary, iter.collect())
 }
 
+/// Serialize sampler failover providers for chat-state credentials storage.
+pub fn failover_providers_to_chat_state(
+    providers: &[xai_grok_sampler::FailoverProvider],
+) -> Vec<serde_json::Value> {
+    providers
+        .iter()
+        .filter_map(|p| serde_json::to_value(p).ok())
+        .collect()
+}
+
+/// Deserialize chat-state failover providers back into sampler types.
+pub fn failover_providers_from_chat_state(
+    values: &[serde_json::Value],
+) -> Vec<xai_grok_sampler::FailoverProvider> {
+    values
+        .iter()
+        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+        .collect()
+}
+
+/// Map a third-party routing model id to the first-party Grok API model id.
+///
+/// OpenRouter uses `x-ai/grok-4.5`; xAI expects `grok-4.5`.
+pub(crate) fn xai_model_id_for_third_party_routing(model: &str) -> String {
+    let m = model.trim();
+    if let Some(rest) = m.strip_prefix("x-ai/") {
+        return rest.to_string();
+    }
+    if let Some(rest) = m.strip_prefix("openrouter-") {
+        return rest.to_string();
+    }
+    if let Some(rest) = m.strip_prefix("routstr-") {
+        return rest.to_string();
+    }
+    m.to_string()
+}
+
+/// First-party Grok API endpoint for credit failover when the active model is
+/// a third-party host (OpenRouter / Routstr).
+///
+/// Preference: `XAI_API_KEY` (and multi-key list primary), else session token.
+/// Returns `None` when neither is available (cannot fail over to Grok API).
+pub(crate) fn first_party_credit_failover_provider(
+    routing_model: &str,
+    session_key: Option<&str>,
+    xai_base_url: &str,
+) -> Option<xai_grok_sampler::FailoverProvider> {
+    let model = xai_model_id_for_third_party_routing(routing_model);
+    let base_url = if xai_base_url.trim().is_empty() {
+        XAI_API_BASE_URL_DEFAULT.to_string()
+    } else {
+        xai_base_url.trim().to_string()
+    };
+    if let Ok(key) = crate::agent::auth_method::read_xai_api_key_env() {
+        let mut keys = Vec::new();
+        for part in split_api_key_list(&key) {
+            push_unique_key(&mut keys, part);
+        }
+        if let Some(primary) = keys.into_iter().next() {
+            return Some(xai_grok_sampler::FailoverProvider {
+                api_key: primary,
+                base_url,
+                model,
+                auth_scheme: AuthScheme::Bearer,
+            });
+        }
+    }
+    if let Some(sk) = session_key.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(xai_grok_sampler::FailoverProvider {
+            api_key: sk.to_owned(),
+            base_url,
+            model,
+            auth_scheme: AuthScheme::Bearer,
+        });
+    }
+    None
+}
+
 /// Resolve credentials for a model.
 /// Priority: model api_key/env_key/secret-store > session token > XAI_API_KEY.
 ///
 /// When `env_key` lists multiple names (or values contain comma-separated
 /// keys), the first is primary and the rest are credit-failover keys.
-/// OpenRouter base URLs never fall through to xAI session / `XAI_API_KEY`
-/// (would send the wrong credential to a third-party host).
+/// OpenRouter / Routstr base URLs never fall through to xAI session /
+/// `XAI_API_KEY` for the **primary** request (would send the wrong credential
+/// to a third-party host). Those first-party credentials are attached as
+/// [`ResolvedCredentials::failover_providers`] so a 402 on the third-party
+/// host can rotate to the Grok API.
 pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> ResolvedCredentials {
     let info = model.info();
-    let is_openrouter = crate::auth::openrouter::is_openrouter_base_url(&info.base_url);
-    let own = collect_own_credentials(
-        model.api_key.as_deref(),
-        model.env_key.as_ref(),
-        is_openrouter,
-    );
+    let provider = third_party_provider_for_url(&info.base_url);
+    let own = collect_own_credentials(model.api_key.as_deref(), model.env_key.as_ref(), provider);
     let (api_key, failover_api_keys, base_url, auth_type) = if !own.is_empty() {
         let (primary, failover) = split_primary_failover(own);
         (
@@ -4508,13 +4703,25 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
-    } else if is_openrouter {
+    } else if provider == ThirdPartyProvider::OpenRouter {
         // Own credential already checked env + secret store. Do not use
         // xAI session or XAI_API_KEY against OpenRouter.
         tracing::warn!(
             model = %info.model,
             env = crate::auth::openrouter::OPENROUTER_API_KEY_ENV,
-            "OpenRouter model has no API key — set OPENROUTER_API_KEY or run `grok login --openrouter`"
+            "OpenRouter model has no API key; set OPENROUTER_API_KEY or run `grok login --openrouter`"
+        );
+        (
+            None,
+            Vec::new(),
+            info.base_url.clone(),
+            xai_chat_state::AuthType::ApiKey,
+        )
+    } else if provider == ThirdPartyProvider::Routstr {
+        tracing::warn!(
+            model = %info.model,
+            env = crate::auth::routstr::ROUTSTR_API_KEY_ENV,
+            "Routstr model has no API key; set ROUTSTR_API_KEY or run `grok login --routstr`"
         );
         (
             None,
@@ -4558,16 +4765,35 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
             xai_chat_state::AuthType::ApiKey,
         )
     };
+
+    // Third-party primary: attach first-party Grok API as credit failover when
+    // the user has XAI_API_KEY or a session. Same-host multi-key remains in
+    // failover_api_keys; this is cross-host.
+    let failover_providers = match provider {
+        ThirdPartyProvider::OpenRouter | ThirdPartyProvider::Routstr if api_key.is_some() => {
+            first_party_credit_failover_provider(
+                &info.model,
+                session_key,
+                XAI_API_BASE_URL_DEFAULT,
+            )
+            .into_iter()
+            .collect()
+        }
+        _ => Vec::new(),
+    };
+
     let auth_scheme = info.auth_scheme;
     tracing::debug!(
         model = % info.model,
         auth_type = ? auth_type,
         failover_keys = failover_api_keys.len(),
+        failover_providers = failover_providers.len(),
         "resolved credentials"
     );
     ResolvedCredentials {
         api_key,
         failover_api_keys,
+        failover_providers,
         base_url,
         auth_type,
         auth_scheme,
@@ -4587,8 +4813,9 @@ pub fn enforce_disable_api_key_auth(
     {
         creds.auth_type = xai_chat_state::AuthType::SessionToken;
         creds.api_key = session_key.map(str::to_owned);
-        // Session tokens are single-identity; drop BYOK failover keys.
+        // Session tokens are single-identity; drop BYOK failover keys/providers.
         creds.failover_api_keys.clear();
+        creds.failover_providers.clear();
         xai_grok_telemetry::unified_log::debug(
             "auth: kill switch blocked a first-party API key at the credential seam",
             None,
@@ -4863,6 +5090,7 @@ pub fn sampling_config_for_model(
     SamplerConfig {
         api_key: credentials.api_key,
         failover_api_keys: credentials.failover_api_keys,
+        failover_providers: credentials.failover_providers,
         model: model_name,
         base_url: credentials.base_url,
         max_completion_tokens,
@@ -4938,6 +5166,15 @@ pub fn inject_url_derived_headers(
         headers
             .entry("X-OpenRouter-Categories".to_string())
             .or_insert_with(|| OPENROUTER_CATEGORIES.to_string());
+    }
+    if crate::auth::routstr::is_routstr_base_url(base_url) {
+        use crate::auth::routstr::{ROUTSTR_HTTP_REFERER, ROUTSTR_X_TITLE};
+        headers
+            .entry("HTTP-Referer".to_string())
+            .or_insert_with(|| ROUTSTR_HTTP_REFERER.to_string());
+        headers
+            .entry("X-Title".to_string())
+            .or_insert_with(|| ROUTSTR_X_TITLE.to_string());
     }
     let _ = (alpha_test_key, base_url);
 }
@@ -5724,6 +5961,7 @@ reasoning_effort = "low"
             ResolvedCredentials {
                 api_key: Some("fallback-key".to_string()),
                 failover_api_keys: Vec::new(),
+                failover_providers: Vec::new(),
                 base_url: model.info().base_url.clone(),
                 auth_type: xai_chat_state::AuthType::ApiKey,
                 auth_scheme: AuthScheme::Bearer,
@@ -5751,6 +5989,7 @@ reasoning_effort = "low"
             let api_key_creds = ResolvedCredentials {
                 api_key: Some("key".into()),
                 failover_api_keys: Vec::new(),
+                failover_providers: Vec::new(),
                 base_url: entry
                     .api_base_url
                     .clone()
@@ -5825,7 +6064,7 @@ reasoning_effort = "low"
         let keys = collect_own_credentials(
             Some("primary,failover-a"),
             Some(&EnvKeys::new(["MISSING_ENV"])),
-            false,
+            ThirdPartyProvider::None,
         );
         assert_eq!(keys, vec!["primary", "failover-a"]);
         let model = test_model_entry(
@@ -5842,6 +6081,66 @@ reasoning_effort = "low"
         let sampling = sampling_config_for_model(&model, creds, None, None, None, None);
         assert_eq!(sampling.api_key.as_deref(), Some("k1"));
         assert_eq!(sampling.failover_api_keys, vec!["k2".to_string()]);
+    }
+
+    #[test]
+    fn xai_model_id_for_third_party_routing_strips_prefixes() {
+        assert_eq!(
+            xai_model_id_for_third_party_routing("x-ai/grok-4.5"),
+            "grok-4.5"
+        );
+        assert_eq!(
+            xai_model_id_for_third_party_routing("openrouter-grok-4.5"),
+            "grok-4.5"
+        );
+        assert_eq!(
+            xai_model_id_for_third_party_routing("routstr-grok-4.5"),
+            "grok-4.5"
+        );
+        assert_eq!(xai_model_id_for_third_party_routing("grok-4.5"), "grok-4.5");
+    }
+
+    #[test]
+    fn openrouter_resolve_attaches_xai_provider_failover_from_session() {
+        let model = test_model_entry(
+            "x-ai/grok-4.5",
+            "https://openrouter.ai/api/v1",
+            Some("or-primary"),
+            None,
+            None,
+        );
+        let creds = resolve_credentials(&model, Some("session-jwt-for-grok-api"));
+        assert_eq!(creds.api_key.as_deref(), Some("or-primary"));
+        assert_eq!(creds.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(creds.failover_providers.len(), 1);
+        let p = &creds.failover_providers[0];
+        assert_eq!(p.api_key, "session-jwt-for-grok-api");
+        assert_eq!(p.base_url, XAI_API_BASE_URL_DEFAULT);
+        assert_eq!(p.model, "grok-4.5");
+        let sampling = sampling_config_for_model(&model, creds, None, None, None, None);
+        assert_eq!(sampling.failover_providers.len(), 1);
+        assert_eq!(sampling.failover_providers[0].model, "grok-4.5");
+    }
+
+    #[test]
+    #[serial]
+    fn openrouter_resolve_without_xai_has_empty_provider_failover() {
+        // Ensure XAI_API_KEY is not ambient for this assertion.
+        let _guard = EnvGuard::unset("XAI_API_KEY");
+        let _legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+        let model = test_model_entry(
+            "x-ai/grok-4.5",
+            "https://openrouter.ai/api/v1",
+            Some("or-only"),
+            None,
+            None,
+        );
+        let creds = resolve_credentials(&model, None);
+        assert_eq!(creds.api_key.as_deref(), Some("or-only"));
+        assert!(
+            creds.failover_providers.is_empty(),
+            "no session and no XAI_API_KEY → cannot fail over to Grok API"
+        );
     }
     #[test]
     fn split_api_key_list_trims_commas_and_newlines() {
@@ -6206,10 +6505,152 @@ reasoning_effort = "low"
             crate::auth::openrouter::OPENROUTER_GROK_45_MODEL
         );
     }
+
+    #[test]
+    fn default_models_include_routstr_grok_45_separate_from_default() {
+        let endpoints = EndpointsConfig::default();
+        let models = default_model_entries(&endpoints);
+        let id = crate::auth::routstr::ROUTSTR_GROK_45_CATALOG_ID;
+        let entry = models
+            .get(id)
+            .unwrap_or_else(|| panic!("missing {id} in defaults"));
+        assert_eq!(
+            entry.info.model,
+            crate::auth::routstr::ROUTSTR_GROK_45_MODEL
+        );
+        assert_eq!(entry.info.base_url, crate::auth::routstr::ROUTSTR_API_URL);
+        assert_eq!(entry.info.api_backend, ApiBackend::ChatCompletions);
+        assert!(entry.supported_in_api);
+        assert_eq!(
+            entry.env_key.as_ref().map(|k| k.names()),
+            Some(vec![crate::auth::routstr::ROUTSTR_API_KEY_ENV])
+        );
+        assert_eq!(crate::models::default_model(), "grok-build");
+        assert!(entry.name.as_deref().is_some_and(|n| n.contains("Routstr")));
+        assert!(
+            entry
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("Bitcoin") || d.contains("Lightning"))
+        );
+        assert!(
+            !entry
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .contains("crypto"),
+            "user-facing description must not say crypto"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_credentials_routstr_uses_env_not_session() {
+        use xai_chat_state::AuthType;
+        let _env = xai_grok_test_support::EnvGuard::set(
+            crate::auth::routstr::ROUTSTR_API_KEY_ENV,
+            "sk-routstr-test",
+        );
+        let entry = ModelEntry::from_config_entry(&routstr_grok_45_default_entry());
+        let creds = resolve_credentials(&entry, Some("session-jwt"));
+        assert_eq!(creds.auth_type, AuthType::ApiKey);
+        assert_eq!(creds.api_key.as_deref(), Some("sk-routstr-test"));
+        assert_eq!(creds.base_url, crate::auth::routstr::ROUTSTR_API_URL);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_credentials_routstr_does_not_use_xai_session() {
+        use xai_chat_state::AuthType;
+        let _env =
+            xai_grok_test_support::EnvGuard::unset(crate::auth::routstr::ROUTSTR_API_KEY_ENV);
+        let entry = ModelEntry::from_config_entry(&routstr_grok_45_default_entry());
+        let creds = resolve_credentials(&entry, Some("session-jwt"));
+        assert_eq!(creds.auth_type, AuthType::ApiKey);
+        assert_ne!(
+            creds.api_key.as_deref(),
+            Some("session-jwt"),
+            "Routstr must never use the xAI session token"
+        );
+        assert_eq!(creds.base_url, crate::auth::routstr::ROUTSTR_API_URL);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_credentials_routstr_does_not_use_xai_api_key_env() {
+        use xai_chat_state::AuthType;
+        let _routstr =
+            xai_grok_test_support::EnvGuard::unset(crate::auth::routstr::ROUTSTR_API_KEY_ENV);
+        let _xai = xai_grok_test_support::EnvGuard::set("XAI_API_KEY", "xai-sentinel-key");
+        let entry = ModelEntry::from_config_entry(&routstr_grok_45_default_entry());
+        let creds = resolve_credentials(&entry, None);
+        assert_eq!(creds.auth_type, AuthType::ApiKey);
+        assert!(
+            creds.api_key.is_none(),
+            "Routstr without ROUTSTR key must not fall through to XAI_API_KEY"
+        );
+        assert_ne!(creds.api_key.as_deref(), Some("xai-sentinel-key"));
+        assert_eq!(creds.base_url, crate::auth::routstr::ROUTSTR_API_URL);
+    }
+
+    #[test]
+    fn inject_url_derived_headers_adds_routstr_attribution() {
+        let mut headers = IndexMap::new();
+        inject_url_derived_headers(&mut headers, None, crate::auth::routstr::ROUTSTR_API_URL);
+        assert_eq!(
+            headers.get("HTTP-Referer").map(String::as_str),
+            Some(crate::auth::routstr::ROUTSTR_HTTP_REFERER)
+        );
+        assert_eq!(
+            headers.get("X-Title").map(String::as_str),
+            Some(crate::auth::routstr::ROUTSTR_X_TITLE)
+        );
+        assert!(!headers.contains_key("X-XAI-Token-Auth"));
+        assert!(
+            headers
+                .get("HTTP-Referer")
+                .is_some_and(|u| u.contains("SurmountSystems/grok-oss")),
+            "referer should be Surmount Grok OSS URL"
+        );
+    }
+
+    #[test]
+    fn routstr_catalog_enabled_defaults_true() {
+        assert!(routstr_catalog_enabled(None));
+        let mut f = Features::default();
+        assert!(routstr_catalog_enabled(Some(&f)));
+        f.routstr_enabled = Some(false);
+        assert!(!routstr_catalog_enabled(Some(&f)));
+        f.routstr_enabled = Some(true);
+        assert!(routstr_catalog_enabled(Some(&f)));
+    }
+
+    #[test]
+    fn resolve_model_list_omits_routstr_when_disabled() {
+        let mut cfg = Config {
+            endpoints: EndpointsConfig::default(),
+            features: Features {
+                routstr_enabled: Some(false),
+                ..Features::default()
+            },
+            ..Config::default()
+        };
+        // Config::default may not exist — build minimally if needed.
+        let _ = &mut cfg;
+        let models = resolve_model_list(&cfg, None);
+        assert!(
+            !models.contains_key(crate::auth::routstr::ROUTSTR_GROK_45_CATALOG_ID),
+            "routstr must be omitted when features.routstr_enabled=false"
+        );
+        // OpenRouter still present.
+        assert!(models.contains_key(crate::auth::openrouter::OPENROUTER_GROK_45_CATALOG_ID));
+    }
     fn api_key_creds(base_url: &str) -> ResolvedCredentials {
         ResolvedCredentials {
             api_key: Some("xai-secret".to_string()),
             failover_api_keys: Vec::new(),
+            failover_providers: Vec::new(),
             base_url: base_url.to_string(),
             auth_type: xai_chat_state::AuthType::ApiKey,
             auth_scheme: Default::default(),

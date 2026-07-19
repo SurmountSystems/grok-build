@@ -38,6 +38,8 @@ pub(crate) const UPSELL_URL_UPGRADE: &str = "https://grok.com/supergrok?referrer
 /// URL for managing pay-as-you-go / on-demand spending / purchasing credits.
 pub(crate) const UPSELL_URL_PAYG: &str = "https://grok.com?_s=usage";
 
+/// OpenRouter credits top-up (not SuperGrok weekly pool).
+pub(crate) const UPSELL_URL_OPENROUTER: &str = "https://openrouter.ai/settings/credits";
 /// Billing mode for credit-limit upsell copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CreditLimitUpsellMode {
@@ -84,6 +86,55 @@ pub(crate) fn is_credit_limit_error(http_status: Option<u16>, message: &str) -> 
         // without a separate status field.
         None | Some(_) => m.contains("status 402") || (m.contains("status 403") && legacy),
     }
+}
+
+/// True when the credit error clearly came from OpenRouter (not xAI weekly pool).
+///
+/// Used so the pager does not show SuperGrok "weekly limit" copy for OR 402s.
+pub(crate) fn is_openrouter_credit_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("openrouter")
+        || m.contains("can only afford")
+        || m.contains("fewer max_tokens")
+}
+
+/// OpenRouter / third-party credit failure: do **not** claim SuperGrok weekly
+/// limit. Point at OpenRouter credits and mention first-party Grok API if
+/// that balance is known.
+pub(super) fn open_openrouter_credit_upsell(
+    agent: &mut AgentView,
+    grok_usage_pct: Option<f64>,
+) {
+    use crate::scrollback::blocks::CreditLimitCardAction;
+    use crate::scrollback::block::RenderBlock;
+
+    let mut body = "OpenRouter credits are too low for this request (or max_tokens is too high for the remaining balance)."
+        .to_string();
+    if let Some(pct) = grok_usage_pct {
+        body.push_str(&format!(
+            " Grok API usage is at {pct:.0}%. Failover to the Grok API runs automatically when XAI_API_KEY or a signed-in session is available."
+        ));
+    } else {
+        body.push_str(
+            " Failover to the Grok API runs automatically when XAI_API_KEY or a signed-in session is available.",
+        );
+    }
+    body.push_str(&format!(" Top up: {UPSELL_URL_OPENROUTER}"));
+
+    log_event(xai_grok_telemetry::events::CreditLimitUpsellShown {
+        surface: xai_grok_telemetry::events::CreditLimitUpsellSurface::InlineCard,
+        max_tier: false,
+        pay_as_you_go: false,
+        unified_billing: false,
+    });
+    agent.scrollback.push_block(RenderBlock::credit_limit_card(
+        "OpenRouter credits exhausted.",
+        CreditLimitCardAction::PurchaseCredits,
+        UPSELL_URL_OPENROUTER,
+    ));
+    agent
+        .scrollback
+        .push_block(RenderBlock::system(body));
 }
 
 /// Open the credit-limit upsell on the given agent.
@@ -352,6 +403,7 @@ pub(super) fn handle_billing_fetched(
     subscription_tier: Option<String>,
     autotopup: crate::views::credit_bar::AutoTopupFetch,
     openrouter_balance: Option<crate::views::credit_bar::OpenRouterCreditBalance>,
+    routstr_balance: Option<crate::views::credit_bar::RoutstrCreditBalance>,
 ) -> Vec<Effect> {
     // Parse/transport failures route to `BillingError`, so a `None`
     // balance here means the response carried no billing config. Clear
@@ -362,33 +414,48 @@ pub(super) fn handle_billing_fetched(
     // `Resolved` updates the cached rule, `Cleared` resets it to unknown
     // (no credits), `Unchanged` keeps the last-known-good (fetch failed).
     apply_auto_topup(&mut app.auto_topup, &autotopup);
-    // OpenRouter: only overwrite when the fetch succeeded (`Some`).
+    // OpenRouter / Routstr: only overwrite when the fetch succeeded (`Some`).
     if let Some(or) = openrouter_balance {
         app.openrouter_credit_balance = Some(or);
+    }
+    if let Some(r) = routstr_balance {
+        app.routstr_credit_balance = Some(r);
     }
     app.billing_poll_wanted = balance
         .as_ref()
         .map(|b| b.usage_pct >= 99.0)
         .unwrap_or(false)
-        // Keep polling when OpenRouter is in use so the footer balance refreshes.
-        || app.openrouter_credit_balance.is_some();
+        // Keep polling when OpenRouter / Routstr is in use so the footer refreshes.
+        || app.openrouter_credit_balance.is_some()
+        || app.routstr_credit_balance.is_some();
     if let Some(tier) = subscription_tier {
         app.subscription_tier = Some(tier);
     }
     // Render the `/usage` summary from the now-current cached rule.
     let summary_topup = app.auto_topup.clone();
     let app_or = app.openrouter_credit_balance;
+    let app_routstr = app.routstr_credit_balance;
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         // Gateway/chat-kind: do not attach Build coding credits.
         let mut topup = agent.auto_topup.clone();
         apply_auto_topup(&mut topup, &autotopup);
-        agent.apply_credit_balance(balance.clone(), topup, app_or);
+        agent.apply_credit_balance(balance.clone(), topup, app_or, app_routstr);
         if !silent && !agent.chat_kind {
             let msg = match &balance {
                 Some(bal) => {
                     crate::views::credit_bar::format_usage_summary(bal, summary_topup.as_ref())
                 }
-                None => "No billing data available.".to_string(),
+                None => {
+                    // Provider-only sessions (Routstr / OpenRouter) still get a
+                    // useful `/usage` line when xAI billing is unavailable.
+                    if let Some(r) = app_routstr.as_ref() {
+                        crate::views::credit_bar::format_routstr_usage_summary(r)
+                    } else if let Some(or) = app_or.as_ref() {
+                        crate::views::credit_bar::format_openrouter_usage_summary(or)
+                    } else {
+                        "No billing data available.".to_string()
+                    }
+                }
             };
             agent.scrollback.push_block(RenderBlock::System(
                 crate::scrollback::blocks::SystemMessageBlock::new(msg),
@@ -520,13 +587,28 @@ pub(super) fn handle_credit_limit_recheck_complete(
             agent.session.enqueue_in_flight_prompt_front(prompt);
         }
     } else if !user_moved_on {
-        let balance = agent
-            .credit_balance
+        let openrouter_model = agent
+            .session
+            .models
+            .current
             .as_ref()
-            .or(app.credit_balance.as_ref());
-        let mode = credit_limit_upsell_mode(balance);
-        let max_tier = is_max_tier(app.subscription_tier.as_deref());
-        open_credit_limit_upsell(agent, mode, max_tier);
+            .is_some_and(|id| xai_grok_shell::auth::is_openrouter_catalog_id(id.0.as_ref()));
+        if openrouter_model {
+            let grok_pct = agent
+                .credit_balance
+                .as_ref()
+                .or(app.credit_balance.as_ref())
+                .map(|b| b.usage_pct);
+            open_openrouter_credit_upsell(agent, grok_pct);
+        } else {
+            let balance = agent
+                .credit_balance
+                .as_ref()
+                .or(app.credit_balance.as_ref());
+            let mode = credit_limit_upsell_mode(balance);
+            let max_tier = is_max_tier(app.subscription_tier.as_deref());
+            open_credit_limit_upsell(agent, mode, max_tier);
+        }
     }
     // Either way, drop the stashed prompt.
     agent.credit_limit_stashed_prompt = None;

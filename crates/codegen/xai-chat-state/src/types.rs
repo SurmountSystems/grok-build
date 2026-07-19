@@ -121,6 +121,11 @@ pub struct Credentials {
     /// Additional API keys for credit-exhaustion failover (opaque to chat-state).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failover_api_keys: Vec<String>,
+    /// Cross-provider credit failover endpoints as JSON objects
+    /// `{api_key, base_url, model, auth_scheme?}` (opaque to chat-state).
+    /// Stored as JSON so chat-state does not depend on the sampler crate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover_providers: Vec<serde_json::Value>,
     /// Whether this is a session token (refreshable) or user-provided api key.
     #[serde(default)]
     pub auth_type: AuthType,

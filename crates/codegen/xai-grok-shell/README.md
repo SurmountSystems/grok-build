@@ -23,35 +23,35 @@ grok agent stdio
 ## Contents
 
 - [Installation](#installation)
-- [Authentication](#authentication) — browser login, API key, OIDC, external auth providers
+- [Authentication](#authentication); browser login, API key, OIDC, external auth providers
 - **Using Grok**
-  - [Interactive TUI](#interactive-tui) — shortcuts, slash commands, file references
-  - [Headless Mode](#headless-mode) — scripting, CI/CD, output formats
-  - [Agent Mode](#agent-mode) — stdio, ACP integration
-  - [SSH Passthrough](#ssh-passthrough-grok-ssh) — Apple Terminal clipboard support
+  - [Interactive TUI](#interactive-tui); shortcuts, slash commands, file references
+  - [Headless Mode](#headless-mode); scripting, CI/CD, output formats
+  - [Agent Mode](#agent-mode); stdio, ACP integration
+  - [SSH Passthrough](#ssh-passthrough-grok-ssh). Apple Terminal clipboard support
 - **Configuration**
-  - [Config File](#configuration) — general settings, telemetry, LSP, enterprise deployment
-  - [Custom Models](#custom-models) — BYOK, Ollama, OpenAI, custom endpoints
-  - [MCP Servers](#mcp-servers) — external tool integrations
+  - [Config File](#configuration); general settings, telemetry, LSP, enterprise deployment
+  - [Custom Models](#custom-models). BYOK, Ollama, OpenAI, custom endpoints
+  - [MCP Servers](#mcp-servers); external tool integrations
 - **Customization**
-  - [Project Rules (AGENTS.md)](#agentsmd) — per-project system prompt instructions
-  - [Skills](#skills) — reusable prompt packages
-  - [Agent Profiles](#agent-profiles) — custom agent definitions
-  - [Subagents](#subagents) — parallel child sessions, roles, personas
-  - [Plugins](#plugins) — external tool/skill packages
-  - [Hooks](#hooks) — project lifecycle scripts
+  - [Project Rules (AGENTS.md)](#agentsmd); per-project system prompt instructions
+  - [Skills](#skills); reusable prompt packages
+  - [Agent Profiles](#agent-profiles); custom agent definitions
+  - [Subagents](#subagents); parallel child sessions, roles, personas
+  - [Plugins](#plugins); external tool/skill packages
+  - [Hooks](#hooks); project lifecycle scripts
 - **Features**
-  - [Memory](#memory) — cross-session knowledge persistence
-  - [Sandbox](#sandbox) — OS-level filesystem/network isolation
+  - [Memory](#memory); cross-session knowledge persistence
+  - [Sandbox](#sandbox). OS-level filesystem/network isolation
 - **Reference**
   - [Introspection (`grok inspect`)](#introspection)
   - [Claude Code Compatibility](#claude-code-compatibility)
   - [Built-in Tools](#built-in-tools)
-  - [Session Persistence](#session-persistence) — storage layout, resume
+  - [Session Persistence](#session-persistence); storage layout, resume
   - [File Locations](#file-locations)
   - [Environment Variables](#environment-variables)
   - [Troubleshooting](#troubleshooting)
-- [Building with Grok](#building-with-grok) — headless API, ACP SDK integration
+- [Building with Grok](#building-with-grok); headless API, ACP SDK integration
 
 ---
 
@@ -152,7 +152,7 @@ export GROK_CLI_CHAT_PROXY_BASE_URL="https://grok-proxy.acme.com/v1"
 
 For environments where browser-based login isn't possible (sandboxed VMs, CI runners, air-gapped networks), delegate authentication to an external binary or script. This is the recommended approach for enterprise deployments where your company runs its own auth infrastructure (SSO, device code flows, certificate auth, etc.).
 
-Grok is provider-agnostic — it doesn't know or care how your binary authenticates. It just runs the command, reads a token from stdout, and stores it. Your binary is a black box that handles the entire auth flow.
+Grok is provider-agnostic; it doesn't know or care how your binary authenticates. It just runs the command, reads a token from stdout, and stores it. Your binary is a black box that handles the entire auth flow.
 
 #### How It Works
 
@@ -178,7 +178,7 @@ This is the most important thing to get right:
 
 | Stream | What to print | Who sees it |
 |--------|---------------|-------------|
-| **stdout** | The token — nothing else | Grok (parsed and stored in `auth.json`) |
+| **stdout** | The token; nothing else | Grok (parsed and stored in `auth.json`) |
 | **stderr** | Login URLs, status messages, errors, progress | The user (displayed in their terminal) |
 
 **Do not print anything to stdout except the token.** No progress messages, no debug output, no "Login successful!" text. Grok reads stdout verbatim and tries to parse it as a token. Any extra text will break parsing.
@@ -187,12 +187,12 @@ This is the most important thing to get right:
 
 The token on stdout can be either:
 
-**1. Bare string** — just the raw token, nothing else:
+**1. Bare string**; just the raw token, nothing else:
 ```
 eyJhbGciOiJSUzI1NiIs...
 ```
 
-**2. JSON** — with optional refresh token and expiry:
+**2. JSON**; with optional refresh token and expiry:
 ```json
 {"access_token": "eyJhbGciOi...", "refresh_token": "ref-tok", "expires_in": 3600}
 ```
@@ -219,8 +219,8 @@ echo "eyJhbGciOiJSUzI1NiIs..."
 # ~/.grok/config.toml
 [auth]
 auth_provider_command = "/usr/local/bin/my-auth-provider"
-auth_provider_label = "Acme Corp"   # optional — customizes the TUI login button
-auth_token_ttl = 3600               # optional — token lifetime in seconds (see below)
+auth_provider_label = "Acme Corp"   # optional; customizes the TUI login button
+auth_token_ttl = 3600               # optional; token lifetime in seconds (see below)
 ```
 
 ```bash
@@ -234,7 +234,7 @@ If your binary outputs a bare token string (not JSON with `expires_in`), set `au
 
 The command is run via `sh -c`, so it can be a binary path, a shell script, or a pipeline.
 
-When `auth_provider_label` is set, the TUI welcome screen shows **"Login with Acme Corp"** instead of "Login with grok.com". In headless mode (`grok -p`), the label has no effect — stderr from your binary is printed directly to the terminal.
+When `auth_provider_label` is set, the TUI welcome screen shows **"Login with Acme Corp"** instead of "Login with grok.com". In headless mode (`grok -p`), the label has no effect; stderr from your binary is printed directly to the terminal.
 
 > **Enterprise setup:** For a complete enterprise `config.toml` combining external auth, corporate proxy, and telemetry settings, see [Enterprise Deployment](#enterprise-deployment) in the Configuration section.
 
@@ -248,7 +248,7 @@ CODE=$(echo "$RESP" | jq -r '.user_code')
 URL=$(echo "$RESP" | jq -r '.verification_uri')
 DEVICE_CODE=$(echo "$RESP" | jq -r '.device_code')
 
-# 2. Show login URL to user (stderr — user sees this in their terminal)
+# 2. Show login URL to user (stderr; user sees this in their terminal)
 echo "Open $URL and enter code: $CODE" >&2
 
 # 3. Poll until user approves
@@ -260,7 +260,7 @@ while true; do
   sleep 5
 done
 
-# 4. Print token to stdout — JSON format enables auto-refresh
+# 4. Print token to stdout. JSON format enables auto-refresh
 echo "{\"access_token\": \"$TOKEN\", \"expires_in\": 3600}"
 ```
 
@@ -271,11 +271,11 @@ When Grok needs to refresh an expired token, it re-runs your binary with `GROK_A
 ```bash
 #!/bin/sh
 if [ "$GROK_AUTH_EXPIRED" = "1" ]; then
-    # Token expired — attempt silent refresh (no user interaction)
+    # Token expired; attempt silent refresh (no user interaction)
     echo "Refreshing token..." >&2
     TOKEN=$(my-company-auth --refresh --silent)
 else
-    # First login — full interactive SSO flow
+    # First login; full interactive SSO flow
     echo "Authenticating via Acme Corp SSO..." >&2
     TOKEN=$(my-company-auth --login --interactive)
 fi
@@ -288,13 +288,13 @@ fi
 echo "{\"access_token\": \"$TOKEN\", \"expires_in\": 3600}"
 ```
 
-`GROK_AUTH_EXPIRED` is optional — if your binary ignores it, Grok still works. It just runs the same flow for both login and refresh.
+`GROK_AUTH_EXPIRED` is optional; if your binary ignores it, Grok still works. It just runs the same flow for both login and refresh.
 
 ### Automatic Credential Refresh
 
 Grok supports automatic credential refresh for external auth providers and OIDC. When Grok detects that your token is expired (either locally based on `expires_in`, or when the server returns a 401), it automatically re-runs your `auth_provider_command` to obtain new credentials before retrying the request.
 
-This is transparent — you don't need to do anything. Grok handles it in the background during your session.
+This is transparent; you don't need to do anything. Grok handles it in the background during your session.
 
 **When does refresh happen?**
 
@@ -311,8 +311,8 @@ export GROK_AUTH_EARLY_INVALIDATION_SECS=300
 ```
 
 **Keep in mind:**
-- When using `auth_provider_command`, you don't need to run `grok login` before starting — Grok runs your binary automatically on first launch. You _can_ run `grok login` to explicitly hydrate `auth.json` ahead of time if you prefer.
-- If both OIDC and `auth_provider_command` are configured: at **login** time, Grok tries OIDC silent refresh first (if a `refresh_token` exists), then the external binary, then browser-based login. During a **session**, whichever method is configured is used exclusively — if `auth_provider_command` is set it handles all mid-session refreshes; otherwise OIDC silent refresh is used.
+- When using `auth_provider_command`, you don't need to run `grok login` before starting. Grok runs your binary automatically on first launch. You _can_ run `grok login` to explicitly hydrate `auth.json` ahead of time if you prefer.
+- If both OIDC and `auth_provider_command` are configured: at **login** time, Grok tries OIDC silent refresh first (if a `refresh_token` exists), then the external binary, then browser-based login. During a **session**, whichever method is configured is used exclusively; if `auth_provider_command` is set it handles all mid-session refreshes; otherwise OIDC silent refresh is used.
 - Your binary's stderr output is displayed to the user but interactive stdin is not supported. This works well for browser-based SSO flows where the binary displays a URL and you complete authentication in the browser.
 
 #### Troubleshooting Auth
@@ -329,7 +329,7 @@ Common log messages:
 | Log message | What it means |
 |-------------|---------------|
 | `auth: running external auth provider` | Your binary is being called (includes the command and whether it's a refresh) |
-| `auth: external auth provider returned fresh token` | Success — token was parsed and stored |
+| `auth: external auth provider returned fresh token` | Success; token was parsed and stored |
 | `auth: external auth provider failed` | Binary exited non-zero, or exited 0 but stdout was empty/unparseable (the `error` field has details) |
 | `auth: external auth provider timed out (likely needs interactive auth), killing` | Binary didn't exit before the timeout (60s initial, 5s mid-session refresh) and was killed |
 | `auth: failed to start external auth provider` | The command couldn't be spawned (e.g. binary not found) |
@@ -470,8 +470,8 @@ Type `/` in the input to access commands:
 - **Inline diffs** showing file changes before they're applied
 - **Tool execution progress** with real-time output
 - **TODO panel** tracking task progress
-- **Session persistence** — conversations auto-save and can be resumed
-- **History search** — `Ctrl+R` to search previous prompts
+- **Session persistence**; conversations auto-save and can be resumed
+- **History search**; `Ctrl+R` to search previous prompts
 
 ### File References (`@`)
 
@@ -485,7 +485,7 @@ Use the `@` operator in your prompt to attach file contents to your message. Typ
 
 **Exposing hidden files with `!`**
 
-By default, the `@` file picker respects `.gitignore` rules and hides dotfiles (files and directories starting with `.`). To search hidden files — such as `.github/`, `.vscode/`, `.env`, or other dotfiles — prefix your query with `!`:
+By default, the `@` file picker respects `.gitignore` rules and hides dotfiles (files and directories starting with `.`). To search hidden files; such as `.github/`, `.vscode/`, `.env`, or other dotfiles - prefix your query with `!`:
 
 ```
 @!.github                 # Search for .github/ and other hidden files
@@ -501,10 +501,10 @@ The `!` modifier allows you to attach any file in the project regardless of igno
 
 Run Grok non-interactively from the command line. Use headless mode when you need to:
 
-- **Automate tasks** — CI/CD pipelines, pre-commit hooks, cron jobs
-- **Script workflows** — Batch process files, chain with other tools
-- **Build integrations** — Spawn as a sub-agent, embed in larger systems
-- **Parse output programmatically** — JSON output for downstream processing
+- **Automate tasks**. CI/CD pipelines, pre-commit hooks, cron jobs
+- **Script workflows**. Batch process files, chain with other tools
+- **Build integrations**. Spawn as a sub-agent, embed in larger systems
+- **Parse output programmatically**. JSON output for downstream processing
 
 Headless mode accepts a single prompt, executes it with full tool access, and returns the result.
 
@@ -580,7 +580,7 @@ grok -p "Fix this bug" --disallowed-tools "Agent"
 grok -p "Refactor this module" --disallowed-tools "Agent(explore)"
 ```
 
-When `--tools` is set, only the listed tools are available and default tool injection is disabled. When both flags are present, `--disallowed-tools` runs after `--tools` — use this to start from an allowlist and then remove specific entries.
+When `--tools` is set, only the listed tools are available and default tool injection is disabled. When both flags are present, `--disallowed-tools` runs after `--tools`; use this to start from an allowlist and then remove specific entries.
 
 > **Note:** `--tools`, `--disallowed-tools`, and `--max-turns` are only supported in headless mode (`-p`). If used in the interactive TUI, a warning is printed and the flag is ignored. `--reasoning-effort`/`--effort` and `--permission-mode` work in both modes.
 
@@ -667,13 +667,13 @@ This differs from `--resume`, which errors when the session doesn't exist.
 
 ### Output Formats
 
-**plain** (default) — Human-readable text:
+**plain** (default). Human-readable text:
 
 ```
 Here's a summary of the codebase...
 ```
 
-**json** — Single JSON object after completion:
+**json**. Single JSON object after completion:
 
 ```json
 {
@@ -684,7 +684,7 @@ Here's a summary of the codebase...
 }
 ```
 
-**streaming-json** — Newline-delimited JSON events:
+**streaming-json**. Newline-delimited JSON events:
 
 ```json
 {"type":"text","data":"Here's"}
@@ -1340,8 +1340,8 @@ Grok can connect to Language Server Protocol (LSP) servers configured in JSON fi
 
 LSP support is used in two ways:
 
-- **Passive diagnostics** — after edits, Grok can surface language-server diagnostics such as errors and warnings.
-- **The `lsp` tool** — Grok can actively query the language server for `goToDefinition`, `findReferences`, `hover`, `goToImplementation`, `documentSymbol`, and `workspaceSymbol`.
+- **Passive diagnostics**; after edits, Grok can surface language-server diagnostics such as errors and warnings.
+- **The `lsp` tool**. Grok can actively query the language server for `goToDefinition`, `findReferences`, `hover`, `goToImplementation`, `documentSymbol`, and `workspaceSymbol`.
 
 Reference: [Language Server Protocol](https://microsoft.github.io/language-server-protocol/)
 
@@ -1503,7 +1503,7 @@ Grok discovers skills from these directories (in priority order):
 | `~/.grok/skills/`           | User  | Lowest   |
 | `~/.claude/skills/`         | User  | Lowest   |
 
-Skills with the same name are deduplicated — higher priority locations override lower ones.
+Skills with the same name are deduplicated; higher priority locations override lower ones.
 
 Repo-scoped skills (Local and Repo) respect `.gitignore` and are filtered out if ignored. User-scoped skills (`~/.grok/skills/`) are outside the repo and never filtered.
 
@@ -1552,7 +1552,7 @@ Review staged changes and create a commit with a clear, conventional message.
 | Field         | Description                                                                  |
 | ------------- | ---------------------------------------------------------------------------- |
 | `name`        | Skill identifier (lowercase, hyphens, max 64 chars)                          |
-| `description` | What the skill does and when to use it—this is how Grok decides to invoke it |
+| `description` | What the skill does and when to use it-this is how Grok decides to invoke it |
 
 ### Using Skills
 
@@ -1569,7 +1569,7 @@ Review staged changes and create a commit with a clear, conventional message.
 
 Users can reference skills as `/skill-name` (e.g., `/commit`). When you see this pattern, Grok invokes the corresponding skill.
 
-> **Tip:** The `description` field is critical — it determines when Grok automatically invokes the skill. Be specific about trigger phrases and use cases.
+> **Tip:** The `description` field is critical; it determines when Grok automatically invokes the skill. Be specific about trigger phrases and use cases.
 
 ---
 
@@ -1621,7 +1621,7 @@ Disable specific subagent types while keeping the system enabled, or route them 
 
 ```toml
 [subagents.toggle]
-explore = true                       # default — omitted agents are enabled
+explore = true                       # default; omitted agents are enabled
 plan = false                         # disable plan subagent
 
 [subagents.models]
@@ -1736,9 +1736,9 @@ api_key = "sk-custom"
 **How it works:** When you override a built-in model, Grok starts with the default configuration (including the correct `base_url` from your `[endpoints]` setting), then applies only the fields you specify. Unspecified fields inherit from the default.
 
 **Priority order:**
-1. Your config (`[model.*]`) — highest priority
+1. Your config (`[model.*]`); highest priority
 2. Prefetched models from remote `/v1/models`
-3. Hardcoded defaults — lowest priority
+3. Hardcoded defaults; lowest priority
 
 **Web search model:** Set `[models] web_search`, `GROK_WEB_SEARCH_MODEL`, or `--web-search-model` to point the `web_search` tool at a different model. The target endpoint must support the Responses API and web search.
 
@@ -1753,22 +1753,22 @@ api_key = "sk-custom"
 >
 > [model.my-custom-model]              # 2. tell Grok how to reach it
 > model = "my-custom-model"
-> api_backend = "responses"            # required — web search uses the Responses API
-> # base_url, api_key, env_key optional — defaults to cli-chat-proxy
+> api_backend = "responses"            # required; web search uses the Responses API
+> # base_url, api_key, env_key optional; defaults to cli-chat-proxy
 > ```
 
-### OpenRouter (Grok 4.5) — Grok OSS
+### OpenRouter (Grok 4.5). Grok OSS
 
 OpenRouter is a **Grok OSS** fork feature: a **separate model option**
 (`openrouter-grok-4.5`). It does not replace the native Grok Build model and is
 not a source for models OpenRouter does not host (e.g. Composer-class models).
 
-**Authenticate** — resolution order:
+**Authenticate**; resolution order:
 
 1. `OPENROUTER_API_KEY` (portable; shared with Zed and other tools)
 2. `OPENROUTER_API_KEYS` (optional extra keys for multi-account failover)
 3. Grok OSS secret store (OS keyring service `grok-build`, or `~/.grok/provider_credentials.json`)
-4. **Read-only** shared harness probes — including keys already saved in **Zed**:
+4. **Read-only** shared harness probes; including keys already saved in **Zed**:
    - Dev channel: `~/.config/zed/development_credentials` (or `%APPDATA%\Zed\…`)
    - OS store: Zed’s Secret Service / Keychain / Credential Manager layout  
      (Linux label `zed-github-account` + `url` attribute; Windows target `zed:url=…`)
@@ -1827,6 +1827,42 @@ default = "openrouter-grok-4.5"
 ```
 
 Credentials are never written to `config.toml`. Keys are keyed by API URL (`https://openrouter.ai/api/v1`).
+
+### Routstr (Grok 4.5, Bitcoin/Lightning). Grok OSS
+
+Routstr is a **separate** catalog entry (`routstr-grok-4.5`) for paying Grok 4.5
+inference with **Bitcoin / Lightning / Cashu (Chaumian eCash)** via
+`https://api.routstr.com/v1`. It does **not** replace the product default model.
+
+**Authenticate** (hot `sk-` / Cashu bearer only; never BIP-39 here):
+
+1. `ROUTSTR_API_KEY` (optional comma-list)
+2. `ROUTSTR_API_KEYS` (extra failover keys)
+3. Grok OSS secret store for `https://api.routstr.com/v1`
+
+```bash
+export ROUTSTR_API_KEY="sk-..."
+# or:
+grok-oss login --routstr
+grok-oss login --routstr --api-key "sk-..."
+grok-oss logout --routstr
+```
+
+**Toggle:** `[features] routstr_enabled = false` omits the catalog entry
+(default **on**). Local wallet/seed work lives in crate `grok-bitcoin-wallet`
+(see `docs/bitcoin-routstr/` and repo `RESIDUAL.md`).
+
+```bash
+cargo test -p xai-grok-shell --lib routstr
+cargo test -p grok-bitcoin-wallet
+./scripts/bitcoin-routstr-validate.sh
+```
+
+```bash
+grok -p "Hello" -m routstr-grok-4.5
+# In the TUI:
+/model routstr-grok-4.5
+```
 
 ### Examples
 
@@ -1922,9 +1958,9 @@ models_base_url = "https://api.acme.com/v1"
 api_key = "my-api-key"
 ```
 
-When using `[endpoints]` with partial model overrides, the `base_url` is inherited from the endpoints config — you don't need to specify it in each `[model.*]` section.
+When using `[endpoints]` with partial model overrides, the `base_url` is inherited from the endpoints config; you don't need to specify it in each `[model.*]` section.
 
-**Auth behavior:** When `models_base_url` is set, Grok uses API key auth (`Authorization: Bearer`) instead of session auth. `grok login` is not required — only the API key.
+**Auth behavior:** When `models_base_url` is set, Grok uses API key auth (`Authorization: Bearer`) instead of session auth. `grok login` is not required; only the API key.
 
 ---
 
@@ -1958,7 +1994,7 @@ MCP servers can also be configured per-project in `.grok/config.toml`. Grok walk
 | `<repo-root>/.grok/config.toml` | This repository   | ↑        |
 | `<cwd>/.grok/config.toml`       | Current directory | Highest  |
 
-If a project defines a server with the same name as a global one, the project version **replaces** it entirely (fields are not merged — omitted fields get defaults, not the global values). Servers defined only in the global config are unaffected.
+If a project defines a server with the same name as a global one, the project version **replaces** it entirely (fields are not merged; omitted fields get defaults, not the global values). Servers defined only in the global config are unaffected.
 
 **Example:** commit a `.grok/config.toml` in your repo to share MCP servers across the team:
 
@@ -2054,9 +2090,9 @@ Cross-session memory lets Grok remember facts, decisions, code patterns, and deb
 ### How it works
 
 Memory is stored as Markdown files under `~/.grok/memory/`:
-- **Global** (`~/.grok/memory/MEMORY.md`) — facts that apply across all your projects
-- **Workspace** (`~/.grok/memory/<project-slug>-<hash8>/MEMORY.md`) — project-specific conventions and context
-- **Session logs** (`~/.grok/memory/<project-slug>-<hash8>/sessions/`) — per-session summaries
+- **Global** (`~/.grok/memory/MEMORY.md`); facts that apply across all your projects
+- **Workspace** (`~/.grok/memory/<project-slug>-<hash8>/MEMORY.md`); project-specific conventions and context
+- **Session logs** (`~/.grok/memory/<project-slug>-<hash8>/sessions/`); per-session summaries
 
 Workspace directories are suffixed with a short hash for uniqueness (e.g. `xai-a3f7b2c9/`). The hash is derived from the git remote URL so all clones and worktrees of the same repository share the same memory directory.
 
@@ -2082,12 +2118,12 @@ enabled = true
 
 At the end of each session, Grok saves a **structured metadata summary** to the daily session log:
 - Message counts (user / assistant / tool)
-- Topics — the first few real user prompts from the session
+- Topics; the first few real user prompts from the session
 - Tool-usage breakdown (e.g., `read_file: 4, search_replace: 3`)
 - File paths that were read or edited
 - Date and session ID
 
-Shell commands are intentionally **not** recorded in automatic saves — command
+Shell commands are intentionally **not** recorded in automatic saves; command
 strings often embed secrets (tokens, API keys, DSNs) and auto-save runs silently.
 For command history, use `/flush`, which is user-initiated and produces an
 LLM-generated summary rather than raw verbatim output.
@@ -2096,7 +2132,7 @@ This summary is searchable in future sessions but does **not** capture full cont
 
 ### Capturing rich knowledge with `/flush`
 
-For richer capture — decisions, patterns, debugging workflows, API discoveries — use `/flush` in the TUI. This triggers an LLM-generated summary of the current session's most important content and writes it to a dated session log under `~/.grok/memory/<project-slug>-<hash8>/sessions/`, where it is indexed and searchable in future sessions.
+For richer capture; decisions, patterns, debugging workflows, API discoveries - use `/flush` in the TUI. This triggers an LLM-generated summary of the current session's most important content and writes it to a dated session log under `~/.grok/memory/<project-slug>-<hash8>/sessions/`, where it is indexed and searchable in future sessions.
 
 Use `/flush` when you want to preserve important context before compaction or at any point during a productive session.
 
@@ -2224,14 +2260,14 @@ grok --sandbox devbox
 ### How It Works
 
 The sandbox is applied to the **entire grok process** at startup using kernel
-primitives — not per-command wrapping. This means all tool operations are
+primitives; not per-command wrapping. This means all tool operations are
 covered:
 
-- `read_file`, `search_replace`, `list_dir` — restricted by Landlock/Seatbelt in-process
-- `bash` commands, `grep` (rg) — child processes inherit FS restrictions automatically
-- Network — child processes can be blocked via seccomp (Linux)
+- `read_file`, `search_replace`, `list_dir`; restricted by Landlock/Seatbelt in-process
+- `bash` commands, `grep` (rg); child processes inherit FS restrictions automatically
+- Network; child processes can be blocked via seccomp (Linux)
 
-The sandbox is **irreversible** once applied. This is a security feature — the
+The sandbox is **irreversible** once applied. This is a security feature; the
 model cannot convince the agent to relax restrictions at runtime.
 
 ### Current Limitations
@@ -2265,14 +2301,14 @@ grok inspect --json   # machine-readable JSON
 
 The output shows all loaded configuration organized by type:
 
-- **Project Instructions** — AGENTS.md / CLAUDE.md files with token counts
-- **Skills** — from `.grok/skills/`, `~/.grok/skills/`, plugins, and config paths
-- **Agents** — built-in, user-defined, and plugin-provided subagents
-- **Plugins** — discovered plugins with what each provides (skills, agents, hooks, MCPs)
-- **MCP Servers** — from `config.toml`, plugins, `~/.claude.json`, and `.mcp.json`
-- **LSP Servers** — language servers from `lsp.json` and plugins
-- **Hooks** — project and plugin hooks
-- **Permissions, Config Sources** — which config files are active
+- **Project Instructions**. AGENTS.md / CLAUDE.md files with token counts
+- **Skills**; from `.grok/skills/`, `~/.grok/skills/`, plugins, and config paths
+- **Agents**; built-in, user-defined, and plugin-provided subagents
+- **Plugins**; discovered plugins with what each provides (skills, agents, hooks, MCPs)
+- **MCP Servers**; from `config.toml`, plugins, `~/.claude.json`, and `.mcp.json`
+- **LSP Servers**; language servers from `lsp.json` and plugins
+- **Hooks**; project and plugin hooks
+- **Permissions, Config Sources**; which config files are active
 
 Plugin-provided components appear in their respective sections with a `[plugin: name]` tag, so you can see at a glance where each skill, MCP server, or agent originates.
 
@@ -2344,7 +2380,7 @@ disallowedTools:
 
 ### `web_fetch`
 
-Fetch a specific URL and return its content as markdown. **Disabled by default** — enable with `GROK_WEB_FETCH=1`. 
+Fetch a specific URL and return its content as markdown. **Disabled by default**; enable with `GROK_WEB_FETCH=1`. 
 
 When no custom `allowed_domains` is set, the tool permits a default allowlist of useful documentation sites (SpaceXAI, language docs, frameworks, cloud providers, databases, etc.). Domains not on the allowlist prompt the user for approval; `--always-approve` auto-approves all. Domain matching is case-insensitive, strips `www.` prefixes, and supports path-scoped entries (e.g. `x.ai/company`).
 
@@ -2371,7 +2407,7 @@ Sessions are stored under `~/.grok/sessions/`, organized by URL-encoded working 
   subagents/              # child session directories (when subagents are enabled)
 ```
 
-`summary.json` is the index entry — it contains the session title, model ID, creation/update timestamps, and parent session reference (for restored sessions). `updates.jsonl` is the authoritative conversation log that drives `/load` and session restore.
+`summary.json` is the index entry; it contains the session title, model ID, creation/update timestamps, and parent session reference (for restored sessions). `updates.jsonl` is the authoritative conversation log that drives `/load` and session restore.
 
 ### TUI
 
@@ -2487,7 +2523,7 @@ The agent persists all session updates automatically. Clients can reconnect and 
 
 Generate completions for your shell and install them to enable tab completion for `grok` commands and flags.
 
-**Note:** The paths below are recommended defaults. Some environments do not automatically source the standard locations — you may need to adapt them to your shell framework or distro conventions.
+**Note:** The paths below are recommended defaults. Some environments do not automatically source the standard locations; you may need to adapt them to your shell framework or distro conventions.
 
 ### Bash
 
@@ -2547,7 +2583,7 @@ compinit
 
 ### After Upgrading
 
-Regenerate completions after upgrading `grok` — the script reflects the CLI of the installed version.
+Regenerate completions after upgrading `grok`; the script reflects the CLI of the installed version.
 
 ---
 
@@ -2555,7 +2591,7 @@ Regenerate completions after upgrading `grok` — the script reflects the CLI of
 
 ### Debug logging
 
-Write logs to a file for debugging. The TUI captures stderr, so `RUST_LOG` alone won't produce visible output in production — use `grok --debug` or `GROK_LOG_FILE` instead:
+Write logs to a file for debugging. The TUI captures stderr, so `RUST_LOG` alone won't produce visible output in production; use `grok --debug` or `GROK_LOG_FILE` instead:
 
 ```bash
 # Per-session debug log (~/.grok/debug/<sessionId>.txt)
@@ -2581,7 +2617,7 @@ GROK_LOG_FILE=/tmp/grok-debug.log RUST_LOG="info,xai_grok_shell::auth=debug" gro
 # Clear credentials and re-login
 grok login
 
-# Debug auth issues — check the log for "auth:" entries
+# Debug auth issues; check the log for "auth:" entries
 grok --debug-file /tmp/grok-auth.log -p "hello"
 grep "auth:" /tmp/grok-auth.log
 ```

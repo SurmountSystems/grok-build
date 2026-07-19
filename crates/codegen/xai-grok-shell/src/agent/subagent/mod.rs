@@ -922,7 +922,13 @@ async fn read_parent_sampling_config(
                 .unwrap_or_default();
             let inherited = xai_grok_sampler::SamplerConfig {
                 api_key: creds.api_key,
-                failover_api_keys: Vec::new(),
+                // Inherit parent multi-key and cross-provider failover so a
+                // child does not dead-end on OpenRouter 402 when Grok API
+                // credentials remain on the parent.
+                failover_api_keys: creds.failover_api_keys,
+                failover_providers: crate::agent::config::failover_providers_from_chat_state(
+                    &creds.failover_providers,
+                ),
                 base_url: cfg.base_url,
                 model: cfg.model.clone(),
                 max_completion_tokens: cfg.max_completion_tokens,

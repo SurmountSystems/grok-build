@@ -392,7 +392,7 @@ pub fn is_context_length_error(message: &str) -> bool {
         || m.contains("context_length_exceeded")
 }
 
-/// Credit / spending-limit wording shared by xAI Build, OpenRouter, and proxies.
+/// Credit / spending-limit wording shared by xAI Build, OpenRouter, Routstr, and proxies.
 pub fn is_credit_exhausted_message(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     m.contains("out of credits")
@@ -403,10 +403,13 @@ pub fn is_credit_exhausted_message(message: &str) -> bool {
         || m.contains("usage limit reached")
         || m.contains("insufficient credits")
         || m.contains("insufficient_quota")
+        || m.contains("insufficient balance")
         || m.contains("payment required")
         || m.contains("credit balance is too low")
         || m.contains("exceeded your current quota")
         || m.contains("add credits")
+        || m.contains("top up")
+        || m.contains("top-up")
 }
 
 fn is_credit_exhausted_status_and_message(status: u16, message: &str) -> bool {
@@ -667,6 +670,18 @@ mod tests {
             should_retry: None,
         };
         assert!(build.is_credit_exhausted());
+
+        let routstr = SamplingError::Api {
+            status: StatusCode::PAYMENT_REQUIRED,
+            message: "insufficient balance, top up with Lightning or Cashu".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        };
+        assert!(
+            routstr.is_credit_exhausted(),
+            "Routstr 402 / balance wording must classify as credit exhausted"
+        );
 
         let plain_403 = SamplingError::Api {
             status: StatusCode::FORBIDDEN,

@@ -170,6 +170,18 @@ jsonschema = "0.30.0"
 # OS credential store (v4 `v1` API). Defaults use secret-service 5 → zbus 5
 # on Linux (keyring 3 pulled secret-service 4 → zbus 4).
 keyring = "4"
+# Bitcoin-native Routstr wallet stack (grok-bitcoin-wallet)
+grok-bitcoin-wallet = { path = "crates/codegen/grok-bitcoin-wallet" }
+bip39 = { version = "2.1", default-features = true, features = ["rand"] }
+getrandom = "0.2"
+zeroize = { version = "1", features = ["derive"] }
+secrecy = "0.10"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hex = "0.4"
+bitcoin = { version = "0.32", default-features = false, features = ["std", "secp-recovery"] }
+qrcode = { version = "0.14", default-features = false }
+nostr = { version = "0.39", default-features = false, features = ["std", "nip06"] }
 libc = "0.2"
 linkify = "0.10"
 lipsum = "0.9"

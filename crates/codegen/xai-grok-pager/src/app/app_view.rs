@@ -667,6 +667,9 @@ pub struct AppView {
     /// OpenRouter account credits (when an OR key is configured). Shown in the
     /// prompt footer when the active model is OpenRouter-backed.
     pub openrouter_credit_balance: Option<crate::views::credit_bar::OpenRouterCreditBalance>,
+    /// Routstr account balance in msats (when a Routstr key is configured).
+    /// Shown in the prompt footer when the active model is Routstr-backed.
+    pub routstr_credit_balance: Option<crate::views::credit_bar::RoutstrCreditBalance>,
     /// Periodic billing poll requested (credits >= 99%).
     pub billing_poll_wanted: bool,
     /// Leader-mode session roster (FleetView dashboard). Populated from
@@ -1353,6 +1356,7 @@ impl AppView {
             credit_balance: None,
             auto_topup: None,
             openrouter_credit_balance: None,
+            routstr_credit_balance: None,
             billing_poll_wanted: false,
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),
@@ -5315,6 +5319,7 @@ pub(crate) mod tests {
             credit_balance: None,
             auto_topup: None,
             openrouter_credit_balance: None,
+            routstr_credit_balance: None,
             billing_poll_wanted: false,
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),

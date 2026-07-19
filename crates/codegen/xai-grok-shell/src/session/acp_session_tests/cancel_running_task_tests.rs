@@ -41,6 +41,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
             let sampling_client = crate::sampling::Client::new(xai_grok_sampler::SamplerConfig {
                 api_key: Some("test-key".to_string()),
                 failover_api_keys: Vec::new(),
+                failover_providers: Vec::new(),
                 base_url: "http://localhost".to_string(),
                 model: "test".to_string(),
                 max_completion_tokens: None,
@@ -342,6 +343,7 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
             let sampling_client = crate::sampling::Client::new(xai_grok_sampler::SamplerConfig {
                 api_key: Some("test-key".to_string()),
                 failover_api_keys: Vec::new(),
+                failover_providers: Vec::new(),
                 base_url: "http://localhost".to_string(),
                 model: "test-model".to_string(),
                 max_completion_tokens: None,
@@ -477,6 +479,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
             let sampling_client = crate::sampling::Client::new(xai_grok_sampler::SamplerConfig {
                 api_key: Some("test-key".to_string()),
                 failover_api_keys: Vec::new(),
+                failover_providers: Vec::new(),
                 base_url: "http://localhost".to_string(),
                 model: "test-model".to_string(),
                 max_completion_tokens: None,
@@ -1802,6 +1805,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
             let cfg = xai_grok_sampler::SamplerConfig {
                 api_key: Some("test-key".to_string()),
                 failover_api_keys: Vec::new(),
+                failover_providers: Vec::new(),
                 base_url: format!("http://{addr}/v1"),
                 model: "test-model".to_string(),
                 max_completion_tokens: None,

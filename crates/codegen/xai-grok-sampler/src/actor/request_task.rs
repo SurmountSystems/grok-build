@@ -365,6 +365,57 @@ fn try_rotate_to_failover_key(config: &mut SamplerConfig, client: &mut SamplingC
     // Live resolvers would re-inject the exhausted primary; clear so the
     // rotated key is what goes on the wire.
     config.bearer_resolver = None;
+    rebuild_client_after_failover(config, client)
+}
+
+/// Pop the next cross-provider endpoint (different host/model/key) and rebuild.
+///
+/// Used after same-host keys are exhausted, e.g. OpenRouter 402 → xAI Grok API.
+fn try_rotate_to_failover_provider(
+    config: &mut SamplerConfig,
+    client: &mut SamplingClient,
+) -> bool {
+    // Drop blank / same-as-active entries.
+    let active_key = config.api_key.as_deref().unwrap_or("").trim().to_owned();
+    let active_url = config.base_url.trim().to_owned();
+    config.failover_providers.retain(|p| {
+        let k = p.api_key.trim();
+        let u = p.base_url.trim();
+        !(k.is_empty()
+            || u.is_empty()
+            || (k == active_key && u.eq_ignore_ascii_case(&active_url)))
+    });
+    let Some(next) = config.failover_providers.first().cloned() else {
+        return false;
+    };
+    config.failover_providers.remove(0);
+    // Same-host keys belonged to the exhausted provider; clear them.
+    config.failover_api_keys.clear();
+    let prev_fp = fingerprint_secret(&active_key);
+    let next_fp = fingerprint_secret(&next.api_key);
+    tracing::info!(
+        target: crate::sampling_log::TARGET,
+        from_key = %prev_fp,
+        from_base = %config.base_url,
+        from_model = %config.model,
+        to_key = %next_fp,
+        to_base = %next.base_url,
+        to_model = %next.model,
+        remaining_providers = config.failover_providers.len(),
+        "credit exhausted on active provider; failing over to next provider"
+    );
+    config.api_key = Some(next.api_key);
+    config.base_url = next.base_url;
+    config.model = next.model;
+    config.auth_scheme = next.auth_scheme;
+    config.bearer_resolver = None;
+    rebuild_client_after_failover(config, client)
+}
+
+fn rebuild_client_after_failover(
+    config: &mut SamplerConfig,
+    client: &mut SamplingClient,
+) -> bool {
     match SamplingClient::new(config.clone()) {
         Ok(fresh) => {
             *client = fresh;
@@ -373,7 +424,7 @@ fn try_rotate_to_failover_key(config: &mut SamplerConfig, client: &mut SamplingC
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "failed to rebuild sampling client after key failover"
+                "failed to rebuild sampling client after credit failover"
             );
             false
         }
@@ -398,10 +449,14 @@ async fn apply_retry_decision(
     config: &mut SamplerConfig,
     completion_tx: &mut Option<oneshot::Sender<CompletionResult>>,
 ) -> bool {
-    // Credit exhaustion is fatal for one account but not for the request if
-    // another key with balance is configured. Rotate before classify so we
-    // do not surface a billing failure while failover keys remain.
-    if err.is_credit_exhausted() && try_rotate_to_failover_key(config, client) {
+    // Credit exhaustion is fatal for one account/provider but not for the
+    // request if another key (same host) or provider (e.g. OpenRouter → xAI)
+    // still has balance. Rotate before classify so we do not surface a
+    // billing failure while failover remains.
+    if err.is_credit_exhausted()
+        && (try_rotate_to_failover_key(config, client)
+            || try_rotate_to_failover_provider(config, client))
+    {
         *retry_count += 1;
         emit_retrying(event_tx, request_id, *retry_count, max_retries, err, config);
         return true;
@@ -991,6 +1046,7 @@ mod tests {
         let mut config = SamplerConfig {
             api_key: Some("key-a".into()),
             failover_api_keys: vec!["key-a".into(), "key-b".into(), "key-c".into()],
+            failover_providers: Vec::new(),
             base_url: "https://openrouter.ai/api/v1".into(),
             model: "x-ai/grok-4.5".into(),
             ..Default::default()
@@ -1011,12 +1067,50 @@ mod tests {
         let mut config = SamplerConfig {
             api_key: Some("only".into()),
             failover_api_keys: vec![],
+            failover_providers: Vec::new(),
             base_url: "https://openrouter.ai/api/v1".into(),
             model: "x-ai/grok-4.5".into(),
             ..Default::default()
         };
         let mut client = SamplingClient::new(config.clone()).expect("client");
         assert!(!try_rotate_to_failover_key(&mut config, &mut client));
+        assert!(!try_rotate_to_failover_provider(&mut config, &mut client));
         assert_eq!(config.api_key.as_deref(), Some("only"));
+    }
+
+    #[test]
+    fn rotate_failover_provider_switches_host_model_and_key() {
+        use crate::config::FailoverProvider;
+
+        let mut config = SamplerConfig {
+            api_key: Some("or-key".into()),
+            failover_api_keys: vec!["or-key-2".into()],
+            failover_providers: vec![FailoverProvider {
+                api_key: "xai-key".into(),
+                base_url: "https://api.x.ai/v1".into(),
+                model: "grok-4.5".into(),
+                auth_scheme: Default::default(),
+            }],
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model: "x-ai/grok-4.5".into(),
+            ..Default::default()
+        };
+        let mut client = SamplingClient::new(config.clone()).expect("client");
+
+        // Same-host key first.
+        assert!(try_rotate_to_failover_key(&mut config, &mut client));
+        assert_eq!(config.api_key.as_deref(), Some("or-key-2"));
+        assert_eq!(config.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(config.model, "x-ai/grok-4.5");
+
+        // Then cross-provider (OpenRouter → Grok API).
+        assert!(!try_rotate_to_failover_key(&mut config, &mut client));
+        assert!(try_rotate_to_failover_provider(&mut config, &mut client));
+        assert_eq!(config.api_key.as_deref(), Some("xai-key"));
+        assert_eq!(config.base_url, "https://api.x.ai/v1");
+        assert_eq!(config.model, "grok-4.5");
+        assert!(config.failover_api_keys.is_empty());
+        assert!(config.failover_providers.is_empty());
+        assert!(!try_rotate_to_failover_provider(&mut config, &mut client));
     }
 }

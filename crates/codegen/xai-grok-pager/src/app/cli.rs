@@ -20,8 +20,11 @@ pub enum Command {
     /// Sign out and clear cached credentials
     Logout {
         /// Clear only the stored OpenRouter API key (not xAI session auth).
-        #[arg(long = "openrouter")]
+        #[arg(long = "openrouter", conflicts_with = "routstr")]
         openrouter: bool,
+        /// Clear only the stored Routstr API key (not xAI session auth).
+        #[arg(long = "routstr", conflicts_with = "openrouter")]
+        routstr: bool,
     },
     /// Sign in to Grok
     Login {
@@ -29,13 +32,13 @@ pub enum Command {
         #[arg(long, hide = true)]
         legacy: bool,
         /// Use Grok OAuth via auth.x.ai.
-        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth", "openrouter"])]
+        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth", "openrouter", "routstr"])]
         oauth: bool,
         /// Use device-code authentication for headless/remote environments.
         #[arg(
             long = "device-auth",
             visible_alias = "device-code",
-            conflicts_with_all = ["oauth", "openrouter"]
+            conflicts_with_all = ["oauth", "openrouter", "routstr"]
         )]
         device_auth: bool,
         /// Store an OpenRouter API key (for Grok 4.5 via OpenRouter).
@@ -43,10 +46,16 @@ pub enum Command {
         /// Keys go to the OS secret store (or `$GROK_HOME/provider_credentials.json`
         /// when the keyring is unavailable). Prefer `OPENROUTER_API_KEY` env over
         /// storing a key. Does not replace xAI login.
-        #[arg(long = "openrouter", conflicts_with_all = ["oauth", "device_auth"])]
+        #[arg(long = "openrouter", conflicts_with_all = ["oauth", "device_auth", "routstr"])]
         openrouter: bool,
-        /// OpenRouter API key (with `--openrouter`). If omitted, prompts on stdin.
-        #[arg(long = "api-key", requires = "openrouter")]
+        /// Store a Routstr API key (for Grok 4.5 via Bitcoin/Lightning/Cashu).
+        ///
+        /// Hot `sk-` / Cashu bearer only; never BIP-39. Prefer `ROUTSTR_API_KEY`
+        /// env over storing a key. Does not replace xAI login.
+        #[arg(long = "routstr", conflicts_with_all = ["oauth", "device_auth", "openrouter"])]
+        routstr: bool,
+        /// API key with `--openrouter` or `--routstr`. If omitted, prompts on stdin.
+        #[arg(long = "api-key")]
         api_key: Option<String>,
         /// Authenticate for remote development environments (hidden).
         ///
@@ -154,6 +163,32 @@ See ~/.grok/README.md for more information.
     /// `~/.grok/config.toml` or when the `GROK_AGENT_DASHBOARD=0` env
     /// var is set.
     Dashboard,
+    /// Routstr balance, top up, refund, and local funding helpers
+    Routstr(RoutstrArgs),
+}
+
+/// Arguments for `grok routstr …`.
+#[derive(Debug, clap::Args, Clone)]
+pub struct RoutstrArgs {
+    #[command(subcommand)]
+    pub command: RoutstrCommand,
+}
+
+/// Subcommands under `grok routstr`.
+#[derive(Debug, Subcommand, Clone)]
+pub enum RoutstrCommand {
+    /// Show remaining Routstr prepaid balance (requires API key)
+    Balance,
+    /// Guide top up of Routstr prepaid float (Lightning/Cashu; partial until CDK/LN)
+    Topup {
+        /// Optional amount in sats for guidance copy
+        #[arg(long)]
+        sats: Option<u64>,
+    },
+    /// Guide refund of unused Routstr float back toward Cashu (stub until CDK)
+    Refund,
+    /// Create or unlock local wallet, confirm BIP-39 backup, show receive address
+    Fund,
 }
 /// Arguments for the `wrap` subcommand: the command to run, then its args.
 #[derive(Debug, clap::Args, Clone)]
@@ -1177,7 +1212,10 @@ mod tests {
         let args = PagerArgs::try_parse_from(["grok", "logout"]).expect("subcommand parses");
         assert!(matches!(
             args.command,
-            Some(Command::Logout { openrouter: false })
+            Some(Command::Logout {
+                openrouter: false,
+                routstr: false
+            })
         ));
         assert!(args.prompt.is_none());
     }
@@ -1190,9 +1228,31 @@ mod tests {
         match args.command {
             Some(Command::Login {
                 openrouter: true,
+                routstr: false,
                 api_key: Some(key),
                 ..
             }) => assert_eq!(key, "sk-or-test"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn login_routstr_parses_api_key() {
+        let args = PagerArgs::try_parse_from([
+            "grok",
+            "login",
+            "--routstr",
+            "--api-key",
+            "sk-routstr-test",
+        ])
+        .expect("login --routstr parses");
+        match args.command {
+            Some(Command::Login {
+                openrouter: false,
+                routstr: true,
+                api_key: Some(key),
+                ..
+            }) => assert_eq!(key, "sk-routstr-test"),
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -1203,7 +1263,67 @@ mod tests {
             .expect("logout --openrouter parses");
         assert!(matches!(
             args.command,
-            Some(Command::Logout { openrouter: true })
+            Some(Command::Logout {
+                openrouter: true,
+                routstr: false
+            })
+        ));
+    }
+
+    #[test]
+    fn logout_routstr_parses() {
+        let args = PagerArgs::try_parse_from(["grok", "logout", "--routstr"])
+            .expect("logout --routstr parses");
+        assert!(matches!(
+            args.command,
+            Some(Command::Logout {
+                openrouter: false,
+                routstr: true
+            })
+        ));
+    }
+
+    #[test]
+    fn routstr_balance_parses() {
+        let args = PagerArgs::try_parse_from(["grok", "routstr", "balance"])
+            .expect("routstr balance parses");
+        assert!(matches!(
+            args.command,
+            Some(Command::Routstr(RoutstrArgs {
+                command: RoutstrCommand::Balance
+            }))
+        ));
+    }
+
+    #[test]
+    fn routstr_topup_parses_sats() {
+        let args = PagerArgs::try_parse_from(["grok", "routstr", "topup", "--sats", "21000"])
+            .expect("routstr topup parses");
+        match args.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command: RoutstrCommand::Topup { sats: Some(21_000) },
+            })) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routstr_refund_and_fund_parse() {
+        let refund = PagerArgs::try_parse_from(["grok", "routstr", "refund"])
+            .expect("routstr refund parses");
+        assert!(matches!(
+            refund.command,
+            Some(Command::Routstr(RoutstrArgs {
+                command: RoutstrCommand::Refund
+            }))
+        ));
+        let fund =
+            PagerArgs::try_parse_from(["grok", "routstr", "fund"]).expect("routstr fund parses");
+        assert!(matches!(
+            fund.command,
+            Some(Command::Routstr(RoutstrArgs {
+                command: RoutstrCommand::Fund
+            }))
         ));
     }
     #[test]

@@ -347,6 +347,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
             app.credit_balance.clone(),
             app.auto_topup.clone(),
             app.openrouter_credit_balance,
+            app.routstr_credit_balance,
         );
         agent
             .prompt
@@ -367,6 +368,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
                 app.credit_balance.clone(),
                 app.auto_topup.clone(),
                 app.openrouter_credit_balance,
+                app.routstr_credit_balance,
             );
             agent.mcp_init_progress = Some(McpInitProgress {
                 total: 0,
@@ -695,6 +697,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             app.credit_balance.clone(),
             app.auto_topup.clone(),
             app.openrouter_credit_balance,
+            app.routstr_credit_balance,
         );
         agent
             .prompt
@@ -788,6 +791,7 @@ pub(in crate::app::dispatch) fn skip_picker_and_create_session(
             app.credit_balance.clone(),
             app.auto_topup.clone(),
             app.openrouter_credit_balance,
+            app.routstr_credit_balance,
         );
         agent.mcp_init_progress = Some(McpInitProgress {
             total: 0,

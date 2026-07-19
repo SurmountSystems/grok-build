@@ -332,7 +332,9 @@ pub(super) async fn run_session(
             ::agent::config::try_resolve_model_credentials(model_name.as_str(), existing
             .api_key.as_deref()) { session.chat_state_handle
             .update_credentials(xai_chat_state::Credentials { api_key : r.api_key,
-            failover_api_keys : r.failover_api_keys, auth_type : r.auth_type,
+            failover_api_keys : r.failover_api_keys,
+            failover_providers : crate::agent::config::failover_providers_to_chat_state(
+            & r.failover_providers), auth_type : r.auth_type,
             alpha_test_key : existing.alpha_test_key,
             client_version : existing.client_version, }); } session.model_auth_facts
             .replace(None); } } SessionCommand::GetCurrentModel { responds_to } => { let

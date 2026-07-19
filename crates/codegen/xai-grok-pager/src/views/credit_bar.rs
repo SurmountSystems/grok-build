@@ -45,6 +45,67 @@ pub struct OpenRouterCreditBalance {
     pub balance_cents: i64,
 }
 
+/// Routstr account balance remaining (millisatoshis), from `GET /v1/balance/info`.
+///
+/// Separate from xAI / OpenRouter balances so a Routstr-active model shows
+/// sats/msats without clobbering other provider state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutstrCreditBalance {
+    /// Remaining balance in millisatoshis.
+    pub balance_msats: u64,
+}
+
+impl RoutstrCreditBalance {
+    /// Whole satoshis (msats / 1000).
+    pub fn sats(&self) -> u64 {
+        self.balance_msats / 1000
+    }
+
+    /// Residual msats after whole sats (0..999).
+    pub fn msats_remainder(&self) -> u64 {
+        self.balance_msats % 1000
+    }
+}
+
+/// Format msats for the prompt footer.
+///
+/// Whole sats when divisible by 1000; otherwise `N sats + R msats` so the
+/// residual is unambiguous (not a second total).
+pub fn format_routstr_balance_msats(msats: u64) -> String {
+    let sats = msats / 1000;
+    let rem = msats % 1000;
+    if rem == 0 {
+        if sats == 1 {
+            "1 sat".to_owned()
+        } else {
+            format!("{sats} sats")
+        }
+    } else if sats == 0 {
+        format!("{msats} msats")
+    } else {
+        format!("{sats} sats + {rem} msats")
+    }
+}
+
+/// One-line `/usage` summary for a Routstr balance (when xAI billing is absent).
+pub fn format_routstr_usage_summary(balance: &RoutstrCreditBalance) -> String {
+    format!(
+        "Routstr balance: {}",
+        format_routstr_balance_msats(balance.balance_msats)
+    )
+}
+
+/// One-line `/usage` summary for an OpenRouter balance (when xAI billing is absent).
+pub fn format_openrouter_usage_summary(balance: &OpenRouterCreditBalance) -> String {
+    format!(
+        "OpenRouter credits: {}",
+        fmt_dollars(balance.balance_cents.abs())
+    )
+}
+
+/// Low Routstr balance warning threshold: 1000 sats (1_000_000 msats).
+const ROUTSTR_LOW_BALANCE_MSATS: u64 = 1_000_000;
+
 impl CreditBalance {
     /// Label for the percentage allowance, chosen from the period type:
     /// "Weekly limit" / "Monthly limit", falling back to "Usage" when unknown.
@@ -189,12 +250,14 @@ pub fn usage_warning_for_session(
     usage_visible: bool,
     gateway_chat: bool,
 ) -> Option<(String, bool)> {
-    usage_warning_for_session_with_openrouter(
+    usage_warning_for_session_with_providers(
         Some(balance),
         autotopup,
         None,
+        None,
         usage_visible,
         gateway_chat,
+        false,
         false,
     )
 }
@@ -205,6 +268,9 @@ pub fn usage_warning_for_session(
 /// When `openrouter_model` is true and an OR balance is known, always shows
 /// `Credits left: $N` (yellow when ≤ $10). xAI Build billing is ignored for
 /// that model so the footer matches the provider actually being charged.
+///
+/// Prefer [`usage_warning_for_session_with_providers`] when Routstr may also
+/// be active (Routstr takes precedence over OpenRouter when both flags are set).
 pub fn usage_warning_for_session_with_openrouter(
     balance: Option<&CreditBalance>,
     autotopup: Option<&AutoTopupInfo>,
@@ -213,14 +279,58 @@ pub fn usage_warning_for_session_with_openrouter(
     gateway_chat: bool,
     openrouter_model: bool,
 ) -> Option<(String, bool)> {
+    usage_warning_for_session_with_providers(
+        balance,
+        autotopup,
+        openrouter,
+        None,
+        usage_visible,
+        gateway_chat,
+        openrouter_model,
+        false,
+    )
+}
+
+/// Prompt info-row warning with OpenRouter and/or Routstr provider balances.
+///
+/// Priority when selecting provider-specific footer copy:
+/// 1. Routstr model → sats/msats (ignore xAI / OpenRouter)
+/// 2. OpenRouter model → USD credits; when Grok/xAI balance is also known,
+///    append ` · Grok used: N%` so first-party pool stays visible for failover
+/// 3. else xAI Build billing path
+pub fn usage_warning_for_session_with_providers(
+    balance: Option<&CreditBalance>,
+    autotopup: Option<&AutoTopupInfo>,
+    openrouter: Option<&OpenRouterCreditBalance>,
+    routstr: Option<&RoutstrCreditBalance>,
+    usage_visible: bool,
+    gateway_chat: bool,
+    openrouter_model: bool,
+    routstr_model: bool,
+) -> Option<(String, bool)> {
     if gateway_chat || !usage_visible {
         return None;
+    }
+
+    if routstr_model {
+        let r = routstr?;
+        let text = format!(
+            "Balance left: {}",
+            format_routstr_balance_msats(r.balance_msats)
+        );
+        let critical = r.balance_msats <= ROUTSTR_LOW_BALANCE_MSATS;
+        return Some((text, critical));
     }
 
     if openrouter_model {
         let or = openrouter?;
         // Show remaining even at $0 so the user sees the balance was fetched.
-        let text = format!("Credits left: {}", fmt_dollars(or.balance_cents.abs()));
+        let mut text = format!("Credits left: {}", fmt_dollars(or.balance_cents.abs()));
+        // Keep first-party Grok usage visible while on OpenRouter so the user
+        // can see failover budget (do not hide Grok API credits).
+        if let Some(b) = balance {
+            text.push_str(&format!(" · Grok used: {:.0}%", b.usage_pct));
+        }
         let critical = or.balance_cents.abs() <= LOW_BALANCE_CENTS || or.balance_cents <= 0;
         return Some((text, critical));
     }
@@ -345,6 +455,12 @@ mod tests {
     fn or_bal(cents: i64) -> OpenRouterCreditBalance {
         OpenRouterCreditBalance {
             balance_cents: cents,
+        }
+    }
+
+    fn routstr_bal(msats: u64) -> RoutstrCreditBalance {
+        RoutstrCreditBalance {
+            balance_msats: msats,
         }
     }
 
@@ -701,9 +817,10 @@ mod tests {
 
     #[test]
     fn warning_openrouter_shows_balance_always() {
+        // OR-only (no Grok balance): single line, backwards compatible.
         assert_eq!(
             usage_warning_for_session_with_openrouter(
-                Some(&bal(50.0)),
+                None,
                 None,
                 Some(&or_bal(6386)),
                 true,
@@ -724,7 +841,7 @@ mod tests {
             ),
             Some(("Credits left: $5".to_string(), true))
         );
-        // OR model without a fetched balance → no warning (don't fall back to xAI).
+        // OR model without a fetched balance → no warning (don't fall back to xAI-only).
         assert_eq!(
             usage_warning_for_session_with_openrouter(
                 Some(&CreditBalance {
@@ -746,6 +863,127 @@ mod tests {
                 None,
                 Some(&or_bal(6386)),
                 true,
+                false,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn warning_openrouter_also_shows_grok_usage_when_both_known() {
+        // Active OpenRouter model with both balances: dual footer so Grok API
+        // credits remain visible for OR → Grok failover awareness.
+        assert_eq!(
+            usage_warning_for_session_with_providers(
+                Some(&bal(24.0)),
+                None,
+                Some(&or_bal(32)), // $0.32
+                None,
+                true,
+                false,
+                true,
+                false,
+            ),
+            Some((
+                "Credits left: $0.32 · Grok used: 24%".to_string(),
+                true // $0.32 is ≤ $10 critical
+            ))
+        );
+    }
+
+    // ── usage_warning: Routstr sats/msats ────────────────────────────
+
+    #[test]
+    fn format_routstr_balance_variants() {
+        assert_eq!(format_routstr_balance_msats(0), "0 sats");
+        assert_eq!(format_routstr_balance_msats(1000), "1 sat");
+        assert_eq!(format_routstr_balance_msats(2_500_000), "2500 sats");
+        assert_eq!(format_routstr_balance_msats(500), "500 msats");
+        assert_eq!(
+            format_routstr_balance_msats(1_500_500),
+            "1500 sats + 500 msats"
+        );
+        assert_eq!(
+            format_routstr_usage_summary(&routstr_bal(2_500_000)),
+            "Routstr balance: 2500 sats"
+        );
+        assert_eq!(
+            format_openrouter_usage_summary(&or_bal(6386)),
+            "OpenRouter credits: $63.86"
+        );
+    }
+
+    #[test]
+    fn warning_routstr_shows_sats_balance() {
+        assert_eq!(
+            usage_warning_for_session_with_providers(
+                Some(&bal(50.0)),
+                None,
+                Some(&or_bal(6386)),
+                Some(&routstr_bal(2_500_000)),
+                true,
+                false,
+                true,
+                true,
+            ),
+            // Routstr wins over OpenRouter when routstr_model is set.
+            Some(("Balance left: 2500 sats".to_string(), false))
+        );
+        // Low balance (≤ 1000 sats) → critical.
+        assert_eq!(
+            usage_warning_for_session_with_providers(
+                None,
+                None,
+                None,
+                Some(&routstr_bal(500_000)),
+                true,
+                false,
+                false,
+                true,
+            ),
+            Some(("Balance left: 500 sats".to_string(), true))
+        );
+        // Exactly 1000 sats is still low.
+        assert_eq!(
+            usage_warning_for_session_with_providers(
+                None,
+                None,
+                None,
+                Some(&routstr_bal(1_000_000)),
+                true,
+                false,
+                false,
+                true,
+            ),
+            Some(("Balance left: 1000 sats".to_string(), true))
+        );
+        // Routstr model without fetched balance → no xAI fallback.
+        assert_eq!(
+            usage_warning_for_session_with_providers(
+                Some(&CreditBalance {
+                    prepaid_balance_cents: Some(9999),
+                    ..bal(100.0)
+                }),
+                Some(&topup(false, None, None)),
+                None,
+                None,
+                true,
+                false,
+                false,
+                true,
+            ),
+            None
+        );
+        // Non-Routstr model ignores Routstr balance.
+        assert_eq!(
+            usage_warning_for_session_with_providers(
+                Some(&bal(50.0)),
+                None,
+                None,
+                Some(&routstr_bal(2_500_000)),
+                true,
+                false,
                 false,
                 false,
             ),

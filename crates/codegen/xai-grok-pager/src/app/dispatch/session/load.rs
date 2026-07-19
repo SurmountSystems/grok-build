@@ -209,6 +209,7 @@ fn dispatch_load_session_ungated(
         app.credit_balance.clone(),
         app.auto_topup.clone(),
         app.openrouter_credit_balance,
+        app.routstr_credit_balance,
     );
     agent_mut
         .prompt
@@ -858,6 +859,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
             app.credit_balance.clone(),
             app.auto_topup.clone(),
             app.openrouter_credit_balance,
+            app.routstr_credit_balance,
         );
         agent
             .prompt
@@ -1135,6 +1137,7 @@ pub(in crate::app::dispatch) fn handle_session_restored(
             app.credit_balance.clone(),
             app.auto_topup.clone(),
             app.openrouter_credit_balance,
+            app.routstr_credit_balance,
         );
         agent.scrollback.push_block(RenderBlock::system(format!(
             "Session restored. Loading {local_session_id}..."

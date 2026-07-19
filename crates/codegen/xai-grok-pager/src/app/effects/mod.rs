@@ -3912,10 +3912,13 @@ pub(crate) fn execute(
             tasks
                 .spawn(async move {
                     use xai_grok_shell::extensions::billing::BillingConfigResponse;
-                    // Always refresh OpenRouter credits alongside xAI billing so
-                    // OR-only / OR-active sessions still update the footer when
-                    // the xAI extension is unavailable (no grok.com auth).
+                    // Always refresh OpenRouter / Routstr balances alongside xAI
+                    // billing so provider-only sessions still update the footer
+                    // when the xAI extension is unavailable (no grok.com auth).
                     let openrouter_balance = fetch_openrouter_credit_balance().await;
+                    let routstr_balance = fetch_routstr_credit_balance().await;
+                    let provider_balance_ok =
+                        openrouter_balance.is_some() || routstr_balance.is_some();
                     let req = acp::ExtRequest::new(
                         "x.ai/billing",
                         serde_json::value::to_raw_value(&serde_json::json!({}))
@@ -3934,8 +3937,8 @@ pub(crate) fn execute(
                             >(result.clone())
                         }
                         Err(e) => {
-                            // Still surface a successful OR balance if we got one.
-                            if openrouter_balance.is_some() {
+                            // Still surface a successful provider balance if we got one.
+                            if provider_balance_ok {
                                 return TaskResult::BillingFetched {
                                     agent_id,
                                     balance: None,
@@ -3943,6 +3946,7 @@ pub(crate) fn execute(
                                     subscription_tier: None,
                                     autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
                                     openrouter_balance,
+                                    routstr_balance,
                                 };
                             }
                             return TaskResult::BillingError {
@@ -3955,7 +3959,7 @@ pub(crate) fn execute(
                     let billing = match parsed {
                         Ok(billing) => billing,
                         Err(e) => {
-                            if openrouter_balance.is_some() {
+                            if provider_balance_ok {
                                 return TaskResult::BillingFetched {
                                     agent_id,
                                     balance: None,
@@ -3963,6 +3967,7 @@ pub(crate) fn execute(
                                     subscription_tier: None,
                                     autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
                                     openrouter_balance,
+                                    routstr_balance,
                                 };
                             }
                             return TaskResult::BillingError {
@@ -3986,6 +3991,7 @@ pub(crate) fn execute(
                         subscription_tier,
                         autotopup,
                         openrouter_balance,
+                        routstr_balance,
                     }
                 });
         }
@@ -4063,29 +4069,35 @@ pub(crate) fn execute(
                                     };
                                     let openrouter_balance =
                                         fetch_openrouter_credit_balance().await;
+                                    let routstr_balance = fetch_routstr_credit_balance().await;
                                     TaskResult::AppBillingFetched {
                                         balance,
                                         autotopup,
                                         openrouter_balance,
+                                        routstr_balance,
                                     }
                                 }
                                 Err(_) => {
                                     let openrouter_balance =
                                         fetch_openrouter_credit_balance().await;
+                                    let routstr_balance = fetch_routstr_credit_balance().await;
                                     TaskResult::AppBillingFetched {
                                         balance: None,
                                         autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
                                         openrouter_balance,
+                                        routstr_balance,
                                     }
                                 }
                             }
                         }
                         Err(_) => {
                             let openrouter_balance = fetch_openrouter_credit_balance().await;
+                            let routstr_balance = fetch_routstr_credit_balance().await;
                             TaskResult::AppBillingFetched {
                                 balance: None,
                                 autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
                                 openrouter_balance,
+                                routstr_balance,
                             }
                         }
                     }

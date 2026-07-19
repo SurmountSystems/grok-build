@@ -851,6 +851,9 @@ pub struct AgentView {
     /// OpenRouter account credits for the prompt footer when the active model
     /// is OpenRouter-backed.
     pub openrouter_credit_balance: Option<crate::views::credit_bar::OpenRouterCreditBalance>,
+    /// Routstr account balance (msats) for the prompt footer when the active
+    /// model is Routstr-backed.
+    pub routstr_credit_balance: Option<crate::views::credit_bar::RoutstrCreditBalance>,
     /// Current goal orchestration state. Set by `GoalUpdated` session
     /// notifications, cleared when a new session starts.
     pub goal_state: Option<super::agent::GoalDisplayState>,

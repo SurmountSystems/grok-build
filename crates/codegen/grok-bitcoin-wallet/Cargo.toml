@@ -7,12 +7,43 @@ description = "Bitcoin wallet + SeedVault foundations for Routstr-funded Grok OS
 authors = ["Surmount"]
 readme = "README.md"
 
-# Heavy BDK/LDK/CDK deps are intentionally not wired yet. Phase 0 ships
-# reasoning docs + a compile-only placeholder so the path and SECURITY.md
-# exist before real-money code. See docs/bitcoin-routstr/.
+# SeedVault + BIP-39 + NIP-06 + address UX + funding wizard types.
+# Heavy LDK/CDK remain feature-gated / stubbed. See RESIDUAL.md.
+
+[features]
+default = ["keyring-store", "nip06", "onchain-address", "qr"]
+# OS keyring backend for SeedVault (disable in constrained CI if needed).
+keyring-store = ["dep:keyring"]
+# NIP-06 Nostr derivation via `nostr` crate.
+nip06 = ["dep:nostr"]
+# BIP84 receive address derivation (bitcoin + bip32).
+onchain-address = ["dep:bitcoin"]
+# Terminal/matrix QR generation for payment displays.
+qr = ["dep:qrcode"]
+# Real HTTP client for mempool.space (reqwest blocking). Off by default so CI
+# stays offline-safe; enable for local integration / ignored network tests.
+explorer-http = ["dep:reqwest"]
 
 [dependencies]
 thiserror = { workspace = true }
+serde = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+bip39 = { workspace = true }
+getrandom = { workspace = true }
+argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }
+
+keyring = { workspace = true, optional = true }
+nostr = { workspace = true, optional = true }
+bitcoin = { workspace = true, optional = true }
+qrcode = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = ["blocking", "rustls-tls"], default-features = false }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

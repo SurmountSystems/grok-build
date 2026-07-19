@@ -32,7 +32,7 @@ code.
 ```
 
 **BOLT12:** optional enhancement. If the recommended peer or our LDK pin cannot
-do offer routing, **defer BOLT12** — do not block the path above. BOLT11 +
+do offer routing, **defer BOLT12**. Do not block the path above. BOLT11 +
 on-chain remain mandatory.
 
 **Later:** optional integration with a **local Bitcoin node and indexes**
@@ -55,13 +55,13 @@ on-chain remain mandatory.
 | Area | Location |
 |------|----------|
 | Wallet crate | `crates/codegen/grok-bitcoin-wallet/` |
-| Hot Routstr API keys (OpenRouter pattern) | `xai-grok-shell/src/auth/` — **not** for BIP-39 |
+| Hot Routstr API keys (OpenRouter pattern) | `xai-grok-shell/src/auth/` (**not** for BIP-39) |
 | Sampler / 402 | `xai-grok-sampler`, `xai-grok-sampling-types` |
 | Session plan (agent) | `~/.grok/sessions/.../plan.md` (Routstr + wallet plan) |
 
 ## Implementation phases (summary)
 
-0. **Reasoning docs** (this tree) + SeedVault design — *in progress*  
+0. **Reasoning docs** (this tree) + SeedVault design (*in progress*)  
 1. SeedVault + BIP-39 + NIP-06 (no plaintext seed on disk)  
 2. Routstr HTTP inference + catalog Grok 4.5 + default-on toggle  
 3. BDK receive + QR/copy + mempool watchers  

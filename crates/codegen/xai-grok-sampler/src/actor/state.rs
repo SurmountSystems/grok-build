@@ -83,6 +83,7 @@ mod tests {
         SamplerConfig {
             api_key: None,
             failover_api_keys: Vec::new(),
+            failover_providers: Vec::new(),
             base_url: "https://example.test".into(),
             model: "test-model".into(),
             max_completion_tokens: None,

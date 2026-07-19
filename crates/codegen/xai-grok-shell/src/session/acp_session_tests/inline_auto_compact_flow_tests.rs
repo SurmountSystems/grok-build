@@ -1290,6 +1290,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             chat_state_handle.update_credentials(xai_chat_state::types::Credentials {
                 api_key: Some("test-key".to_string()),
                 failover_api_keys: Vec::new(),
+                failover_providers: Vec::new(),
                 auth_type: Default::default(),
                 alpha_test_key: None,
                 client_version: None,

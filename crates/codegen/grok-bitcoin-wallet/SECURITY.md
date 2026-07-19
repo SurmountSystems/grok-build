@@ -1,11 +1,11 @@
-# Security rules — `grok-bitcoin-wallet`
+# Security rules for `grok-bitcoin-wallet`
 
 **Read with** `docs/bitcoin-routstr/THREAT_MODEL.md`.
 
 ## SeedVault invariants
 
 1. Mnemonic / seed bytes **never** written as plaintext to disk.
-2. Primary store: **OS keyring** (service label dedicated to wallet seed —
+2. Primary store: **OS keyring** (service label dedicated to wallet seed;
    do not reuse OpenRouter Bearer JSON mirror behavior).
 3. Fallback: **password-based AEAD** only (Argon2id + XChaCha20-Poly1305 or
    AES-256-GCM), with UX that states degraded portability / password loss =

@@ -16,6 +16,7 @@ pub mod oidc;
 pub mod openrouter;
 pub(crate) mod recovery;
 pub(crate) mod refresh;
+pub mod routstr;
 pub(crate) mod single_flight;
 mod storage;
 pub(crate) mod token_type;
@@ -55,6 +56,16 @@ pub use openrouter::{
     store_openrouter_api_key, usd_to_cents,
 };
 pub(crate) use refresh::DiagnosticUploader;
+pub use routstr::{
+    ROUTSTR_API_KEY_ENV, ROUTSTR_API_KEYS_ENV, ROUTSTR_API_URL, ROUTSTR_GROK_45_CATALOG_ID,
+    ROUTSTR_GROK_45_MODEL, RoutstrAuthError, RoutstrBalanceInfo, RoutstrCliError,
+    clear_routstr_api_key, fetch_routstr_balance_msats, fetch_routstr_balance_msats_with_key,
+    format_routstr_balance_line, has_routstr_api_key, is_routstr_base_url, is_routstr_catalog_id,
+    load_routstr_api_key, load_routstr_api_key_default, parse_routstr_balance_msats,
+    routstr_balance_msats_from_info, routstr_seed_aead_path, run_routstr_balance, run_routstr_fund,
+    run_routstr_login, run_routstr_logout, run_routstr_refund, run_routstr_topup,
+    store_routstr_api_key,
+};
 pub use storage::{
     clear_api_key, read_api_key, read_auth_json, read_token_by_scope, store_api_key,
 };

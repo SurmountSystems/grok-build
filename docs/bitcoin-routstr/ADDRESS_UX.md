@@ -19,9 +19,9 @@ No address-only monospaced dump without QR+copy in interactive TUI flows.
 | On-chain address | address or `bitcoin:<addr>` BIP21 | address or BIP21 | link receive addr on mempool.space |
 | On-chain with amount | BIP21 with `amount` | BIP21 preferred | same |
 | BOLT11 invoice | raw bolt11 bech | bolt11 | optional decode summary (amount, expiry) |
-| BOLT12 offer | offer bech (when not deferred) | offer | — |
+| BOLT12 offer | offer bech (when not deferred) | offer |, |
 | txid (status) | optional QR of explorer URL | txid and/or URL | **required** mempool.space tx link |
-| npub | npub bech | npub | not a payment method — still QR+copy if shown |
+| npub | npub bech | npub | not a payment method; still QR+copy if shown |
 | Cashu token | avoid ambient QR of large tokens in scrollback | copy in secure modal | treat as bearer secret |
 
 ## BIP21

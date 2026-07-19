@@ -150,6 +150,8 @@ xai-file-utils = { path = "../xai-file-utils" }
 xai-grok-auth = { workspace = true, features = ["middleware"] }
 xai-grok-telemetry = { workspace = true }
 xai-grok-http = { workspace = true }
+# Bitcoin SeedVault + funding CLI for Routstr (never CredentialsStore for BIP-39).
+grok-bitcoin-wallet = { workspace = true }
 xai-grok-models = { workspace = true }
 prod-mc-cli-chat-proxy-types = { path = "../../../prod/mc/cli-chat-proxy-types" }
 flate2 = { workspace = true }
