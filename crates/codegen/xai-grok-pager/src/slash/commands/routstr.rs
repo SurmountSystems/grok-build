@@ -188,12 +188,20 @@ pub(crate) fn parse_routstr_args(args: &str) -> CommandResult {
         "spend" => {
             let rest: Vec<&str> = parts.collect();
             match grok_bitcoin_wallet::funding_cli::parse_spend_tokens(&rest) {
-                Ok(req) => CommandResult::Action(Action::RoutstrSpend {
-                    address: req.payment_address,
-                    amount_sats: req.amount_sats,
-                    broadcast: req.broadcast,
-                    fee_rate_sat_vb: req.fee_rate_sat_vb,
-                }),
+                Ok(req) => {
+                    // Non-explicit fee → explorer halfHour estimates when available.
+                    let fee_rate_sat_vb = if req.fee_rate_explicit {
+                        req.fee_rate_sat_vb
+                    } else {
+                        xai_grok_shell::auth::resolve_spend_fee_rate_for_product(None)
+                    };
+                    CommandResult::Action(Action::RoutstrSpend {
+                        address: req.payment_address,
+                        amount_sats: req.amount_sats,
+                        broadcast: req.broadcast,
+                        fee_rate_sat_vb,
+                    })
+                }
                 Err(e) => CommandResult::Error(format!(
                     "{e}\nUsage: /routstr spend <address> <sats> [broadcast] [fee=<n>]\n\
                      Dry-run by default. BIP-39 is never part of this command — \

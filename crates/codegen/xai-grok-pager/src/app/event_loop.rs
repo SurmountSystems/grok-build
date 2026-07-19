@@ -1339,6 +1339,11 @@ pub(crate) async fn run(
         if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
             return Ok(make_run_result(&app));
         }
+        // Re-arm durable deposit watch after process restart (no BIP-39).
+        let resume_effs = dispatch::try_resume_persisted_routstr_watch(&mut app);
+        if process_effects(resume_effs, &mut tasks, &mut app, &progress_tx) {
+            return Ok(make_run_result(&app));
+        }
         app.draw(terminal);
     } else if args.worktree.is_some() {
         // --worktree only: create worktree + new session.

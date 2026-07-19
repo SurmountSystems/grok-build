@@ -169,12 +169,71 @@ impl SignOutcome {
         matches!(self, Self::AllSigned { .. })
     }
 
+    /// True only when every input was signed — never true for multi-sig residual.
+    pub fn is_broadcast_ready(&self) -> bool {
+        self.is_complete()
+    }
+
     pub fn signed_inputs(&self) -> usize {
         match self {
             Self::AllSigned { signed_inputs } => *signed_inputs,
             Self::Partial { signed_inputs, .. } => *signed_inputs,
         }
     }
+}
+
+/// Outcome of P2WPKH finalize (honest about multi-sig / non-P2WPKH residual).
+///
+/// Only single-key P2WPKH inputs with a matching partial signature become
+/// `final_script_witness`. Multi-sig, script-path, and non-P2WPKH scripts are
+/// left residual and surface as [`FinalizeOutcome::Partial`] — **not**
+/// broadcast-ready.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    /// Every input has a non-empty `final_script_witness`.
+    Complete { finalized_inputs: usize },
+    /// Some inputs finalized; others could not (unsigned, multi-sig, non-P2WPKH).
+    ///
+    /// Not broadcast-ready. Callers must not extract/broadcast as a success.
+    Partial {
+        finalized_inputs: usize,
+        residual_inputs: usize,
+        detail: String,
+    },
+}
+
+impl FinalizeOutcome {
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete { .. })
+    }
+
+    /// Alias for product copy: only [`Self::Complete`] is broadcast-ready.
+    pub fn is_broadcast_ready(&self) -> bool {
+        self.is_complete()
+    }
+
+    pub fn finalized_inputs(&self) -> usize {
+        match self {
+            Self::Complete { finalized_inputs } => *finalized_inputs,
+            Self::Partial {
+                finalized_inputs, ..
+            } => *finalized_inputs,
+        }
+    }
+}
+
+/// True when every PSBT input has a **non-empty** `final_script_witness`.
+///
+/// Empty witnesses and missing witnesses are **not** complete. Never use this
+/// alone to claim multi-sig success — only single-key P2WPKH finalize fills
+/// witnesses in this crate.
+pub fn psbt_is_broadcast_ready(psbt: &Psbt) -> bool {
+    !psbt.inputs.is_empty()
+        && psbt.inputs.iter().all(|i| {
+            i.final_script_witness
+                .as_ref()
+                .is_some_and(|w| !w.is_empty())
+        })
 }
 
 /// Options for coin selection (confirmed filter + optional fee model).
@@ -219,6 +278,223 @@ pub fn estimate_tx_vbytes(input_count: usize, output_count: usize) -> u64 {
 /// `estimate_tx_vbytes(...) * fee_rate_sat_vb`.
 pub fn estimate_fee_sats(input_count: usize, output_count: usize, fee_rate_sat_vb: u64) -> u64 {
     estimate_tx_vbytes(input_count, output_count).saturating_mul(fee_rate_sat_vb)
+}
+
+/// Bitcoin Core default incremental relay fee (sat/vB) used for BIP-125 RBF
+/// absolute fee floor guidance. Not network-fetched; product may override.
+pub const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_VB: u64 = 1;
+
+/// Floor division fee rate in sat/vB. Returns 0 when `vbytes == 0`.
+pub fn effective_fee_rate_sat_vb(fee_sats: u64, vbytes: u64) -> u64 {
+    if vbytes == 0 {
+        return 0;
+    }
+    fee_sats / vbytes
+}
+
+/// Ceiling division (`num / den`, rounding up). Returns 0 when `den == 0`.
+pub fn div_ceil_u64(num: u64, den: u64) -> u64 {
+    if den == 0 {
+        return 0;
+    }
+    num.div_ceil(den)
+}
+
+/// Minimum absolute fee increase (sats) for a same-size BIP-125 replacement:
+/// `replacement_vbytes * incremental_relay_sat_vb` (at least 1 sat when sizes > 0).
+pub fn rbf_min_fee_increase_sats(replacement_vbytes: u64, incremental_relay_sat_vb: u64) -> u64 {
+    let inc = if incremental_relay_sat_vb == 0 {
+        DEFAULT_INCREMENTAL_RELAY_FEE_SAT_VB
+    } else {
+        incremental_relay_sat_vb
+    };
+    let raw = replacement_vbytes.saturating_mul(inc);
+    if replacement_vbytes > 0 {
+        raw.max(1)
+    } else {
+        0
+    }
+}
+
+/// Errors from RBF / CPFP pure fee planners (offline; no network).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeeBumpPlanError {
+    /// Transaction virtual size must be > 0.
+    ZeroVbytes,
+    /// Target fee rate must be > 0 sat/vB.
+    ZeroTargetRate,
+    /// Child vbytes must be > 0 for CPFP.
+    ZeroChildVbytes,
+}
+
+impl std::fmt::Display for FeeBumpPlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroVbytes => write!(f, "vbytes must be > 0"),
+            Self::ZeroTargetRate => write!(f, "target fee rate must be > 0 sat/vB"),
+            Self::ZeroChildVbytes => write!(f, "child vbytes must be > 0"),
+        }
+    }
+}
+
+impl std::error::Error for FeeBumpPlanError {}
+
+/// BIP-125-style RBF fee bump plan for a **same-size** single-tx replacement.
+///
+/// Does not rebuild a PSBT. Product uses this to pick a higher fee rate / absolute
+/// fee before re-selecting coins and rebuilding. Inputs already signal RBF via
+/// [`Sequence::ENABLE_RBF_NO_LOCKTIME`] on [`build_unsigned_psbt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RbfFeePlan {
+    pub original_fee_sats: u64,
+    pub original_vbytes: u64,
+    /// Floor sat/vB of the original tx.
+    pub original_fee_rate_sat_vb: u64,
+    /// Minimum absolute fee for a same-size replacement (increment + higher rate).
+    pub min_replacement_fee_sats: u64,
+    /// Floor sat/vB at [`Self::min_replacement_fee_sats`].
+    pub min_replacement_fee_rate_sat_vb: u64,
+    /// Recommended absolute fee meeting target rate and BIP-125 floors.
+    pub recommended_fee_sats: u64,
+    /// Floor sat/vB at [`Self::recommended_fee_sats`].
+    pub recommended_fee_rate_sat_vb: u64,
+    /// `recommended_fee_sats - original_fee_sats`.
+    pub fee_delta_sats: u64,
+    pub target_fee_rate_sat_vb: u64,
+    pub incremental_relay_sat_vb: u64,
+}
+
+/// Plan a same-size RBF fee bump.
+///
+/// Ensures the recommended fee:
+/// 1. Is strictly greater than `original_fee_sats`
+/// 2. Pays at least `vbytes * incremental_relay` extra (BIP-125 bandwidth)
+/// 3. Has a strictly higher floor fee rate than the original when possible
+/// 4. Meets `target_fee_rate_sat_vb * vbytes`
+///
+/// `incremental_relay_sat_vb == 0` uses [`DEFAULT_INCREMENTAL_RELAY_FEE_SAT_VB`].
+pub fn plan_rbf_fee_bump(
+    original_fee_sats: u64,
+    original_vbytes: u64,
+    target_fee_rate_sat_vb: u64,
+    incremental_relay_sat_vb: u64,
+) -> std::result::Result<RbfFeePlan, FeeBumpPlanError> {
+    if original_vbytes == 0 {
+        return Err(FeeBumpPlanError::ZeroVbytes);
+    }
+    if target_fee_rate_sat_vb == 0 {
+        return Err(FeeBumpPlanError::ZeroTargetRate);
+    }
+    let incremental = if incremental_relay_sat_vb == 0 {
+        DEFAULT_INCREMENTAL_RELAY_FEE_SAT_VB
+    } else {
+        incremental_relay_sat_vb
+    };
+    let original_fee_rate_sat_vb = effective_fee_rate_sat_vb(original_fee_sats, original_vbytes);
+    let min_increase = rbf_min_fee_increase_sats(original_vbytes, incremental);
+    let min_by_increment = original_fee_sats.saturating_add(min_increase);
+    // Strictly higher absolute fee.
+    let min_by_absolute = original_fee_sats.saturating_add(1);
+    // Strictly higher floor feerate: (orig_rate + 1) * vb (at least 1 sat/vB).
+    let higher_rate = original_fee_rate_sat_vb.saturating_add(1).max(1);
+    let min_by_rate = higher_rate.saturating_mul(original_vbytes);
+    let by_target = original_vbytes.saturating_mul(target_fee_rate_sat_vb);
+
+    // BIP-125 floor (no target): increment bandwidth + absolute + higher rate.
+    let min_replacement_fee_sats = min_by_increment.max(min_by_absolute).max(min_by_rate);
+    // Recommended also meets the caller's target mempool rate.
+    let mut recommended = by_target.max(min_replacement_fee_sats);
+    // Defensive: never recommend ≤ original absolute fee.
+    if recommended <= original_fee_sats {
+        recommended = original_fee_sats.saturating_add(min_increase.max(1));
+    }
+
+    let recommended_fee_rate_sat_vb = effective_fee_rate_sat_vb(recommended, original_vbytes);
+    let min_replacement_fee_rate_sat_vb =
+        effective_fee_rate_sat_vb(min_replacement_fee_sats, original_vbytes);
+    let fee_delta_sats = recommended.saturating_sub(original_fee_sats);
+
+    Ok(RbfFeePlan {
+        original_fee_sats,
+        original_vbytes,
+        original_fee_rate_sat_vb,
+        min_replacement_fee_sats,
+        min_replacement_fee_rate_sat_vb,
+        recommended_fee_sats: recommended,
+        recommended_fee_rate_sat_vb,
+        fee_delta_sats,
+        target_fee_rate_sat_vb,
+        incremental_relay_sat_vb: incremental,
+    })
+}
+
+/// CPFP child fee plan: child pays enough so parent+child package meets a target rate.
+///
+/// Pure guidance (does not build the child PSBT). Typical child is 1-in (parent
+/// output) + 1–2 P2WPKH outs — use [`estimate_tx_vbytes`] / [`estimate_cpfp_child_vbytes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpfpFeePlan {
+    pub parent_fee_sats: u64,
+    pub parent_vbytes: u64,
+    pub child_vbytes: u64,
+    pub target_fee_rate_sat_vb: u64,
+    /// Minimum child absolute fee so package rate ≥ target (and child meets min relay).
+    pub min_child_fee_sats: u64,
+    /// Floor sat/vB of the child alone at [`Self::min_child_fee_sats`].
+    pub min_child_fee_rate_sat_vb: u64,
+    /// Package fee rate after paying [`Self::min_child_fee_sats`].
+    pub package_fee_rate_sat_vb: u64,
+    pub package_vbytes: u64,
+    pub package_fee_sats: u64,
+}
+
+/// Estimate vbytes for a typical CPFP child spending one P2WPKH parent output
+/// with `output_count` P2WPKH outputs (payment and/or change). `output_count`
+/// of 0 is treated as 1.
+pub fn estimate_cpfp_child_vbytes(output_count: usize) -> u64 {
+    estimate_tx_vbytes(1, output_count.max(1))
+}
+
+/// Plan CPFP child fee so `(parent_fee + child_fee) / (parent_vb + child_vb) ≥ target`.
+///
+/// Also enforces a minimum child fee of `child_vbytes * 1` sat (min-relay style)
+/// so a fully overpaying parent still yields a relayable child.
+pub fn plan_cpfp_child_fee(
+    parent_fee_sats: u64,
+    parent_vbytes: u64,
+    child_vbytes: u64,
+    target_fee_rate_sat_vb: u64,
+) -> std::result::Result<CpfpFeePlan, FeeBumpPlanError> {
+    if parent_vbytes == 0 {
+        return Err(FeeBumpPlanError::ZeroVbytes);
+    }
+    if child_vbytes == 0 {
+        return Err(FeeBumpPlanError::ZeroChildVbytes);
+    }
+    if target_fee_rate_sat_vb == 0 {
+        return Err(FeeBumpPlanError::ZeroTargetRate);
+    }
+    let package_vbytes = parent_vbytes.saturating_add(child_vbytes);
+    let needed_package_fee = package_vbytes.saturating_mul(target_fee_rate_sat_vb);
+    let for_package = needed_package_fee.saturating_sub(parent_fee_sats);
+    // Child must pay at least min-relay for its own size (1 sat/vB).
+    let min_relay_child = child_vbytes.saturating_mul(DEFAULT_INCREMENTAL_RELAY_FEE_SAT_VB).max(1);
+    let min_child_fee_sats = for_package.max(min_relay_child);
+    let package_fee_sats = parent_fee_sats.saturating_add(min_child_fee_sats);
+    let package_fee_rate_sat_vb = effective_fee_rate_sat_vb(package_fee_sats, package_vbytes);
+    let min_child_fee_rate_sat_vb = effective_fee_rate_sat_vb(min_child_fee_sats, child_vbytes);
+
+    Ok(CpfpFeePlan {
+        parent_fee_sats,
+        parent_vbytes,
+        child_vbytes,
+        target_fee_rate_sat_vb,
+        min_child_fee_sats,
+        min_child_fee_rate_sat_vb,
+        package_fee_rate_sat_vb,
+        package_vbytes,
+        package_fee_sats,
+    })
 }
 
 /// Injectable chain / explorer backend for UTXO discovery.
@@ -857,17 +1133,31 @@ pub fn sign_psbt_bip84_p2wpkh(
 
 /// Convert ECDSA `partial_sigs` on P2WPKH inputs into `final_script_witness`.
 ///
-/// Each finalized input must have exactly one partial signature whose pubkey
-/// HASH160 matches a P2WPKH `witness_utxo.script_pubkey`. Multi-sig /
-/// script-path spends remain residual.
+/// # Honesty
 ///
-/// Empty pre-existing `final_script_witness` values are treated as missing
-/// (aligned with [`extract_finalized_tx`]).
+/// - Only single-key **P2WPKH** with exactly one matching partial signature is
+///   finalized.
+/// - Multi-sig (`partial_sigs.len() != 1`), non-P2WPKH scripts, missing
+///   `witness_utxo`, and unsigned inputs are left residual and yield
+///   [`FinalizeOutcome::Partial`] (not broadcast-ready) — never a complete
+///   success claim.
+/// - Empty pre-existing `final_script_witness` values are treated as missing
+///   (aligned with [`extract_finalized_tx`] / [`psbt_is_broadcast_ready`]).
+/// - Pubkey HASH160 mismatch against a P2WPKH `witness_utxo` is a hard error
+///   (corrupt / tampered PSBT), not a silent skip.
 ///
-/// Returns the number of inputs that have a **non-empty** final witness after
-/// this call.
-pub fn finalize_p2wpkh_psbt(psbt: &mut Psbt) -> Result<usize> {
+/// Product paths must require [`FinalizeOutcome::is_complete`] before extract
+/// or broadcast.
+pub fn finalize_p2wpkh_psbt(psbt: &mut Psbt) -> Result<FinalizeOutcome> {
+    let total = psbt.inputs.len();
+    if total == 0 {
+        return Err(WalletError::Onchain(
+            "PSBT has no inputs to finalize".into(),
+        ));
+    }
     let mut finalized = 0usize;
+    let mut residual_reasons: Vec<String> = Vec::new();
+
     for (idx, input) in psbt.inputs.iter_mut().enumerate() {
         if let Some(w) = input.final_script_witness.as_ref() {
             if w.is_empty() {
@@ -880,30 +1170,43 @@ pub fn finalize_p2wpkh_psbt(psbt: &mut Psbt) -> Result<usize> {
             }
         }
         if input.partial_sigs.is_empty() {
+            residual_reasons.push(format!(
+                "input {idx}: no partial_sigs (unsigned residual; not broadcast-ready)"
+            ));
             continue;
         }
         if input.partial_sigs.len() != 1 {
-            return Err(WalletError::Onchain(format!(
-                "input {idx}: expected 1 partial_sig for P2WPKH finalize, got {}",
+            // Multi-sig / multi-key: never invent a P2WPKH witness.
+            residual_reasons.push(format!(
+                "input {idx}: multi-sig / multi-key residual ({} partial_sigs; only single-key \
+                 P2WPKH finalize supported; not broadcast-ready)",
                 input.partial_sigs.len()
-            )));
+            ));
+            continue;
         }
-        let utxo = input.witness_utxo.as_ref().ok_or_else(|| {
-            WalletError::Onchain(format!(
-                "input {idx}: missing witness_utxo for P2WPKH finalize"
-            ))
-        })?;
+        let Some(utxo) = input.witness_utxo.as_ref() else {
+            residual_reasons.push(format!(
+                "input {idx}: missing witness_utxo (not broadcast-ready)"
+            ));
+            continue;
+        };
         if !utxo.script_pubkey.is_p2wpkh() {
-            return Err(WalletError::Onchain(format!(
-                "input {idx}: witness_utxo script_pubkey is not P2WPKH"
-            )));
+            // P2WSH / multi-sig / script-path / legacy — honest residual.
+            residual_reasons.push(format!(
+                "input {idx}: non-P2WPKH script residual (only single-key P2WPKH finalize; \
+                 not broadcast-ready)"
+            ));
+            continue;
         }
         let (pk, sig) = input.partial_sigs.iter().next().expect("len checked == 1");
-        let wpkh = pk.wpubkey_hash().map_err(|e| {
-            WalletError::Onchain(format!(
-                "input {idx}: partial_sig pubkey is not compressed P2WPKH: {e}"
-            ))
-        })?;
+        let wpkh = match pk.wpubkey_hash() {
+            Ok(h) => h,
+            Err(e) => {
+                return Err(WalletError::Onchain(format!(
+                    "input {idx}: partial_sig pubkey is not compressed P2WPKH: {e}"
+                )));
+            }
+        };
         let expected_spk = ScriptBuf::new_p2wpkh(&wpkh);
         if utxo.script_pubkey != expected_spk {
             return Err(WalletError::Onchain(format!(
@@ -914,10 +1217,35 @@ pub fn finalize_p2wpkh_psbt(psbt: &mut Psbt) -> Result<usize> {
         input.final_script_witness = Some(witness);
         finalized += 1;
     }
-    Ok(finalized)
+
+    let residual = total.saturating_sub(finalized);
+    if residual == 0 {
+        debug_assert!(psbt_is_broadcast_ready(psbt));
+        Ok(FinalizeOutcome::Complete {
+            finalized_inputs: finalized,
+        })
+    } else {
+        let detail = if residual_reasons.is_empty() {
+            format!("finalized {finalized}/{total} inputs; residual not broadcast-ready")
+        } else {
+            format!(
+                "finalized {finalized}/{total} inputs (not broadcast-ready): {}",
+                residual_reasons.join("; ")
+            )
+        };
+        Ok(FinalizeOutcome::Partial {
+            finalized_inputs: finalized,
+            residual_inputs: residual,
+            detail,
+        })
+    }
 }
 
-/// Extract a transaction when **every** input has `final_script_witness`.
+/// Extract a transaction when **every** input has a **non-empty**
+/// `final_script_witness`.
+///
+/// Empty witnesses are rejected (never treated as complete). Multi-sig /
+/// non-P2WPKH residual PSBTs fail here if finalize left them partial.
 ///
 /// Uses fee-rate-unchecked extract so dust-folded / test fees are not rejected.
 /// **Does not broadcast.** Submit via [`broadcast_raw_tx`] / [`TxBroadcaster`].
@@ -925,13 +1253,22 @@ pub fn extract_finalized_tx(psbt: Psbt) -> Result<Transaction> {
     if psbt.inputs.is_empty() {
         return Err(WalletError::Onchain("cannot extract empty PSBT".into()));
     }
-    for (idx, input) in psbt.inputs.iter().enumerate() {
-        match &input.final_script_witness {
-            Some(w) if !w.is_empty() => {}
-            _ => {
-                return Err(WalletError::Onchain(format!(
-                    "input {idx} missing final_script_witness; finalize P2WPKH before extract"
-                )));
+    if !psbt_is_broadcast_ready(&psbt) {
+        for (idx, input) in psbt.inputs.iter().enumerate() {
+            match &input.final_script_witness {
+                Some(w) if !w.is_empty() => {}
+                Some(w) if w.is_empty() => {
+                    return Err(WalletError::Onchain(format!(
+                        "input {idx} has empty final_script_witness (not complete; \
+                         multi-sig / non-P2WPKH residual or unsigned)"
+                    )));
+                }
+                _ => {
+                    return Err(WalletError::Onchain(format!(
+                        "input {idx} missing final_script_witness; finalize P2WPKH before extract \
+                         (partial / multi-sig / non-P2WPKH is not broadcast-ready)"
+                    )));
+                }
             }
         }
     }
@@ -1004,6 +1341,27 @@ impl PreparedSpend {
     pub fn txid_hex(&self) -> String {
         transaction_txid_hex(&self.tx)
     }
+
+    /// Consensus weight converted to virtual bytes (ceil). Prefer this over the
+    /// P2WPKH heuristic when the signed tx is already in hand.
+    pub fn weight_vbytes(&self) -> u64 {
+        transaction_vbytes(&self.tx)
+    }
+
+    /// Floor effective fee rate (sat/vB) from actual weight and recorded fee.
+    pub fn effective_fee_rate_sat_vb(&self) -> u64 {
+        effective_fee_rate_sat_vb(self.fee_sats, self.weight_vbytes())
+    }
+
+    /// P2WPKH heuristic vbytes from input/output counts (matches coin select).
+    pub fn estimated_vbytes(&self) -> u64 {
+        estimate_tx_vbytes(self.input_count, self.output_count)
+    }
+}
+
+/// Virtual size of a transaction: `weight.to_vbytes_ceil()`.
+pub fn transaction_vbytes(tx: &Transaction) -> u64 {
+    tx.weight().to_vbytes_ceil()
 }
 
 /// Build → BIP84 P2WPKH sign → finalize → extract for a complete local spend path.
@@ -1039,7 +1397,7 @@ pub fn prepare_bip84_p2wpkh_spend(
         params.network,
         address_gap,
     )?;
-    if !outcome.is_complete() {
+    if !outcome.is_broadcast_ready() {
         return Err(WalletError::Onchain(format!(
             "incomplete BIP84 P2WPKH sign (not broadcast-ready): {}",
             match &outcome {
@@ -1048,12 +1406,20 @@ pub fn prepare_bip84_p2wpkh_spend(
             }
         )));
     }
-    let n = finalize_p2wpkh_psbt(&mut built.psbt)?;
-    if n != built.psbt.inputs.len() {
+    let fin = finalize_p2wpkh_psbt(&mut built.psbt)?;
+    if !fin.is_broadcast_ready() {
         return Err(WalletError::Onchain(format!(
-            "finalize only covered {n}/{} inputs",
-            built.psbt.inputs.len()
+            "incomplete P2WPKH finalize (not broadcast-ready): {}",
+            match &fin {
+                FinalizeOutcome::Partial { detail, .. } => detail.clone(),
+                FinalizeOutcome::Complete { .. } => unreachable!(),
+            }
         )));
+    }
+    if !psbt_is_broadcast_ready(&built.psbt) {
+        return Err(WalletError::Onchain(
+            "PSBT not broadcast-ready after finalize (empty or missing witnesses)".into(),
+        ));
     }
     let tx = extract_finalized_tx(built.psbt)?;
     let input_count = tx.input.len();
@@ -1660,6 +2026,157 @@ mod tests {
     }
 
     #[test]
+    fn effective_fee_rate_and_div_ceil_edge_cases() {
+        assert_eq!(effective_fee_rate_sat_vb(1410, 141), 10);
+        assert_eq!(effective_fee_rate_sat_vb(100, 0), 0);
+        assert_eq!(effective_fee_rate_sat_vb(0, 100), 0);
+        assert_eq!(div_ceil_u64(10, 3), 4);
+        assert_eq!(div_ceil_u64(9, 3), 3);
+        assert_eq!(div_ceil_u64(1, 0), 0);
+        assert_eq!(div_ceil_u64(0, 5), 0);
+    }
+
+    #[test]
+    fn rbf_min_fee_increase_uses_default_incremental() {
+        assert_eq!(rbf_min_fee_increase_sats(141, 0), 141); // default 1 sat/vB
+        assert_eq!(rbf_min_fee_increase_sats(141, 1), 141);
+        assert_eq!(rbf_min_fee_increase_sats(141, 2), 282);
+        assert_eq!(rbf_min_fee_increase_sats(0, 1), 0);
+        assert_eq!(rbf_min_fee_increase_sats(1, 0), 1);
+    }
+
+    #[test]
+    fn plan_rbf_fee_bump_meets_bip125_and_target() {
+        // Original: 141 vb @ 5 sat/vB → 705 sats fee, floor rate 5.
+        let orig_vb = 141u64;
+        let orig_fee = 705u64;
+        let plan = plan_rbf_fee_bump(orig_fee, orig_vb, 10, 0).unwrap();
+        assert_eq!(plan.original_fee_rate_sat_vb, 5);
+        assert_eq!(plan.incremental_relay_sat_vb, DEFAULT_INCREMENTAL_RELAY_FEE_SAT_VB);
+        // Target 10 * 141 = 1410; increment floor = 705+141=846; higher rate 6*141=846.
+        assert_eq!(plan.recommended_fee_sats, 1410);
+        assert_eq!(plan.recommended_fee_rate_sat_vb, 10);
+        assert_eq!(plan.fee_delta_sats, 1410 - 705);
+        assert!(plan.min_replacement_fee_sats > orig_fee);
+        assert!(plan.min_replacement_fee_sats >= orig_fee + orig_vb);
+        assert!(plan.min_replacement_fee_rate_sat_vb > plan.original_fee_rate_sat_vb);
+        assert!(plan.recommended_fee_sats >= plan.min_replacement_fee_sats);
+    }
+
+    #[test]
+    fn plan_rbf_fee_bump_target_below_bip125_floor_still_bumps() {
+        // Target equal to original rate must still raise absolute fee / rate.
+        let plan = plan_rbf_fee_bump(705, 141, 5, 1).unwrap();
+        assert!(plan.recommended_fee_sats > 705);
+        assert!(plan.recommended_fee_rate_sat_vb >= 5);
+        // At least +141 sats for 1 sat/vB incremental on same size.
+        assert!(plan.recommended_fee_sats >= 705 + 141);
+        assert_eq!(plan.min_replacement_fee_sats, plan.recommended_fee_sats);
+    }
+
+    #[test]
+    fn plan_rbf_fee_bump_rejects_zero_vbytes_and_zero_target() {
+        assert_eq!(
+            plan_rbf_fee_bump(100, 0, 10, 1).unwrap_err(),
+            FeeBumpPlanError::ZeroVbytes
+        );
+        assert_eq!(
+            plan_rbf_fee_bump(100, 100, 0, 1).unwrap_err(),
+            FeeBumpPlanError::ZeroTargetRate
+        );
+    }
+
+    #[test]
+    fn plan_rbf_fee_bump_zero_original_fee() {
+        let plan = plan_rbf_fee_bump(0, 100, 5, 1).unwrap();
+        assert_eq!(plan.original_fee_rate_sat_vb, 0);
+        // higher_rate = 1 → min_by_rate = 100; increment = 100; absolute = 1 → min 100
+        // target = 500 → recommended 500
+        assert_eq!(plan.recommended_fee_sats, 500);
+        assert!(plan.min_replacement_fee_sats >= 100);
+        assert!(plan.recommended_fee_sats > 0);
+    }
+
+    #[test]
+    fn plan_cpfp_child_fee_covers_underpaying_parent() {
+        // Parent 200 vb, 200 sats fee → 1 sat/vB. Target 10. Child 110 vb (1-in 1-out).
+        let child_vb = estimate_cpfp_child_vbytes(1);
+        assert_eq!(child_vb, estimate_tx_vbytes(1, 1));
+        let plan = plan_cpfp_child_fee(200, 200, child_vb, 10).unwrap();
+        let package_vb = 200 + child_vb;
+        let needed = package_vb * 10;
+        assert_eq!(plan.min_child_fee_sats, needed - 200);
+        assert_eq!(plan.package_fee_sats, needed);
+        assert!(plan.package_fee_rate_sat_vb >= 10);
+        assert_eq!(plan.package_vbytes, package_vb);
+        assert!(plan.min_child_fee_rate_sat_vb >= 10);
+    }
+
+    #[test]
+    fn plan_cpfp_child_fee_overpaying_parent_still_min_relay_child() {
+        // Parent already at 50 sat/vB; child still needs min-relay for itself.
+        let child_vb = 110u64;
+        let parent_fee = 50 * 200;
+        let plan = plan_cpfp_child_fee(parent_fee, 200, child_vb, 10).unwrap();
+        assert_eq!(plan.min_child_fee_sats, child_vb); // 1 sat/vB min relay
+        assert!(plan.package_fee_rate_sat_vb >= 10);
+    }
+
+    #[test]
+    fn plan_cpfp_child_fee_rejects_bad_inputs() {
+        assert_eq!(
+            plan_cpfp_child_fee(10, 0, 100, 5).unwrap_err(),
+            FeeBumpPlanError::ZeroVbytes
+        );
+        assert_eq!(
+            plan_cpfp_child_fee(10, 100, 0, 5).unwrap_err(),
+            FeeBumpPlanError::ZeroChildVbytes
+        );
+        assert_eq!(
+            plan_cpfp_child_fee(10, 100, 50, 0).unwrap_err(),
+            FeeBumpPlanError::ZeroTargetRate
+        );
+    }
+
+    #[test]
+    fn estimate_cpfp_child_vbytes_defaults_empty_outputs_to_one() {
+        assert_eq!(estimate_cpfp_child_vbytes(0), estimate_tx_vbytes(1, 1));
+        assert_eq!(estimate_cpfp_child_vbytes(2), estimate_tx_vbytes(1, 2));
+    }
+
+    #[test]
+    fn prepared_spend_exposes_weight_and_fee_rate() {
+        let m = import_mnemonic(VECTOR).unwrap();
+        let w = DescriptorWallet::from_mnemonic(&m, Network::Bitcoin, 5).unwrap();
+        let recv = w.receive_addresses[0].clone();
+        let pay_to = w.receive_addresses[1].clone();
+        let chain = MockChainSource::with_utxos(vec![WalletUtxo {
+            outpoint: OutPointRef::new("aa".repeat(32), 0),
+            amount_sats: 100_000,
+            address: recv,
+            confirmations: 6,
+            is_change: false,
+        }]);
+        let prep = select_and_prepare_bip84_spend(&w, &chain, &m, &pay_to, 25_000, 5, 5).unwrap();
+        assert!(prep.weight_vbytes() > 0);
+        assert_eq!(
+            prep.effective_fee_rate_sat_vb(),
+            effective_fee_rate_sat_vb(prep.fee_sats, prep.weight_vbytes())
+        );
+        assert_eq!(
+            prep.estimated_vbytes(),
+            estimate_tx_vbytes(prep.input_count, prep.output_count)
+        );
+        // Weight vbytes should be in the same ballpark as the P2WPKH heuristic.
+        let est = prep.estimated_vbytes();
+        let actual = prep.weight_vbytes();
+        assert!(
+            actual.abs_diff(est) <= 20,
+            "weight {actual} vs estimate {est}"
+        );
+    }
+
+    #[test]
     fn select_coins_with_fee_covers_target_plus_fee() {
         // 1-in 2-out @ 10 sat/vB: fee = (11+68+62)*10 = 1410
         let fee = estimate_fee_sats(1, 2, 10);
@@ -2185,8 +2702,10 @@ mod tests {
         assert_eq!(outcome.signed_inputs(), 1);
         assert_eq!(built.psbt.inputs[0].partial_sigs.len(), 1);
 
-        let n = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
-        assert_eq!(n, 1);
+        let fin = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
+        assert!(fin.is_complete() && fin.is_broadcast_ready(), "{fin:?}");
+        assert_eq!(fin.finalized_inputs(), 1);
+        assert!(psbt_is_broadcast_ready(&built.psbt));
         let witness = built.psbt.inputs[0]
             .final_script_witness
             .as_ref()
@@ -2415,7 +2934,8 @@ mod tests {
         // Finalize pipeline then extract_and_broadcast must accept via mock.
         let outcome = sign_psbt_bip84_p2wpkh(&mut built.psbt, &m, "", Network::Bitcoin, 5).unwrap();
         assert!(outcome.is_complete());
-        finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
+        let fin = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
+        assert!(fin.is_broadcast_ready(), "{fin:?}");
         let expected_txid =
             transaction_txid_hex(&extract_finalized_tx(built.psbt.clone()).unwrap());
         let mut mock = crate::explorer::MockTxBroadcaster::new();
@@ -2651,19 +3171,292 @@ mod tests {
         .unwrap();
         // Pre-stuff empty final witness — finalize must not count it as done.
         built.psbt.inputs[0].final_script_witness = Some(Witness::default());
-        let n = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
-        assert_eq!(n, 0, "empty witness is not finalized");
+        assert!(!psbt_is_broadcast_ready(&built.psbt));
+        let fin = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
+        assert!(
+            !fin.is_complete(),
+            "empty witness is not finalized: {fin:?}"
+        );
+        assert_eq!(fin.finalized_inputs(), 0);
+        // Extract must refuse empty / missing witnesses (never success claim).
+        let err = extract_finalized_tx(built.psbt.clone()).unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("final_script_witness")
+                || msg.contains("empty")
+                || msg.contains("not broadcast"),
+            "{err}"
+        );
         // After sign, finalize should replace empty with real witness.
         sign_psbt_bip84_p2wpkh(&mut built.psbt, &m, "", Network::Bitcoin, 5).unwrap();
         // Empty may have been cleared; re-stuff empty after sign to force the path.
         built.psbt.inputs[0].final_script_witness = Some(Witness::default());
-        let n = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
-        assert_eq!(n, 1);
+        let fin = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
+        assert!(fin.is_complete(), "{fin:?}");
+        assert_eq!(fin.finalized_inputs(), 1);
         assert!(
             built.psbt.inputs[0]
                 .final_script_witness
                 .as_ref()
                 .is_some_and(|w| !w.is_empty())
+        );
+        assert!(psbt_is_broadcast_ready(&built.psbt));
+    }
+
+    /// Multi-sig shaped input (2 partial_sigs): never invent P2WPKH witness / complete.
+    #[test]
+    fn finalize_multisig_partial_sigs_is_partial_not_complete() {
+        use bitcoin::PublicKey;
+        use bitcoin::ecdsa;
+        use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+
+        let m = import_mnemonic(VECTOR).unwrap();
+        let recv = derive_bip84_receive_address(&m, Network::Bitcoin, 0).unwrap();
+        let pay_to = derive_bip84_receive_address(&m, Network::Bitcoin, 1).unwrap();
+        let sel = selection_one_utxo(&recv, 10_000, 9_000, 1_000);
+        let mut built = build_unsigned_psbt(
+            &sel,
+            &SpendParams {
+                payment_address: pay_to,
+                change_address: None,
+                network: Network::Bitcoin,
+            },
+        )
+        .unwrap();
+
+        let secp = Secp256k1::new();
+        let sk1 = SecretKey::from_slice(&[1u8; 32]).expect("sk1");
+        let sk2 = SecretKey::from_slice(&[2u8; 32]).expect("sk2");
+        let pk1 = PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk1));
+        let pk2 = PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk2));
+        let msg = Message::from_digest_slice(&[9u8; 32]).expect("msg");
+        let sig1 = ecdsa::Signature {
+            signature: secp.sign_ecdsa(&msg, &sk1),
+            sighash_type: bitcoin::EcdsaSighashType::All,
+        };
+        let sig2 = ecdsa::Signature {
+            signature: secp.sign_ecdsa(&msg, &sk2),
+            sighash_type: bitcoin::EcdsaSighashType::All,
+        };
+        built.psbt.inputs[0].partial_sigs.insert(pk1, sig1);
+        built.psbt.inputs[0].partial_sigs.insert(pk2, sig2);
+        assert_eq!(built.psbt.inputs[0].partial_sigs.len(), 2);
+
+        let fin = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
+        assert!(!fin.is_complete() && !fin.is_broadcast_ready(), "{fin:?}");
+        match &fin {
+            FinalizeOutcome::Partial {
+                finalized_inputs,
+                residual_inputs,
+                detail,
+            } => {
+                assert_eq!(*finalized_inputs, 0);
+                assert_eq!(*residual_inputs, 1);
+                let d = detail.to_ascii_lowercase();
+                assert!(d.contains("multi") || d.contains("partial_sig"), "{detail}");
+                assert!(d.contains("not broadcast-ready"), "{detail}");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        // Must not invent a final witness for multi-sig residual.
+        assert!(
+            built.psbt.inputs[0]
+                .final_script_witness
+                .as_ref()
+                .map(|w| w.is_empty())
+                .unwrap_or(true),
+            "multi-sig residual must not claim final witness"
+        );
+        assert!(!psbt_is_broadcast_ready(&built.psbt));
+        let err = extract_finalized_tx(built.psbt).unwrap_err();
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains("final_script_witness")
+                || err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("not broadcast"),
+            "{err}"
+        );
+    }
+
+    /// Non-P2WPKH (P2WSH) script residual: finalize Partial, never extract success.
+    #[test]
+    fn finalize_non_p2wpkh_p2wsh_is_partial_not_complete() {
+        use bitcoin::PublicKey;
+        use bitcoin::ecdsa;
+        use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+
+        let m = import_mnemonic(VECTOR).unwrap();
+        let recv = derive_bip84_receive_address(&m, Network::Bitcoin, 0).unwrap();
+        let pay_to = derive_bip84_receive_address(&m, Network::Bitcoin, 1).unwrap();
+        let sel = selection_one_utxo(&recv, 10_000, 9_000, 1_000);
+        let mut built = build_unsigned_psbt(
+            &sel,
+            &SpendParams {
+                payment_address: pay_to,
+                change_address: None,
+                network: Network::Bitcoin,
+            },
+        )
+        .unwrap();
+
+        // Replace witness_utxo script with P2WSH (non-P2WPKH residual).
+        let redeem = ScriptBuf::from_hex("51").expect("OP_TRUE");
+        let p2wsh = redeem.to_p2wsh();
+        assert!(p2wsh.is_p2wsh());
+        if let Some(utxo) = built.psbt.inputs[0].witness_utxo.as_mut() {
+            utxo.script_pubkey = p2wsh;
+        }
+        // Inject a single partial_sig so finalize reaches the script-type check
+        // (unsigned residual would also be Partial; this asserts non-P2WPKH path).
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[3u8; 32]).expect("sk");
+        let pk = PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk));
+        let msg = Message::from_digest_slice(&[8u8; 32]).expect("msg");
+        let sig = ecdsa::Signature {
+            signature: secp.sign_ecdsa(&msg, &sk),
+            sighash_type: bitcoin::EcdsaSighashType::All,
+        };
+        built.psbt.inputs[0].partial_sigs.insert(pk, sig);
+
+        let fin = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
+        assert!(!fin.is_complete() && !fin.is_broadcast_ready(), "{fin:?}");
+        match &fin {
+            FinalizeOutcome::Partial {
+                finalized_inputs,
+                residual_inputs,
+                detail,
+            } => {
+                assert_eq!(*finalized_inputs, 0);
+                assert_eq!(*residual_inputs, 1);
+                let d = detail.to_ascii_lowercase();
+                assert!(d.contains("non-p2wpkh") || d.contains("p2wpkh"), "{detail}");
+                assert!(d.contains("not broadcast-ready"), "{detail}");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        assert!(
+            built.psbt.inputs[0].final_script_witness.is_none(),
+            "non-P2WPKH must not set final_script_witness"
+        );
+        assert!(!psbt_is_broadcast_ready(&built.psbt));
+        let err = extract_finalized_tx(built.psbt).unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("final_script_witness") || msg.contains("not broadcast"),
+            "{err}"
+        );
+    }
+
+    /// Partial sign must never claim extract / prepare / broadcast-ready success.
+    #[test]
+    fn partial_sign_never_claims_extract_or_prepare_success() {
+        let m = import_mnemonic(VECTOR).unwrap();
+        let foreign = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let pay_to = derive_bip84_receive_address(&m, Network::Bitcoin, 0).unwrap();
+        let sel = selection_one_utxo(foreign, 10_000, 9_000, 1_000);
+        let mut built = build_unsigned_psbt(
+            &sel,
+            &SpendParams {
+                payment_address: pay_to.clone(),
+                change_address: None,
+                network: Network::Bitcoin,
+            },
+        )
+        .unwrap();
+
+        let outcome = sign_psbt_bip84_p2wpkh(&mut built.psbt, &m, "", Network::Bitcoin, 5).unwrap();
+        assert!(!outcome.is_complete() && !outcome.is_broadcast_ready());
+        match &outcome {
+            SignOutcome::Partial { detail, .. } => {
+                assert!(
+                    detail.to_ascii_lowercase().contains("not broadcast-ready"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+
+        // Finalize of unsigned inputs is Partial (not Complete).
+        let fin = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
+        assert!(!fin.is_complete() && !fin.is_broadcast_ready(), "{fin:?}");
+        assert_eq!(fin.finalized_inputs(), 0);
+        assert!(!psbt_is_broadcast_ready(&built.psbt));
+
+        let err = extract_finalized_tx(built.psbt.clone()).unwrap_err();
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains("final_script_witness")
+                || err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("not broadcast"),
+            "{err}"
+        );
+
+        let mut mock = crate::explorer::MockTxBroadcaster::new();
+        mock.push_ok("should-not-be-used");
+        let err = extract_and_broadcast(built.psbt, &mut mock).unwrap_err();
+        assert!(mock.submitted.is_empty(), "partial must not broadcast");
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains("final_script_witness")
+                || err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("not broadcast")
+                || err.to_string().to_ascii_lowercase().contains("finalize"),
+            "{err}"
+        );
+
+        // Product prepare path refuses partial (honest residual).
+        let err = prepare_bip84_p2wpkh_spend(
+            &sel,
+            &SpendParams {
+                payment_address: pay_to,
+                change_address: None,
+                network: Network::Bitcoin,
+            },
+            &m,
+            "",
+            5,
+        )
+        .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("incomplete") || msg.contains("not broadcast"),
+            "{err}"
+        );
+        assert!(!msg.contains("broadcast accepted") && !msg.contains("txid accepted"));
+    }
+
+    /// Empty final_script_witness alone is never broadcast-ready for extract.
+    #[test]
+    fn extract_rejects_empty_final_script_witness() {
+        let m = import_mnemonic(VECTOR).unwrap();
+        let recv = derive_bip84_receive_address(&m, Network::Bitcoin, 0).unwrap();
+        let pay_to = derive_bip84_receive_address(&m, Network::Bitcoin, 1).unwrap();
+        let sel = selection_one_utxo(&recv, 10_000, 9_000, 1_000);
+        let mut built = build_unsigned_psbt(
+            &sel,
+            &SpendParams {
+                payment_address: pay_to,
+                change_address: None,
+                network: Network::Bitcoin,
+            },
+        )
+        .unwrap();
+        built.psbt.inputs[0].final_script_witness = Some(Witness::default());
+        assert!(!psbt_is_broadcast_ready(&built.psbt));
+        let err = extract_finalized_tx(built.psbt).unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("empty") || msg.contains("final_script_witness"),
+            "{err}"
         );
     }
 
@@ -2714,8 +3507,10 @@ mod tests {
         assert!(outcome.is_complete(), "{outcome:?}");
         assert_eq!(outcome.signed_inputs(), 2);
 
-        let n = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
-        assert_eq!(n, 2);
+        let fin = finalize_p2wpkh_psbt(&mut built.psbt).unwrap();
+        assert!(fin.is_complete(), "{fin:?}");
+        assert_eq!(fin.finalized_inputs(), 2);
+        assert!(psbt_is_broadcast_ready(&built.psbt));
         let tx = extract_finalized_tx(built.psbt).unwrap();
         assert_eq!(tx.input.len(), 2);
         assert_eq!(tx.output[0].value.to_sat(), 30_000);

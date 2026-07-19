@@ -183,6 +183,33 @@ impl FundingStep {
             Self::RefundOptional => "refund optional",
         }
     }
+
+    /// Stable wire name for persistence (snake_case; not user copy).
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::NeedWallet => "need_wallet",
+            Self::ShowAddress => "show_address",
+            Self::WatchingTx => "watching_tx",
+            Self::OpenChannel => "open_channel",
+            Self::AcquireCashu => "acquire_cashu",
+            Self::ReadyForInference => "ready_for_inference",
+            Self::RefundOptional => "refund_optional",
+        }
+    }
+
+    /// Parse [`Self::as_wire_str`] (and a few aliases). Unknown → `None`.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "need_wallet" => Some(Self::NeedWallet),
+            "show_address" => Some(Self::ShowAddress),
+            "watching_tx" => Some(Self::WatchingTx),
+            "open_channel" => Some(Self::OpenChannel),
+            "acquire_cashu" => Some(Self::AcquireCashu),
+            "ready_for_inference" => Some(Self::ReadyForInference),
+            "refund_optional" => Some(Self::RefundOptional),
+            _ => None,
+        }
+    }
 }
 
 /// Funding wizard state.
@@ -244,6 +271,35 @@ impl FundingWizard {
             required_confirmations: required_confirmations.max(1),
             backup_confirmed: true,
         }
+    }
+
+    /// Resume funding-wizard watch progress after a process restart.
+    ///
+    /// **No BIP-39 / seed material.** Address + txid + confirmation counts only.
+    /// Call only when the original fund path already confirmed backup (watch
+    /// sessions never re-display recovery words).
+    ///
+    /// Invalid for `NeedWallet` (would skip backup gates).
+    pub fn resume_watch(
+        address: impl Into<String>,
+        required_confirmations: u32,
+        step: FundingStep,
+        watched_txid: Option<String>,
+        confirmations: u32,
+    ) -> Result<Self> {
+        if matches!(step, FundingStep::NeedWallet) {
+            return Err(WalletError::Onchain(
+                "cannot resume watch at need_wallet (backup gate not skippable)".into(),
+            ));
+        }
+        Ok(Self {
+            step,
+            receive_address: Some(address.into()),
+            watched_txid,
+            confirmations,
+            required_confirmations: required_confirmations.max(1),
+            backup_confirmed: true,
+        })
     }
 
     /// After BIP-39 backup confirmed and address derived.

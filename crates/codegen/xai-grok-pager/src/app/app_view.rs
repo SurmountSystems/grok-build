@@ -693,6 +693,12 @@ pub struct AppView {
     pub routstr_watch_generation: u64,
     /// Address currently watched (after fund or explicit `/routstr watch`).
     pub routstr_watch_address: Option<String>,
+    /// Canonical Bitcoin network for the active watch (`mainnet`, `signet`, …).
+    ///
+    /// Set at watch start / resume from durable state. Re-arms must reuse this
+    /// and **not** re-read `GROK_BITCOIN_NETWORK`, so a signet deposit survives
+    /// pager restart when env defaults to mainnet.
+    pub routstr_watch_network: Option<String>,
     /// Agent that owns the current singleton watch (for supersede messaging).
     pub routstr_watch_agent_id: Option<crate::app::agent::AgentId>,
     /// Last watch status line for footer / system messages.
@@ -1402,6 +1408,7 @@ impl AppView {
             routstr_credit_balance: None,
             routstr_watch_generation: 0,
             routstr_watch_address: None,
+            routstr_watch_network: None,
             routstr_watch_agent_id: None,
             routstr_watch_status: None,
             routstr_watch_last_scrollback: None,
@@ -5374,6 +5381,7 @@ pub(crate) mod tests {
             routstr_credit_balance: None,
             routstr_watch_generation: 0,
             routstr_watch_address: None,
+            routstr_watch_network: None,
             routstr_watch_agent_id: None,
             routstr_watch_status: None,
             routstr_watch_last_scrollback: None,

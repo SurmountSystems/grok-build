@@ -328,6 +328,120 @@ pub fn mempool_api_broadcast_tx_url(network: BitcoinNetwork) -> String {
     format!("{}/api/tx", mempool_base_url(network))
 }
 
+/// REST recommended fee rates: `GET /api/v1/fees/recommended` (sat/vB integers).
+pub fn mempool_api_fees_recommended_url(network: BitcoinNetwork) -> String {
+    format!("{}/api/v1/fees/recommended", mempool_base_url(network))
+}
+
+/// mempool.space-shaped recommended fee ladder (all values sat/vB).
+///
+/// Pure data; product maps a [`FeePriority`] via [`FeeEstimates::rate_sat_vb`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeeEstimates {
+    pub fastest_sat_vb: u64,
+    pub half_hour_sat_vb: u64,
+    pub hour_sat_vb: u64,
+    pub economy_sat_vb: u64,
+    pub minimum_sat_vb: u64,
+}
+
+/// Which ladder rung to use when selecting a spend fee rate from estimates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FeePriority {
+    /// Next-block target (`fastestFee`).
+    Fastest,
+    /// ~3 block / half-hour target. Product default when estimates are live.
+    #[default]
+    HalfHour,
+    /// ~6 block / hour target.
+    Hour,
+    /// Economy / low-priority.
+    Economy,
+    /// Mempool minimum relay-ish floor from the explorer.
+    Minimum,
+}
+
+impl FeeEstimates {
+    /// Rate for `priority` in sat/vB (may be 0 if the explorer returned 0).
+    pub fn rate_sat_vb(&self, priority: FeePriority) -> u64 {
+        match priority {
+            FeePriority::Fastest => self.fastest_sat_vb,
+            FeePriority::HalfHour => self.half_hour_sat_vb,
+            FeePriority::Hour => self.hour_sat_vb,
+            FeePriority::Economy => self.economy_sat_vb,
+            FeePriority::Minimum => self.minimum_sat_vb,
+        }
+    }
+}
+
+/// Parse mempool.space `GET /api/v1/fees/recommended` JSON (offline-testable).
+///
+/// Expected shape:
+/// `{"fastestFee":N,"halfHourFee":N,"hourFee":N,"economyFee":N,"minimumFee":N}`
+///
+/// All five fields required; non-negative integers. Rejects missing keys and
+/// non-object bodies. Does **not** require network.
+pub fn parse_mempool_fee_estimates(body: &str) -> std::result::Result<FeeEstimates, String> {
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|e| format!("fee estimates JSON: {e}"))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "fee estimates JSON: expected object".to_owned())?;
+    let field = |key: &str| -> std::result::Result<u64, String> {
+        let raw = obj
+            .get(key)
+            .ok_or_else(|| format!("fee estimates JSON: missing {key}"))?;
+        if let Some(n) = raw.as_u64() {
+            return Ok(n);
+        }
+        if let Some(n) = raw.as_i64() {
+            if n < 0 {
+                return Err(format!("fee estimates JSON: {key} must be >= 0"));
+            }
+            return Ok(n as u64);
+        }
+        if let Some(s) = raw.as_str() {
+            return s
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("fee estimates JSON: {key} not an integer"));
+        }
+        Err(format!("fee estimates JSON: {key} not an integer"))
+    };
+    Ok(FeeEstimates {
+        fastest_sat_vb: field("fastestFee")?,
+        half_hour_sat_vb: field("halfHourFee")?,
+        hour_sat_vb: field("hourFee")?,
+        economy_sat_vb: field("economyFee")?,
+        minimum_sat_vb: field("minimumFee")?,
+    })
+}
+
+/// Resolve a spend fee rate (sat/vB): user override → estimates → fallback.
+///
+/// - `user_override` of `Some(0)` is treated as unset (invalid zero rate).
+/// - Estimates rate of 0 is ignored (fall through).
+/// - Final value is always ≥ 1 (fallback forced to at least 1).
+pub fn resolve_spend_fee_rate_sat_vb(
+    user_override: Option<u64>,
+    estimates: Option<&FeeEstimates>,
+    priority: FeePriority,
+    fallback_sat_vb: u64,
+) -> u64 {
+    if let Some(n) = user_override
+        && n > 0
+    {
+        return n;
+    }
+    if let Some(est) = estimates {
+        let r = est.rate_sat_vb(priority);
+        if r > 0 {
+            return r;
+        }
+    }
+    fallback_sat_vb.max(1)
+}
+
 /// Map HTTP status + body into a [`FetchResult`] (shared by real client + tests).
 pub fn fetch_result_from_http(status: u16, body: String) -> FetchResult {
     if status == 429 {
@@ -563,6 +677,21 @@ impl MempoolHttpClient {
         self.get_text(&url)
     }
 
+    /// Recommended fee ladder JSON from mempool.space (`/api/v1/fees/recommended`).
+    ///
+    /// Always goes through [`RateLimitedExplorer`] gates (no bypass). Returns
+    /// `None` when gated, rate-limited, or network error — never invents rates.
+    pub fn fetch_fees_recommended_json(&mut self) -> Option<String> {
+        let url = mempool_api_fees_recommended_url(self.network);
+        self.get_text(&url)
+    }
+
+    /// Parsed [`FeeEstimates`] from live explorer (or `None` on any failure).
+    pub fn fetch_fee_estimates(&mut self) -> Option<FeeEstimates> {
+        let body = self.fetch_fees_recommended_json()?;
+        parse_mempool_fee_estimates(&body).ok()
+    }
+
     /// Broadcast raw transaction hex via `POST /api/tx`.
     ///
     /// Always goes through [`RateLimitedExplorer`] gates (no cache, no bypass).
@@ -753,6 +882,108 @@ mod tests {
         assert_eq!(b, "https://mempool.space/api/tx");
         let b_s = mempool_api_broadcast_tx_url(BitcoinNetwork::Signet);
         assert_eq!(b_s, "https://mempool.space/signet/api/tx");
+        let f = mempool_api_fees_recommended_url(BitcoinNetwork::Mainnet);
+        assert_eq!(f, "https://mempool.space/api/v1/fees/recommended");
+        let f_s = mempool_api_fees_recommended_url(BitcoinNetwork::Signet);
+        assert_eq!(f_s, "https://mempool.space/signet/api/v1/fees/recommended");
+    }
+
+    #[test]
+    fn parse_mempool_fee_estimates_happy_path() {
+        let body = r#"{
+            "fastestFee": 20,
+            "halfHourFee": 15,
+            "hourFee": 10,
+            "economyFee": 5,
+            "minimumFee": 1
+        }"#;
+        let est = parse_mempool_fee_estimates(body).unwrap();
+        assert_eq!(est.fastest_sat_vb, 20);
+        assert_eq!(est.half_hour_sat_vb, 15);
+        assert_eq!(est.hour_sat_vb, 10);
+        assert_eq!(est.economy_sat_vb, 5);
+        assert_eq!(est.minimum_sat_vb, 1);
+        assert_eq!(est.rate_sat_vb(FeePriority::Fastest), 20);
+        assert_eq!(est.rate_sat_vb(FeePriority::HalfHour), 15);
+        assert_eq!(est.rate_sat_vb(FeePriority::Hour), 10);
+        assert_eq!(est.rate_sat_vb(FeePriority::Economy), 5);
+        assert_eq!(est.rate_sat_vb(FeePriority::Minimum), 1);
+        assert_eq!(FeePriority::default(), FeePriority::HalfHour);
+    }
+
+    #[test]
+    fn parse_mempool_fee_estimates_accepts_string_integers() {
+        let body = r#"{"fastestFee":"8","halfHourFee":"6","hourFee":"4","economyFee":"2","minimumFee":"1"}"#;
+        let est = parse_mempool_fee_estimates(body).unwrap();
+        assert_eq!(est.hour_sat_vb, 4);
+    }
+
+    #[test]
+    fn parse_mempool_fee_estimates_rejects_missing_and_bad_shape() {
+        assert!(parse_mempool_fee_estimates("[]").is_err());
+        assert!(parse_mempool_fee_estimates("not-json").is_err());
+        assert!(
+            parse_mempool_fee_estimates(r#"{"fastestFee":1}"#)
+                .unwrap_err()
+                .contains("missing")
+        );
+        assert!(
+            parse_mempool_fee_estimates(
+                r#"{"fastestFee":-1,"halfHourFee":1,"hourFee":1,"economyFee":1,"minimumFee":1}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_mempool_fee_estimates(
+                r#"{"fastestFee":"x","halfHourFee":1,"hourFee":1,"economyFee":1,"minimumFee":1}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_spend_fee_rate_prefers_override_then_estimates_then_fallback() {
+        let est = FeeEstimates {
+            fastest_sat_vb: 20,
+            half_hour_sat_vb: 15,
+            hour_sat_vb: 10,
+            economy_sat_vb: 5,
+            minimum_sat_vb: 1,
+        };
+        assert_eq!(
+            resolve_spend_fee_rate_sat_vb(Some(12), Some(&est), FeePriority::Fastest, 5),
+            12
+        );
+        // Zero override is unset.
+        assert_eq!(
+            resolve_spend_fee_rate_sat_vb(Some(0), Some(&est), FeePriority::HalfHour, 5),
+            15
+        );
+        assert_eq!(
+            resolve_spend_fee_rate_sat_vb(None, Some(&est), FeePriority::Economy, 5),
+            5
+        );
+        assert_eq!(
+            resolve_spend_fee_rate_sat_vb(None, None, FeePriority::HalfHour, 7),
+            7
+        );
+        // Fallback of 0 still yields 1.
+        assert_eq!(
+            resolve_spend_fee_rate_sat_vb(None, None, FeePriority::HalfHour, 0),
+            1
+        );
+        // Zero estimate rate falls through.
+        let zero = FeeEstimates {
+            fastest_sat_vb: 0,
+            half_hour_sat_vb: 0,
+            hour_sat_vb: 0,
+            economy_sat_vb: 0,
+            minimum_sat_vb: 0,
+        };
+        assert_eq!(
+            resolve_spend_fee_rate_sat_vb(None, Some(&zero), FeePriority::Fastest, 9),
+            9
+        );
     }
 
     #[test]

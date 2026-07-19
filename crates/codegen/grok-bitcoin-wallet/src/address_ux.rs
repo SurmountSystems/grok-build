@@ -26,6 +26,16 @@ impl BitcoinNetwork {
             _ => None,
         }
     }
+
+    /// Canonical wire / env string for this network (for persistence).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Signet => "signet",
+            Self::Testnet => "testnet",
+            Self::Testnet4 => "testnet4",
+        }
+    }
 }
 
 /// Everything the UI needs to show a payment endpoint.

@@ -1003,6 +1003,12 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         notify_session_ready(&app.notification_service, agent);
         crate::memory_release::release_retained_memory_with("session-load-replay");
         note_peek_page_flip_after_drain(app, agent_id);
+        // Re-arm durable deposit watch after pager restart (no BIP-39).
+        effects.extend(
+            crate::app::dispatch::routstr::try_resume_persisted_routstr_watch_for_agent(
+                app, agent_id,
+            ),
+        );
         return effects;
     }
     vec![]

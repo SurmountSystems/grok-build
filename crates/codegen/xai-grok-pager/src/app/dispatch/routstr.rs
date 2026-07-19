@@ -1,6 +1,9 @@
 //! `/routstr` product surface: balance, fund gates, top up / refund honesty,
 //! and background address watch.
 
+use std::cell::RefCell;
+use std::path::PathBuf;
+
 use super::status::dispatch_show_usage;
 use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
@@ -12,9 +15,201 @@ use crate::scrollback::block::RenderBlock;
 /// errors still update `routstr_watch_status` (footer) only.
 const WATCH_ERROR_SCROLLBACK_CAP: u32 = 2;
 
+// Test-only override for the durable watch path. When set under `cfg!(test)`,
+// pager unit tests may exercise resume/persist glue against a `tempfile`
+// without touching developer `~/.grok`. Product builds never set this.
+thread_local! {
+    static WATCH_SESSION_PATH_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
 /// Resolve grok home for wallet paths (same layout as CLI).
 fn grok_home() -> std::path::PathBuf {
     xai_grok_shell::util::grok_home::grok_home()
+}
+
+/// Durable watch progress path (`{GROK_HOME}/bitcoin/watch_session.json`).
+///
+/// Under unit tests, returns the injected override when set; otherwise the
+/// default path (persistence is still gated by [`watch_persistence_enabled`]).
+pub(crate) fn watch_session_path() -> PathBuf {
+    if let Some(p) = WATCH_SESSION_PATH_OVERRIDE.with(|c| c.borrow().clone()) {
+        return p;
+    }
+    grok_bitcoin_wallet::watcher::default_watch_session_path(grok_home())
+}
+
+/// Whether durable watch FS I/O is active.
+///
+/// Product binaries: always on. Unit-test builds: only when a path override is
+/// injected so lib tests never pollute developer `~/.grok` by default, but
+/// resume/persist glue can still be covered with a `tempfile`.
+pub(crate) fn watch_persistence_enabled() -> bool {
+    if cfg!(test) {
+        WATCH_SESSION_PATH_OVERRIDE.with(|c| c.borrow().is_some())
+    } else {
+        true
+    }
+}
+
+/// Install (or clear) the test-only durable watch path override.
+///
+/// Prefer [`with_watch_session_path_for_test`] so panics still clear the TLS.
+#[cfg(test)]
+pub(crate) fn set_watch_session_path_override(path: Option<PathBuf>) {
+    WATCH_SESSION_PATH_OVERRIDE.with(|c| {
+        *c.borrow_mut() = path;
+    });
+}
+
+/// Run `f` with durable watch FS pointed at `path`, then clear the override.
+#[cfg(test)]
+pub(crate) fn with_watch_session_path_for_test<T>(path: PathBuf, f: impl FnOnce() -> T) -> T {
+    set_watch_session_path_override(Some(path));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    set_watch_session_path_override(None);
+    match result {
+        Ok(v) => v,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Canonical network wire string for a brand-new watch (`GROK_BITCOIN_NETWORK`).
+fn network_from_env() -> String {
+    use grok_bitcoin_wallet::address_ux::BitcoinNetwork;
+    let raw = std::env::var("GROK_BITCOIN_NETWORK").unwrap_or_else(|_| "mainnet".into());
+    BitcoinNetwork::from_env_str(&raw)
+        .map(|n| n.as_str().to_owned())
+        .unwrap_or_else(|| raw.trim().to_ascii_lowercase())
+}
+
+/// Canonicalize a network string; fall back to env/mainnet when unknown.
+fn canonicalize_network(network: &str) -> String {
+    use grok_bitcoin_wallet::address_ux::BitcoinNetwork;
+    BitcoinNetwork::from_env_str(network)
+        .map(|n| n.as_str().to_owned())
+        .unwrap_or_else(network_from_env)
+}
+
+/// Persist a running watch (address + network only seed-free fields).
+///
+/// Merges prior txid/confirmations when the address matches so a restart mid-
+/// confirmation does not forget progress. Best-effort: disk errors are logged
+/// and never abort the in-process watch loop.
+///
+/// `network` must already be the watch's intended network (durable state on
+/// resume, env only for brand-new watches). Matching-address merges **keep**
+/// the caller's network rather than re-reading env.
+fn persist_routstr_watch_running(address: &str, network: &str, generation: u64) {
+    if !watch_persistence_enabled() {
+        return;
+    }
+    use grok_bitcoin_wallet::address_ux::BitcoinNetwork;
+    use grok_bitcoin_wallet::watcher::{
+        WatchSession, load_watch_session_state, save_watch_session_state,
+    };
+    let path = watch_session_path();
+    let address = address.trim();
+    if address.is_empty() {
+        return;
+    }
+    let net = BitcoinNetwork::from_env_str(network).unwrap_or(BitcoinNetwork::Mainnet);
+    let net_wire = net.as_str().to_owned();
+    let state = match load_watch_session_state(&path) {
+        Ok(Some(prior)) if prior.address.trim() == address => {
+            let mut s = prior;
+            s.running = true;
+            s.generation = generation;
+            // Honor the network the watch was (re)armed with — durable on
+            // resume, not a fresh env default that would rewrite signet→mainnet.
+            s.network = net_wire;
+            s.address = address.to_owned();
+            s
+        }
+        _ => {
+            let session = WatchSession::start(address, net, 3);
+            let mut s = session.to_state(true);
+            s.generation = generation;
+            s
+        }
+    };
+    if let Err(e) = save_watch_session_state(&path, &state) {
+        tracing::warn!(error = %e, path = %path.display(), "persist routstr watch session failed");
+    }
+}
+
+/// Stop durable watch (stop / deposit confirmed). Best-effort.
+///
+/// Unlink first; if remove fails, write `running: false` so the next pager
+/// start cannot re-arm a user-stopped or already-confirmed watch.
+fn clear_persisted_routstr_watch() {
+    if !watch_persistence_enabled() {
+        return;
+    }
+    let path = watch_session_path();
+    if let Err(e) = grok_bitcoin_wallet::watcher::stop_watch_session_state(&path) {
+        tracing::warn!(error = %e, path = %path.display(), "stop routstr watch session failed");
+    }
+}
+
+/// Re-arm a deposit watch after pager process restart if a durable session exists.
+///
+/// Call when an agent view is available (session load / startup). No BIP-39.
+/// Returns empty when nothing to resume or a watch is already running.
+///
+/// **Network:** durable `state.network` is passed through to the effect and
+/// re-persist path — never discarded in favor of `GROK_BITCOIN_NETWORK`.
+pub(crate) fn try_resume_persisted_routstr_watch(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        return vec![];
+    };
+    try_resume_persisted_routstr_watch_for_agent(app, agent_id)
+}
+
+/// Same as [`try_resume_persisted_routstr_watch`] but bound to an explicit agent
+/// (session create/load completions).
+pub(crate) fn try_resume_persisted_routstr_watch_for_agent(
+    app: &mut AppView,
+    agent_id: AgentId,
+) -> Vec<Effect> {
+    if !watch_persistence_enabled() {
+        return vec![];
+    }
+    if app.routstr_watch_address.is_some() {
+        return vec![];
+    }
+    if !app.agents.contains_key(&agent_id) {
+        return vec![];
+    }
+    let path = watch_session_path();
+    let state = match grok_bitcoin_wallet::watcher::load_watch_session_state(&path) {
+        Ok(Some(s)) if s.should_resume() => s,
+        Ok(_) => return vec![],
+        Err(e) => {
+            tracing::warn!(error = %e, "load routstr watch session failed");
+            return vec![];
+        }
+    };
+    let address = state.address.trim().to_owned();
+    if address.is_empty() {
+        return vec![];
+    }
+    let network = canonicalize_network(&state.network);
+    push_system_to_agent(
+        app,
+        agent_id,
+        format!(
+            "Resuming deposit watch for {address} on {network} after restart \
+             (no recovery phrase involved)."
+        ),
+    );
+    // Re-arm with durable network (not env); re-persists with a fresh generation.
+    start_routstr_watch_for_agent_on_network(
+        app,
+        agent_id,
+        address,
+        Some(network),
+        /*immediate*/ true,
+    )
 }
 
 fn push_system_to_agent(app: &mut AppView, agent_id: AgentId, text: impl Into<String>) {
@@ -254,6 +449,9 @@ pub(super) fn dispatch_routstr_watch(app: &mut AppView, address: String) -> Vec<
 /// Does **not** consult `app.active_view`. First poll is immediate when
 /// `immediate` is true; subsequent re-arms sleep between polls.
 ///
+/// Network comes from `GROK_BITCOIN_NETWORK` (brand-new watch). Resume paths
+/// must call [`start_routstr_watch_for_agent_on_network`] with durable network.
+///
 /// **Singleton watch (intentional):** process-wide generation/address on
 /// `AppView`, not per-agent concurrent watches. Tick *messages* still target
 /// the owning `agent_id`. Semantics match
@@ -263,6 +461,21 @@ pub(super) fn start_routstr_watch_for_agent(
     app: &mut AppView,
     agent_id: AgentId,
     address: String,
+    immediate: bool,
+) -> Vec<Effect> {
+    start_routstr_watch_for_agent_on_network(app, agent_id, address, None, immediate)
+}
+
+/// Like [`start_routstr_watch_for_agent`] with an optional network override.
+///
+/// `network_override: Some` is used when resuming durable state so signet /
+/// testnet watches are not rewritten to the env default. `None` reads env for
+/// a brand-new watch (slash `/routstr watch`, fund complete).
+pub(super) fn start_routstr_watch_for_agent_on_network(
+    app: &mut AppView,
+    agent_id: AgentId,
+    address: String,
+    network_override: Option<String>,
     immediate: bool,
 ) -> Vec<Effect> {
     let address = address.trim().to_owned();
@@ -293,6 +506,11 @@ pub(super) fn start_routstr_watch_for_agent(
     app.routstr_watch_generation = app.routstr_watch_generation.saturating_add(1);
     let generation = app.routstr_watch_generation;
     app.routstr_watch_address = Some(address.clone());
+    let network = match network_override {
+        Some(n) if !n.trim().is_empty() => canonicalize_network(&n),
+        _ => network_from_env(),
+    };
+    app.routstr_watch_network = Some(network.clone());
     app.routstr_watch_agent_id = Some(agent_id);
     app.routstr_watch_status = Some(format!("Watching {address}: starting"));
     app.routstr_watch_last_scrollback = None;
@@ -306,7 +524,8 @@ pub(super) fn start_routstr_watch_for_agent(
             grok_bitcoin_wallet::watcher::DEFAULT_WATCH_POLL_INTERVAL.as_secs()
         ),
     );
-    let network = std::env::var("GROK_BITCOIN_NETWORK").unwrap_or_else(|_| "mainnet".into());
+    // Durable progress so a pager restart can re-arm (no BIP-39 in the file).
+    persist_routstr_watch_running(&address, &network, generation);
     vec![Effect::RoutstrWatchLoop {
         agent_id,
         address,
@@ -324,10 +543,12 @@ pub(super) fn dispatch_routstr_watch_stop(app: &mut AppView) -> Vec<Effect> {
     // Mirror WatchTaskLifecycle::stop (bump generation while running, clear address).
     app.routstr_watch_generation = app.routstr_watch_generation.saturating_add(1);
     app.routstr_watch_address = None;
+    app.routstr_watch_network = None;
     app.routstr_watch_agent_id = None;
     app.routstr_watch_status = None;
     app.routstr_watch_last_scrollback = None;
     app.routstr_watch_error_streak = 0;
+    clear_persisted_routstr_watch();
     push_system_active(app, "Address watch stopped.");
     vec![]
 }
@@ -527,10 +748,12 @@ pub(super) fn handle_routstr_watch_tick(
     }
     if confirmed {
         app.routstr_watch_address = None;
+        app.routstr_watch_network = None;
         app.routstr_watch_agent_id = None;
         app.routstr_watch_status = Some("Deposit confirmed enough for next funding steps.".into());
         app.routstr_watch_last_scrollback = None;
         app.routstr_watch_error_streak = 0;
+        clear_persisted_routstr_watch();
         push_system_to_agent(
             app,
             agent_id,
@@ -541,7 +764,12 @@ pub(super) fn handle_routstr_watch_tick(
     }
     // Re-arm poll loop while generation is current (stop bumps generation).
     // Subsequent polls sleep first for rate-limit honesty.
-    let network = std::env::var("GROK_BITCOIN_NETWORK").unwrap_or_else(|_| "mainnet".into());
+    // Reuse in-memory / durable network — never re-read env (would rewrite
+    // signet watches to mainnet when GROK_BITCOIN_NETWORK is unset).
+    let network = app
+        .routstr_watch_network
+        .clone()
+        .unwrap_or_else(network_from_env);
     vec![Effect::RoutstrWatchLoop {
         agent_id,
         address,
@@ -1077,5 +1305,169 @@ mod tests {
             WATCH_ERROR_SCROLLBACK_CAP + 2,
             "streak counts every consecutive error, including past CAP"
         );
+    }
+
+    /// Durable signet watch must survive resume when env defaults to mainnet.
+    #[test]
+    fn resume_honors_durable_signet_network_not_env() {
+        use grok_bitcoin_wallet::address_ux::BitcoinNetwork;
+        use grok_bitcoin_wallet::cashu::FundingStep;
+        use grok_bitcoin_wallet::watcher::{
+            WatchSession, load_watch_session_state, save_watch_session_state,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch_session.json");
+        let addr = "tb1qtestsignet000000000000000000000";
+        let txid = "a".repeat(64);
+
+        let mut state = WatchSession::start(addr, BitcoinNetwork::Signet, 3).to_state(true);
+        state.watched_txid = Some(txid.clone());
+        state.confirmations = 1;
+        state.step = FundingStep::WatchingTx.as_wire_str().into();
+        state.generation = 7;
+        save_watch_session_state(&path, &state).unwrap();
+
+        with_watch_session_path_for_test(path.clone(), || {
+            let mut app = test_app_with_agent();
+            // Brand-new watch without override would use env/mainnet; resume must
+            // ignore that and keep durable signet (regression for Issue 1).
+            let effects = try_resume_persisted_routstr_watch_for_agent(&mut app, AgentId(0));
+            assert!(
+                matches!(
+                    effects.first(),
+                    Some(Effect::RoutstrWatchLoop {
+                        network,
+                        skip_sleep: true,
+                        ..
+                    }) if network == "signet"
+                ),
+                "resume effect must keep durable signet, got {effects:?}"
+            );
+            assert_eq!(app.routstr_watch_network.as_deref(), Some("signet"));
+            assert_eq!(app.routstr_watch_address.as_deref(), Some(addr));
+
+            // Re-persist must not rewrite network to env default.
+            let reloaded = load_watch_session_state(&path).unwrap().expect("file");
+            assert_eq!(reloaded.network, "signet");
+            assert!(reloaded.should_resume());
+            assert_eq!(reloaded.watched_txid.as_deref(), Some(txid.as_str()));
+            assert_eq!(reloaded.confirmations, 1);
+
+            // Re-arm tick must also keep signet (not re-read env).
+            let generation = app.routstr_watch_generation;
+            let rearm = handle_routstr_watch_tick(
+                &mut app,
+                AgentId(0),
+                generation,
+                "Watching: waiting".into(),
+                false,
+                addr.into(),
+            );
+            assert!(
+                matches!(
+                    rearm.first(),
+                    Some(Effect::RoutstrWatchLoop { network, .. }) if network == "signet"
+                ),
+                "re-arm must keep signet: {rearm:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn watch_persist_start_stop_and_no_resume_after_stop() {
+        use grok_bitcoin_wallet::watcher::load_watch_session_state;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch_session.json");
+        let addr = "bc1qpersisttest0000000000000000000";
+
+        with_watch_session_path_for_test(path.clone(), || {
+            let mut app = test_app_with_agent();
+            let effects = start_routstr_watch_for_agent_on_network(
+                &mut app,
+                AgentId(0),
+                addr.into(),
+                Some("testnet".into()),
+                true,
+            );
+            assert!(
+                matches!(
+                    effects.first(),
+                    Some(Effect::RoutstrWatchLoop {
+                        network,
+                        ..
+                    }) if network == "testnet"
+                ),
+                "{effects:?}"
+            );
+            let loaded = load_watch_session_state(&path).unwrap().expect("persisted");
+            assert_eq!(loaded.network, "testnet");
+            assert_eq!(loaded.address, addr);
+            assert!(loaded.should_resume());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "pager persist must write 0600");
+            }
+
+            let _ = dispatch(Action::RoutstrWatchStop, &mut app);
+            assert!(app.routstr_watch_address.is_none());
+            assert!(app.routstr_watch_network.is_none());
+            // File unlinked (or non-resumable).
+            let after = load_watch_session_state(&path).unwrap();
+            assert!(
+                after.as_ref().is_none_or(|s| !s.should_resume()),
+                "stop must not leave resumable state: {after:?}"
+            );
+
+            // Fresh app must not re-arm.
+            let mut app2 = test_app_with_agent();
+            let resume = try_resume_persisted_routstr_watch_for_agent(&mut app2, AgentId(0));
+            assert!(resume.is_empty(), "must not resume after stop: {resume:?}");
+        });
+    }
+
+    #[test]
+    fn watch_confirm_clears_durable_and_does_not_resume() {
+        use grok_bitcoin_wallet::watcher::load_watch_session_state;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch_session.json");
+        let addr = "bc1qconfirmtest000000000000000000";
+
+        with_watch_session_path_for_test(path.clone(), || {
+            let mut app = test_app_with_agent();
+            let _ = start_routstr_watch_for_agent(&mut app, AgentId(0), addr.into(), true);
+            assert!(path.exists());
+            let generation = app.routstr_watch_generation;
+            let effects = handle_routstr_watch_tick(
+                &mut app,
+                AgentId(0),
+                generation,
+                "confirmed enough".into(),
+                true,
+                addr.into(),
+            );
+            assert!(effects.is_empty());
+            assert!(app.routstr_watch_address.is_none());
+            assert!(app.routstr_watch_network.is_none());
+            let after = load_watch_session_state(&path).unwrap();
+            assert!(
+                after.as_ref().is_none_or(|s| !s.should_resume()),
+                "confirm must clear/stop durable: {after:?}"
+            );
+            let mut app2 = test_app_with_agent();
+            assert!(try_resume_persisted_routstr_watch_for_agent(&mut app2, AgentId(0)).is_empty());
+        });
+    }
+
+    #[test]
+    fn without_path_override_unit_tests_skip_durable_fs() {
+        // Default cfg!(test) without override must not touch real GROK_HOME.
+        assert!(!watch_persistence_enabled());
+        let mut app = test_app_with_agent();
+        assert!(try_resume_persisted_routstr_watch_for_agent(&mut app, AgentId(0)).is_empty());
     }
 }

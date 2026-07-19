@@ -4383,10 +4383,37 @@ fn routstr_watch_poll_once(
 ) -> Result<(String, bool, String), String> {
     use grok_bitcoin_wallet::address_ux::BitcoinNetwork;
     use grok_bitcoin_wallet::explorer::MempoolHttpClient;
-    use grok_bitcoin_wallet::watcher::{WatchSession, poll_with_http_client};
+    use grok_bitcoin_wallet::watcher::{
+        WatchSession, load_watch_session_state, poll_with_http_client,
+    };
 
     let net = BitcoinNetwork::from_env_str(network).unwrap_or(BitcoinNetwork::Mainnet);
-    let mut session = WatchSession::start(address, net, 3);
+    // Prefer the effect's network (set from durable state on resume). When
+    // durable progress exists for the same address, resume that session so
+    // txid/confs survive; if durable network differs from effect, prefer
+    // durable (authoritative post-restart).
+    let path = crate::app::dispatch::watch_session_path();
+    let persist = crate::app::dispatch::watch_persistence_enabled();
+    // Resume durable progress (txid / confs) after pager restart; never BIP-39.
+    // Unit-test builds skip disk unless a path override is injected.
+    let mut session = if !persist {
+        WatchSession::start(address, net, 3)
+    } else {
+        match load_watch_session_state(&path) {
+            Ok(Some(state))
+                if state.should_resume() && state.address.trim() == address.trim() =>
+            {
+                // Prefer durable network over effect/env when resuming progress.
+                WatchSession::resume_from_state(&state).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "resume watch session failed; starting fresh");
+                    WatchSession::start(address, net, 3)
+                })
+            }
+            _ => WatchSession::start(address, net, 3),
+        }
+    };
+    // Client network must match the session (durable on resume).
+    let net = session.network();
     let mut client = MempoolHttpClient::with_defaults(net)
         .map_err(|e| format!("mempool client: {e}"))?;
     let update = poll_with_http_client(session.watcher_mut(), &mut client);
@@ -4401,6 +4428,16 @@ fn routstr_watch_poll_once(
         &update,
         session.wizard().required_confirmations,
     );
+    // Persist progress so the next process can resume; stop when confirmed.
+    if persist {
+        if confirmed {
+            if let Err(e) = grok_bitcoin_wallet::watcher::stop_watch_session_state(&path) {
+                tracing::warn!(error = %e, "stop watch session after confirm failed");
+            }
+        } else if let Err(e) = session.save_to_path(&path, true) {
+            tracing::warn!(error = %e, "save watch session after poll failed");
+        }
+    }
     Ok((status, confirmed, address.to_owned()))
 }
 

@@ -9,16 +9,258 @@
 //! Multi-URL polls advance the clock (or sleep) between gated fetches so a
 //! single logical poll can complete address → tx → tip under default
 //! `min_interval` without under-reporting confirmations.
+//!
+//! ## Persistence
+//!
+//! [`WatchSessionState`] can be serialized to disk so a deposit watch survives
+//! pager process restarts. The file holds **only** address / network / txid /
+//! confirmation progress — **never** BIP-39 or other seed material.
 
-use std::time::{Duration, Instant};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use crate::address_ux::{BitcoinNetwork, mempool_txid_url};
 use crate::cashu::{FundingStep, FundingWizard};
-use crate::error::Result;
+use crate::error::{Result, WalletError};
 use crate::explorer::{
     FetchResult, RateLimitedExplorer, mempool_api_address_url, mempool_api_tip_height_url,
     mempool_api_tx_url,
 };
+
+/// On-disk format version for [`WatchSessionState`].
+pub const WATCH_SESSION_FORMAT_VERSION: u32 = 1;
+
+/// Relative path under grok home: `bitcoin/watch_session.json`.
+pub const WATCH_SESSION_REL_PATH: &str = "bitcoin/watch_session.json";
+
+/// Default durable path: `{grok_home}/bitcoin/watch_session.json`.
+///
+/// No BIP-39 — only watch progress (address / txid / confirmations).
+pub fn default_watch_session_path(grok_home: impl AsRef<Path>) -> PathBuf {
+    grok_home.as_ref().join(WATCH_SESSION_REL_PATH)
+}
+
+/// Durable watch progress for resume after process restart.
+///
+/// **Invariant:** never contains seed material, recovery phrases, or vault
+/// secrets. Safe to write as world-unreadable JSON under grok home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchSessionState {
+    /// Format version ([`WATCH_SESSION_FORMAT_VERSION`]).
+    pub version: u32,
+    /// Receive address being watched (no secrets).
+    pub address: String,
+    /// Canonical network wire string (`mainnet`, `signet`, …).
+    pub network: String,
+    /// Confirmations required to leave WatchingTx.
+    pub required_confirmations: u32,
+    /// Known funding txid when discovered.
+    pub watched_txid: Option<String>,
+    /// Last observed confirmation count for `watched_txid`.
+    pub confirmations: u32,
+    /// Funding wizard step wire name ([`FundingStep::as_wire_str`]).
+    pub step: String,
+    /// Session generation at last persist (product may re-bump on reload).
+    pub generation: u64,
+    /// Whether the watch is considered running (false after stop / confirmed).
+    pub running: bool,
+    /// Unix seconds when last written (informational).
+    pub updated_unix_secs: u64,
+}
+
+impl WatchSessionState {
+    /// Validate wire fields and reject seed-looking payloads.
+    pub fn validate(&self) -> Result<()> {
+        if self.version == 0 || self.version > WATCH_SESSION_FORMAT_VERSION {
+            return Err(WalletError::Onchain(format!(
+                "unsupported watch session version {}",
+                self.version
+            )));
+        }
+        let address = self.address.trim();
+        if address.is_empty() {
+            return Err(WalletError::Onchain(
+                "watch session address is empty".into(),
+            ));
+        }
+        // Hard reject: never persist / load BIP-39-shaped blobs here.
+        if looks_like_bip39_phrase(address) {
+            return Err(WalletError::Onchain(
+                "watch session must not contain BIP-39 material".into(),
+            ));
+        }
+        if BitcoinNetwork::from_env_str(&self.network).is_none() {
+            return Err(WalletError::Onchain(format!(
+                "watch session unknown network {:?}",
+                self.network
+            )));
+        }
+        if FundingStep::from_wire_str(&self.step).is_none() {
+            return Err(WalletError::Onchain(format!(
+                "watch session unknown step {:?}",
+                self.step
+            )));
+        }
+        if let Some(txid) = self.watched_txid.as_deref() {
+            let t = txid.trim();
+            if t.is_empty() || looks_like_bip39_phrase(t) {
+                return Err(WalletError::Onchain(
+                    "watch session txid invalid or looks like seed material".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// True when a process restart should re-arm the watch loop.
+    pub fn should_resume(&self) -> bool {
+        self.running
+            && !self.address.trim().is_empty()
+            && FundingStep::from_wire_str(&self.step)
+                .is_some_and(|s| matches!(s, FundingStep::ShowAddress | FundingStep::WatchingTx))
+    }
+}
+
+fn looks_like_bip39_phrase(s: &str) -> bool {
+    let words: Vec<&str> = s.split_whitespace().collect();
+    (words.len() == 12 || words.len() == 24)
+        && words
+            .iter()
+            .all(|w| w.len() >= 3 && w.chars().all(|c| c.is_ascii_lowercase()))
+}
+
+fn unix_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Load watch session state from `path`. Missing file → `Ok(None)`.
+pub fn load_watch_session_state(path: &Path) -> Result<Option<WatchSessionState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)
+        .map_err(|e| WalletError::Onchain(format!("read watch session {}: {e}", path.display())))?;
+    let state: WatchSessionState = serde_json::from_slice(&bytes).map_err(|e| {
+        WalletError::Onchain(format!("parse watch session {}: {e}", path.display()))
+    })?;
+    state.validate()?;
+    // Defense in depth: reject if any string field looks like BIP-39.
+    if looks_like_bip39_phrase(&state.address)
+        || state
+            .watched_txid
+            .as_deref()
+            .is_some_and(looks_like_bip39_phrase)
+    {
+        return Err(WalletError::Onchain(
+            "watch session rejected: BIP-39-shaped field".into(),
+        ));
+    }
+    Ok(Some(state))
+}
+
+/// Atomically write watch session state (mode 0600 on Unix).
+pub fn save_watch_session_state(path: &Path, state: &WatchSessionState) -> Result<()> {
+    state.validate()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            WalletError::Onchain(format!(
+                "create watch session dir {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut to_write = state.clone();
+    to_write.updated_unix_secs = unix_secs_now();
+    let json = serde_json::to_vec_pretty(&to_write)
+        .map_err(|e| WalletError::Onchain(format!("serialize watch session: {e}")))?;
+    write_watch_file_atomic(path, &json)
+}
+
+/// Remove persisted watch session if present (stop / confirmed).
+pub fn clear_watch_session_state(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path).map_err(|e| {
+            WalletError::Onchain(format!("remove watch session {}: {e}", path.display()))
+        })?;
+    }
+    Ok(())
+}
+
+/// Stop a durable watch so it will not resume after process restart.
+///
+/// Prefer unlinking the file. If remove fails (permissions, busy FS, etc.),
+/// fall back to writing `running: false` so [`WatchSessionState::should_resume`]
+/// is false and the next pager start cannot re-arm a user-stopped watch.
+pub fn stop_watch_session_state(path: &Path) -> Result<()> {
+    match clear_watch_session_state(path) {
+        Ok(()) => Ok(()),
+        Err(clear_err) => match load_watch_session_state(path) {
+            Ok(Some(mut state)) => {
+                state.running = false;
+                save_watch_session_state(path, &state).map_err(|save_err| {
+                    WalletError::Onchain(format!(
+                        "stop watch session: clear failed ({clear_err}); \
+                         write running=false also failed: {save_err}"
+                    ))
+                })
+            }
+            Ok(None) => Ok(()), // already gone
+            Err(load_err) => Err(WalletError::Onchain(format!(
+                "stop watch session: clear failed ({clear_err}); \
+                 load for running=false also failed: {load_err}"
+            ))),
+        },
+    }
+}
+
+fn write_watch_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "watch_session.json".into());
+    tmp_name.push(".tmp");
+    let tmp_path = parent.join(tmp_name);
+
+    {
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .map_err(|e| WalletError::Onchain(format!("create watch temp: {e}")))?
+        };
+        #[cfg(not(unix))]
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| WalletError::Onchain(format!("create watch temp: {e}")))?;
+
+        file.write_all(bytes)
+            .map_err(|e| WalletError::Onchain(format!("write watch temp: {e}")))?;
+        file.sync_all()
+            .map_err(|e| WalletError::Onchain(format!("fsync watch temp: {e}")))?;
+    }
+
+    fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        WalletError::Onchain(format!("rename watch session: {e}"))
+    })?;
+    Ok(())
+}
 
 /// Outcome of one watcher poll (no network implied).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -869,6 +1111,97 @@ impl WatchSession {
         )
     }
 
+    /// Snapshot durable fields (no seed material). `running` false when stopped
+    /// or already confirmed enough for next funding steps.
+    pub fn to_state(&self, running: bool) -> WatchSessionState {
+        let effective_running = running && !self.is_confirmed_enough();
+        WatchSessionState {
+            version: WATCH_SESSION_FORMAT_VERSION,
+            address: self.address().to_owned(),
+            network: self.network().as_str().to_owned(),
+            required_confirmations: self.wizard.required_confirmations,
+            watched_txid: self
+                .wizard
+                .watched_txid
+                .clone()
+                .or_else(|| self.watcher.txid().map(str::to_owned)),
+            confirmations: self.wizard.confirmations,
+            step: self.wizard.step.as_wire_str().to_owned(),
+            generation: self.generation,
+            running: effective_running,
+            updated_unix_secs: unix_secs_now(),
+        }
+    }
+
+    /// Rebuild a session from durable state (pager process restart).
+    ///
+    /// Does **not** load BIP-39. Restores address / network / txid / wizard
+    /// progress only. Generation is taken from state (product may re-bump).
+    pub fn resume_from_state(state: &WatchSessionState) -> Result<Self> {
+        state.validate()?;
+        let network = BitcoinNetwork::from_env_str(&state.network).ok_or_else(|| {
+            WalletError::Onchain(format!("resume watch: bad network {}", state.network))
+        })?;
+        let step = FundingStep::from_wire_str(&state.step).ok_or_else(|| {
+            WalletError::Onchain(format!("resume watch: bad step {}", state.step))
+        })?;
+        let address = state.address.trim().to_owned();
+        let wizard = FundingWizard::resume_watch(
+            address.clone(),
+            state.required_confirmations,
+            step,
+            state.watched_txid.clone(),
+            state.confirmations,
+        )?;
+        let mut watcher = AddressWatcher::new(address, network);
+        if let Some(txid) = state.watched_txid.as_deref() {
+            let t = txid.trim();
+            if !t.is_empty() {
+                watcher.set_txid(t);
+            }
+        }
+        Ok(Self {
+            watcher,
+            wizard,
+            generation: state.generation.max(1),
+            last_update: None,
+        })
+    }
+
+    /// Like [`Self::resume_from_state`] but injects a custom explorer (tests).
+    pub fn resume_from_state_with_explorer(
+        state: &WatchSessionState,
+        explorer: RateLimitedExplorer,
+    ) -> Result<Self> {
+        let mut session = Self::resume_from_state(state)?;
+        session.watcher = AddressWatcher::with_explorer(
+            session.watcher.address().to_owned(),
+            session.watcher.network(),
+            explorer,
+        );
+        if let Some(txid) = state.watched_txid.as_deref() {
+            let t = txid.trim();
+            if !t.is_empty() {
+                session.watcher.set_txid(t);
+            }
+        }
+        Ok(session)
+    }
+
+    /// Persist [`Self::to_state`] to `path` (atomic, mode 0600 on Unix).
+    pub fn save_to_path(&self, path: &Path, running: bool) -> Result<()> {
+        save_watch_session_state(path, &self.to_state(running))
+    }
+
+    /// Load + resume from `path`. Missing file → `Ok(None)`.
+    pub fn load_from_path(path: &Path) -> Result<Option<Self>> {
+        match load_watch_session_state(path)? {
+            Some(state) if state.should_resume() => Ok(Some(Self::resume_from_state(&state)?)),
+            Some(_) => Ok(None), // present but not resumable (stopped / confirmed)
+            None => Ok(None),
+        }
+    }
+
     /// One poll tick: fetch via `producer`, apply to wizard, return snapshot.
     pub fn poll_tick(
         &mut self,
@@ -1147,5 +1480,243 @@ mod watch_session_tests {
         assert_ne!(g1, g2);
         assert!(life.accepts(g2));
         assert!(!life.accepts(g1));
+    }
+
+    #[test]
+    fn watch_session_state_roundtrip_json() {
+        let session = WatchSession::start(ADDR, BitcoinNetwork::Mainnet, 3);
+        let state = session.to_state(true);
+        assert_eq!(state.version, WATCH_SESSION_FORMAT_VERSION);
+        assert_eq!(state.address, ADDR);
+        assert_eq!(state.network, "mainnet");
+        assert!(state.running);
+        assert!(state.should_resume());
+        state.validate().unwrap();
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        assert!(!json.to_ascii_lowercase().contains("mnemonic"));
+        assert!(!json.contains("leader"));
+        let back: WatchSessionState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.address, state.address);
+        assert_eq!(back.network, state.network);
+        assert_eq!(back.step, FundingStep::ShowAddress.as_wire_str());
+        assert_eq!(back.required_confirmations, 3);
+    }
+
+    #[test]
+    fn watch_session_persist_load_resume_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = default_watch_session_path(dir.path());
+        assert!(load_watch_session_state(&path).unwrap().is_none());
+
+        let mut session =
+            WatchSession::start_with_explorer(ADDR, BitcoinNetwork::Signet, fast_ex(), 3);
+        // Progress: payment in mempool.
+        let t0 = Instant::now();
+        let txs = format!(r#"[{{"txid":"{TXID}"}}]"#);
+        let tick = session
+            .poll_tick(t0, |url| {
+                if url.contains("/txs") {
+                    FetchResult::Ok(txs.clone())
+                } else if url.contains("/tx/") {
+                    FetchResult::Ok(r#"{"status":{"confirmed":false}}"#.into())
+                } else {
+                    FetchResult::Error
+                }
+            })
+            .unwrap();
+        assert_eq!(tick.step, FundingStep::WatchingTx);
+        assert_eq!(session.wizard().watched_txid.as_deref(), Some(TXID));
+
+        session.save_to_path(&path, true).unwrap();
+        assert!(path.exists());
+        // Atomic write must leave the final path mode 0600 (secrets-adjacent).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "watch_session.json must be mode 0600, got {:o}",
+                mode & 0o777
+            );
+        }
+
+        // Simulate pager process restart: load durable state, resume session.
+        let loaded = load_watch_session_state(&path).unwrap().expect("file");
+        assert!(loaded.should_resume());
+        assert_eq!(loaded.watched_txid.as_deref(), Some(TXID));
+        assert_eq!(loaded.step, FundingStep::WatchingTx.as_wire_str());
+        assert_eq!(loaded.network, "signet");
+
+        let mut resumed =
+            WatchSession::resume_from_state_with_explorer(&loaded, fast_ex()).unwrap();
+        assert_eq!(resumed.address(), ADDR);
+        assert_eq!(resumed.network(), BitcoinNetwork::Signet);
+        assert_eq!(resumed.wizard().step, FundingStep::WatchingTx);
+        assert_eq!(resumed.wizard().watched_txid.as_deref(), Some(TXID));
+        assert_eq!(resumed.watcher().txid(), Some(TXID));
+
+        // Continue poll from resumed state → confirmations advance.
+        let tick = resumed
+            .poll_tick(t0 + Duration::from_secs(2), |url| {
+                if url.contains("/tx/") && !url.contains("/txs") {
+                    FetchResult::Ok(r#"{"status":{"confirmed":true,"block_height":100}}"#.into())
+                } else if url.contains("tip") {
+                    FetchResult::Ok("102".into())
+                } else {
+                    FetchResult::Error
+                }
+            })
+            .unwrap();
+        assert_eq!(tick.update.confirmations, 3);
+        assert!(resumed.is_confirmed_enough());
+
+        // Confirmed → to_state(running=true) still marks running=false.
+        let done = resumed.to_state(true);
+        assert!(!done.running);
+        assert!(!done.should_resume());
+        save_watch_session_state(&path, &done).unwrap();
+        assert!(WatchSession::load_from_path(&path).unwrap().is_none());
+
+        clear_watch_session_state(&path).unwrap();
+        assert!(!path.exists());
+        assert!(load_watch_session_state(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn watch_session_stop_persists_not_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch.json");
+        let mut session = WatchSession::start(ADDR, BitcoinNetwork::Mainnet, 3);
+        session.save_to_path(&path, true).unwrap();
+        assert!(WatchSession::load_from_path(&path).unwrap().is_some());
+
+        session.stop();
+        // Product path: save running=false on stop (or clear file).
+        session.save_to_path(&path, false).unwrap();
+        let state = load_watch_session_state(&path).unwrap().unwrap();
+        assert!(!state.running);
+        assert!(!state.should_resume());
+        assert!(WatchSession::load_from_path(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn stop_watch_session_state_unlinks_when_possible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch.json");
+        WatchSession::start(ADDR, BitcoinNetwork::Signet, 3)
+            .save_to_path(&path, true)
+            .unwrap();
+        assert!(path.exists());
+        stop_watch_session_state(&path).unwrap();
+        assert!(!path.exists());
+        assert!(load_watch_session_state(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn stop_watch_session_state_running_false_fallback() {
+        // Simulate clear-failure path by writing running=false via the same
+        // fallback branch logic (direct exercise of non-resumable save).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch.json");
+        let mut state = WatchSession::start(ADDR, BitcoinNetwork::Testnet, 3).to_state(true);
+        state.watched_txid = Some(TXID.into());
+        state.step = FundingStep::WatchingTx.as_wire_str().into();
+        save_watch_session_state(&path, &state).unwrap();
+        assert!(
+            load_watch_session_state(&path)
+                .unwrap()
+                .unwrap()
+                .should_resume()
+        );
+
+        // Best-effort stop when unlink is not the only option: mark stopped.
+        let mut stopped = load_watch_session_state(&path).unwrap().unwrap();
+        stopped.running = false;
+        save_watch_session_state(&path, &stopped).unwrap();
+        let loaded = load_watch_session_state(&path).unwrap().unwrap();
+        assert!(!loaded.running);
+        assert!(!loaded.should_resume());
+        assert_eq!(loaded.network, "testnet");
+        assert!(WatchSession::load_from_path(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn watch_session_rejects_bip39_in_state() {
+        let mut state = WatchSession::start(ADDR, BitcoinNetwork::Mainnet, 3).to_state(true);
+        state.address =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                .into();
+        let err = state.validate().unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("bip-39")
+                || err.to_string().to_ascii_lowercase().contains("bip39"),
+            "{err}"
+        );
+
+        // File with BIP-39-shaped address must not load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        let evil = serde_json::json!({
+            "version": 1,
+            "address": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "network": "mainnet",
+            "required_confirmations": 3,
+            "watched_txid": null,
+            "confirmations": 0,
+            "step": "show_address",
+            "generation": 1,
+            "running": true,
+            "updated_unix_secs": 0,
+        });
+        fs::write(&path, serde_json::to_vec(&evil).unwrap()).unwrap();
+        let err = load_watch_session_state(&path).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("bip"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn watch_session_resume_preserves_generation_and_rejects_need_wallet() {
+        let mut state = WatchSession::start(ADDR, BitcoinNetwork::Testnet, 5).to_state(true);
+        state.generation = 42;
+        let session = WatchSession::resume_from_state(&state).unwrap();
+        assert_eq!(session.generation(), 42);
+        assert_eq!(session.network(), BitcoinNetwork::Testnet);
+        assert_eq!(session.wizard().required_confirmations, 5);
+
+        state.step = FundingStep::NeedWallet.as_wire_str().into();
+        let err = WatchSession::resume_from_state(&state).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("need_wallet")
+                || err.to_string().to_ascii_lowercase().contains("backup"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn default_watch_session_path_under_bitcoin() {
+        let p = default_watch_session_path("/tmp/grok-home-test");
+        assert!(p.ends_with("bitcoin/watch_session.json"));
+    }
+
+    #[test]
+    fn funding_step_wire_roundtrip() {
+        for step in [
+            FundingStep::ShowAddress,
+            FundingStep::WatchingTx,
+            FundingStep::OpenChannel,
+            FundingStep::AcquireCashu,
+            FundingStep::ReadyForInference,
+            FundingStep::RefundOptional,
+            FundingStep::NeedWallet,
+        ] {
+            let w = step.as_wire_str();
+            assert_eq!(FundingStep::from_wire_str(w), Some(step));
+        }
+        assert_eq!(FundingStep::from_wire_str("nope"), None);
     }
 }

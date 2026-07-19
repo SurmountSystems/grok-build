@@ -42,6 +42,7 @@ Bitcoin / Lightning / Cashu (Chaumian eCash). Never “crypto.”
 | Address UX + rate-limited explorer | done |
 | mempool.space HTTP (`explorer-http`) | done (ignored live test) |
 | BIP84 receive address | done |
-| Descriptor wallet + fee-aware UTXO select + PSBT + broadcast | done (sign/finalize/extract + TxBroadcaster; CLI/TUI dry-run default) |
+| Descriptor wallet + fee-aware UTXO select + PSBT + broadcast | done (sign/finalize/extract + TxBroadcaster; CLI/TUI dry-run default; multi-sig/non-P2WPKH finalize is honest Partial only) |
+| WatchSession persistence (no BIP-39) | done (`{GROK_HOME}/bitcoin/watch_session.json`; pager resume on restart) |
 | LDK pay / BOLT12 | stub / deferred (`BOLT12_SUPPORTED=false`; optional `ldk` feature flag only) |
 | CDK Cashu mint/spend | capability seams + default backend factory; stubs never claim live mint/refund; optional `cashu-cdk` feature flag only |

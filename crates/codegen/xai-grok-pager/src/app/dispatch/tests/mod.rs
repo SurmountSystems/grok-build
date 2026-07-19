@@ -246,6 +246,7 @@ fn test_app() -> AppView {
         routstr_credit_balance: None,
         routstr_watch_generation: 0,
         routstr_watch_address: None,
+        routstr_watch_network: None,
         routstr_watch_agent_id: None,
         routstr_watch_status: None,
         routstr_watch_last_scrollback: None,

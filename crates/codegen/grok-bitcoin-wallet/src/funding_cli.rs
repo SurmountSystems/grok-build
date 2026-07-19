@@ -573,6 +573,9 @@ pub struct SpendRequest {
     /// When false (product default), build/sign/extract only — do not broadcast.
     pub broadcast: bool,
     pub fee_rate_sat_vb: u64,
+    /// True when the user supplied `fee=` / `--fee-rate` (not product default).
+    /// Product may replace non-explicit rates with live explorer estimates.
+    pub fee_rate_explicit: bool,
 }
 
 /// Pure parse errors for spend args (CLI positional / TUI tokens).
@@ -601,6 +604,9 @@ impl std::fmt::Display for SpendParseError {
 }
 
 /// Parse address + amount + broadcast flag into a [`SpendRequest`].
+///
+/// `fee_rate_sat_vb: None` → default rate and `fee_rate_explicit = false`.
+/// `Some(n)` with `n > 0` → explicit rate.
 pub fn parse_spend_request(
     address: &str,
     amount_sats: u64,
@@ -614,6 +620,7 @@ pub fn parse_spend_request(
     if amount_sats == 0 {
         return Err(SpendParseError::ZeroAmount);
     }
+    let fee_rate_explicit = fee_rate_sat_vb.is_some();
     let fee_rate_sat_vb = fee_rate_sat_vb.unwrap_or(DEFAULT_SPEND_FEE_RATE_SAT_VB);
     if fee_rate_sat_vb == 0 {
         return Err(SpendParseError::InvalidFeeRate(
@@ -625,6 +632,7 @@ pub fn parse_spend_request(
         amount_sats,
         broadcast,
         fee_rate_sat_vb,
+        fee_rate_explicit,
     })
 }
 
@@ -745,6 +753,133 @@ pub fn format_spend_prepared_lines(
     lines
 }
 
+/// Fee / RBF meta lines appended after a successful local prepare.
+///
+/// Reports requested vs effective rate and notes that inputs signal BIP-125 RBF
+/// (`Sequence::ENABLE_RBF_NO_LOCKTIME`). Does not claim a replacement was broadcast.
+#[cfg(feature = "onchain-address")]
+pub fn format_spend_fee_meta_lines(
+    fee_sats: u64,
+    vbytes: u64,
+    requested_fee_rate_sat_vb: u64,
+) -> Vec<String> {
+    let effective = crate::descriptor_wallet::effective_fee_rate_sat_vb(fee_sats, vbytes);
+    vec![
+        format!(
+            "Fee rate: requested {requested_fee_rate_sat_vb} sat/vB; effective ~{effective} sat/vB \
+             ({fee_sats} sats / {vbytes} vB)."
+        ),
+        "Inputs signal RBF (BIP-125). To bump later, rebuild at a higher fee rate (see RBF plan \
+         helpers) or CPFP a child that spends a change output."
+            .to_owned(),
+    ]
+}
+
+/// Human lines for an [`crate::descriptor_wallet::RbfFeePlan`].
+#[cfg(feature = "onchain-address")]
+pub fn format_rbf_fee_plan_lines(plan: &crate::descriptor_wallet::RbfFeePlan) -> Vec<String> {
+    vec![
+        format!(
+            "RBF fee bump plan (same-size replacement, {} vB):",
+            plan.original_vbytes
+        ),
+        format!(
+            "  Original: {} sats ({} sat/vB floor)",
+            plan.original_fee_sats, plan.original_fee_rate_sat_vb
+        ),
+        format!(
+            "  BIP-125 minimum replacement: {} sats ({} sat/vB floor; +{} sat/vB incremental)",
+            plan.min_replacement_fee_sats,
+            plan.min_replacement_fee_rate_sat_vb,
+            plan.incremental_relay_sat_vb
+        ),
+        format!(
+            "  Recommended for {} sat/vB target: {} sats ({} sat/vB floor; +{} sats)",
+            plan.target_fee_rate_sat_vb,
+            plan.recommended_fee_sats,
+            plan.recommended_fee_rate_sat_vb,
+            plan.fee_delta_sats
+        ),
+        "  Rebuild the spend at the recommended fee rate (or higher). Does not broadcast."
+            .to_owned(),
+    ]
+}
+
+/// Human lines for an [`crate::descriptor_wallet::CpfpFeePlan`].
+#[cfg(feature = "onchain-address")]
+pub fn format_cpfp_fee_plan_lines(plan: &crate::descriptor_wallet::CpfpFeePlan) -> Vec<String> {
+    vec![
+        format!(
+            "CPFP child fee plan (package {} vB = parent {} + child {}):",
+            plan.package_vbytes, plan.parent_vbytes, plan.child_vbytes
+        ),
+        format!(
+            "  Parent fee: {} sats; target package rate: {} sat/vB",
+            plan.parent_fee_sats, plan.target_fee_rate_sat_vb
+        ),
+        format!(
+            "  Minimum child fee: {} sats (~{} sat/vB child alone)",
+            plan.min_child_fee_sats, plan.min_child_fee_rate_sat_vb
+        ),
+        format!(
+            "  Package after child: {} sats (~{} sat/vB)",
+            plan.package_fee_sats, plan.package_fee_rate_sat_vb
+        ),
+        "  Child must spend a confirmed-or-unconfirmed parent output you control. Guidance only."
+            .to_owned(),
+    ]
+}
+
+/// Human lines for mempool-shaped [`crate::explorer::FeeEstimates`].
+pub fn format_fee_estimates_lines(est: &crate::explorer::FeeEstimates) -> Vec<String> {
+    vec![
+        "Explorer fee estimates (sat/vB):".to_owned(),
+        format!("  fastest: {}", est.fastest_sat_vb),
+        format!("  halfHour: {}", est.half_hour_sat_vb),
+        format!("  hour: {}", est.hour_sat_vb),
+        format!("  economy: {}", est.economy_sat_vb),
+        format!("  minimum: {}", est.minimum_sat_vb),
+        "Use fee=<n> / --fee-rate <n> to override; product default priority is halfHour when live estimates are available."
+            .to_owned(),
+    ]
+}
+
+/// Pure RBF guidance from original fee/size + target rate (product / CLI helper).
+#[cfg(feature = "onchain-address")]
+pub fn rbf_fee_bump_guidance_lines(
+    original_fee_sats: u64,
+    original_vbytes: u64,
+    target_fee_rate_sat_vb: u64,
+) -> std::result::Result<Vec<String>, String> {
+    let plan = crate::descriptor_wallet::plan_rbf_fee_bump(
+        original_fee_sats,
+        original_vbytes,
+        target_fee_rate_sat_vb,
+        0,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(format_rbf_fee_plan_lines(&plan))
+}
+
+/// Pure CPFP guidance; `child_output_count` defaults to 1 when 0.
+#[cfg(feature = "onchain-address")]
+pub fn cpfp_fee_guidance_lines(
+    parent_fee_sats: u64,
+    parent_vbytes: u64,
+    child_output_count: usize,
+    target_fee_rate_sat_vb: u64,
+) -> std::result::Result<Vec<String>, String> {
+    let child_vb = crate::descriptor_wallet::estimate_cpfp_child_vbytes(child_output_count);
+    let plan = crate::descriptor_wallet::plan_cpfp_child_fee(
+        parent_fee_sats,
+        parent_vbytes,
+        child_vb,
+        target_fee_rate_sat_vb,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(format_cpfp_fee_plan_lines(&plan))
+}
+
 /// Lines after explorer accepted a broadcast (txid from broadcaster only).
 pub fn format_spend_broadcast_success_lines(txid: &str, network_label: &str) -> Vec<String> {
     vec![
@@ -783,6 +918,10 @@ pub fn spend_usage_lines() -> Vec<String> {
          writes the hex alone on stdout for piping. Broadcast-requested path does not dump \
          hex before explorer acceptance; on broadcast failure the signed hex is shown for \
          external broadcast."
+            .to_owned(),
+        "Fee: omit --fee-rate to use explorer halfHour estimates when available, else \
+         default 5 sat/vB. Inputs signal RBF (BIP-125); use RBF/CPFP plan helpers to size \
+         a fee bump without inventing witnesses."
             .to_owned(),
     ]
 }
@@ -1320,11 +1459,13 @@ mod tests {
         assert_eq!(req.amount_sats, 21_000);
         assert!(!req.broadcast);
         assert_eq!(req.fee_rate_sat_vb, DEFAULT_SPEND_FEE_RATE_SAT_VB);
+        assert!(!req.fee_rate_explicit);
         assert!(!spend_wants_broadcast(&req));
 
         let req = parse_spend_tokens(&["bc1qtest", "100", "broadcast", "fee=8"]).unwrap();
         assert!(req.broadcast);
         assert_eq!(req.fee_rate_sat_vb, 8);
+        assert!(req.fee_rate_explicit);
         assert!(spend_wants_broadcast(&req));
 
         assert!(matches!(
@@ -1447,5 +1588,55 @@ mod tests {
         let residual = spend_chain_unavailable_lines(true);
         let r = residual.join("\n").to_ascii_lowercase();
         assert!(r.contains("not broadcasting") || r.contains("never claim"));
+    }
+
+    #[test]
+    fn format_fee_estimates_lines_lists_ladder() {
+        let est = crate::explorer::FeeEstimates {
+            fastest_sat_vb: 20,
+            half_hour_sat_vb: 15,
+            hour_sat_vb: 10,
+            economy_sat_vb: 5,
+            minimum_sat_vb: 1,
+        };
+        let joined = format_fee_estimates_lines(&est).join("\n");
+        assert!(joined.contains("fastest: 20"));
+        assert!(joined.contains("halfHour: 15"));
+        assert!(joined.contains("economy: 5"));
+        assert!(!joined.to_ascii_lowercase().contains("crypto"));
+    }
+
+    #[cfg(feature = "onchain-address")]
+    #[test]
+    fn format_spend_fee_meta_and_rbf_cpfp_guidance() {
+        let meta = format_spend_fee_meta_lines(705, 141, 5);
+        let meta_j = meta.join("\n").to_ascii_lowercase();
+        assert!(meta_j.contains("fee rate"));
+        assert!(meta_j.contains("rbf"));
+        assert!(meta_j.contains("5 sat/vb"));
+        assert!(!meta_j.contains("broadcast accepted"));
+
+        let rbf = rbf_fee_bump_guidance_lines(705, 141, 10).unwrap();
+        let rbf_j = rbf.join("\n").to_ascii_lowercase();
+        assert!(rbf_j.contains("rbf fee bump"));
+        assert!(rbf_j.contains("recommended"));
+        assert!(rbf_j.contains("does not broadcast"));
+
+        let cpfp = cpfp_fee_guidance_lines(200, 200, 1, 10).unwrap();
+        let cpfp_j = cpfp.join("\n").to_ascii_lowercase();
+        assert!(cpfp_j.contains("cpfp"));
+        assert!(cpfp_j.contains("minimum child fee"));
+        assert!(cpfp_j.contains("guidance only"));
+
+        assert!(rbf_fee_bump_guidance_lines(100, 0, 10).is_err());
+        assert!(cpfp_fee_guidance_lines(100, 100, 1, 0).is_err());
+    }
+
+    #[test]
+    fn spend_usage_mentions_rbf_and_fee_estimates() {
+        let usage = spend_usage_lines().join("\n").to_ascii_lowercase();
+        assert!(usage.contains("rbf") || usage.contains("bip-125"));
+        assert!(usage.contains("fee"));
+        assert!(!usage.contains("crypto"));
     }
 }

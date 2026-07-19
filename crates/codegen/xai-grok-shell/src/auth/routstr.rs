@@ -425,12 +425,44 @@ pub struct RoutstrSpendSuccess {
     pub lines: Vec<String>,
 }
 
+/// Resolve product spend fee rate (sat/vB).
+///
+/// Order: explicit user override → live mempool.space halfHour estimates
+/// (`explorer-http`) → [`grok_bitcoin_wallet::funding_cli::DEFAULT_SPEND_FEE_RATE_SAT_VB`].
+/// Never invents a rate from a failed fetch; never returns 0.
+pub fn resolve_spend_fee_rate_for_product(user_override: Option<u64>) -> u64 {
+    use grok_bitcoin_wallet::address_ux::BitcoinNetwork;
+    use grok_bitcoin_wallet::explorer::{FeePriority, resolve_spend_fee_rate_sat_vb};
+    use grok_bitcoin_wallet::funding_cli::DEFAULT_SPEND_FEE_RATE_SAT_VB;
+
+    if let Some(n) = user_override
+        && n > 0
+    {
+        return n;
+    }
+
+    let network_str = std::env::var("GROK_BITCOIN_NETWORK").unwrap_or_else(|_| "mainnet".into());
+    let btc_net = BitcoinNetwork::from_env_str(network_str.trim()).unwrap_or(BitcoinNetwork::Mainnet);
+    let estimates = grok_bitcoin_wallet::explorer::MempoolHttpClient::with_defaults(btc_net)
+        .ok()
+        .and_then(|mut c| c.fetch_fee_estimates());
+    resolve_spend_fee_rate_sat_vb(
+        None,
+        estimates.as_ref(),
+        FeePriority::HalfHour,
+        DEFAULT_SPEND_FEE_RATE_SAT_VB,
+    )
+}
+
 /// `grok routstr spend <address> <sats> [--broadcast] [--fee-rate N]`.
 ///
 /// **Dry-run by default** (build/sign/extract only). Explicit `--broadcast`
 /// submits via rate-limited mempool.space. Requires SeedVault unlock + full
 /// recovery-phrase re-entry (same gate as fund). Never mints a new wallet;
 /// keyring errors never mint.
+///
+/// When `fee_rate_sat_vb` is `None`, uses explorer halfHour estimates when the
+/// HTTP client can fetch them; otherwise the wallet default (5 sat/vB).
 pub fn run_routstr_spend(
     grok_home: &Path,
     payment_address: &str,
@@ -445,7 +477,9 @@ pub fn run_routstr_spend(
     use grok_bitcoin_wallet::seed_vault::{SeedVault, UnlockSession, VaultPassword};
     use std::time::Instant;
 
-    let req = parse_spend_request(payment_address, amount_sats, broadcast, fee_rate_sat_vb)
+    // Resolve fee: explicit override → live mempool halfHour estimates → default.
+    let resolved_fee_rate = resolve_spend_fee_rate_for_product(fee_rate_sat_vb);
+    let req = parse_spend_request(payment_address, amount_sats, broadcast, Some(resolved_fee_rate))
         .map_err(|e| RoutstrCliError::Message(e.to_string()))?;
 
     let aead_path = routstr_seed_aead_path(grok_home);
@@ -571,7 +605,7 @@ pub fn complete_routstr_spend_with_mnemonic(
     };
     use grok_bitcoin_wallet::funding_cli::{
         format_spend_broadcast_failed_lines, format_spend_broadcast_success_lines,
-        format_spend_prepared_lines,
+        format_spend_fee_meta_lines, format_spend_prepared_lines,
     };
 
     let network_label = {
@@ -611,6 +645,13 @@ pub fn complete_routstr_spend_with_mnemonic(
         &raw_hex,
         broadcast,
     );
+    // RBF-aware fee meta (effective rate + BIP-125 signal note). Uses weight vB
+    // when available; never claims a replacement was broadcast.
+    lines.extend(format_spend_fee_meta_lines(
+        prepared.fee_sats,
+        prepared.weight_vbytes(),
+        fee_rate_sat_vb,
+    ));
 
     let broadcast_txid = if broadcast {
         let mut client = grok_bitcoin_wallet::explorer::MempoolHttpClient::with_defaults(btc_net)
@@ -1338,5 +1379,17 @@ routstr_enabled = false
         );
         clear_routstr_api_key(&store).unwrap();
         assert!(load_routstr_api_key(&store).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_spend_fee_rate_override_skips_network() {
+        // Explicit override never needs explorer; must not return 0.
+        assert_eq!(resolve_spend_fee_rate_for_product(Some(12)), 12);
+        assert_eq!(resolve_spend_fee_rate_for_product(Some(1)), 1);
+        // Zero / None → default or live halfHour estimate; never 0.
+        let resolved_zero = resolve_spend_fee_rate_for_product(Some(0));
+        let resolved_none = resolve_spend_fee_rate_for_product(None);
+        assert!(resolved_zero >= 1, "got {resolved_zero}");
+        assert!(resolved_none >= 1, "got {resolved_none}");
     }
 }
