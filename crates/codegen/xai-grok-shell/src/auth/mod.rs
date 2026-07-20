@@ -61,10 +61,13 @@ pub use harness_secrets::{
     probe_shared_openrouter_key_default,
 };
 pub use openrouter::{
-    OPENROUTER_API_KEY_ENV, OPENROUTER_API_URL, OPENROUTER_GROK_45_CATALOG_ID, OpenRouterAuthError,
-    clear_openrouter_api_key, has_openrouter_api_key, load_openrouter_api_key,
-    load_openrouter_api_key_default, run_openrouter_login, run_openrouter_logout,
-    store_openrouter_api_key,
+    OPENROUTER_API_KEY_ENV, OPENROUTER_API_KEYS_ENV, OPENROUTER_API_URL,
+    OPENROUTER_GROK_45_CATALOG_ID, OpenRouterAuthError, OpenRouterCreditsData,
+    OpenRouterCreditsResponse, clear_openrouter_api_key, fetch_openrouter_credit_balance_cents,
+    fetch_openrouter_credit_balance_cents_with_key, has_openrouter_api_key,
+    is_openrouter_catalog_id, load_openrouter_api_key, load_openrouter_api_key_default,
+    openrouter_balance_usd_from_credits, run_openrouter_login, run_openrouter_logout,
+    store_openrouter_api_key, usd_to_cents,
 };
 pub(crate) use refresh::DiagnosticUploader;
 pub use storage::{

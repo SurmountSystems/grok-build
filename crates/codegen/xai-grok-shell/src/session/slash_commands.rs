@@ -115,6 +115,53 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         resolve: |_args| BuiltinAction::ContextInfo,
     },
     BuiltinCommand {
+        name: "economic-mode",
+        description: "Cap context at 200K for cheaper Grok 4.5 pricing; clamps auto /implement --effort to 1 (on by default)",
+        argument_hint: Some("on|off|status|global on|global off"),
+        aliases: &["economic", "econ"],
+        gate: BuiltinGate::AlwaysOn,
+        resolve: |args| {
+            let trimmed = args.trim().to_lowercase();
+            match trimmed.as_str() {
+                "" => BuiltinAction::EconomicMode {
+                    enabled: None,
+                    persist_global: false,
+                    status_only: false,
+                },
+                "on" | "enable" | "true" | "1" => BuiltinAction::EconomicMode {
+                    enabled: Some(true),
+                    persist_global: false,
+                    status_only: false,
+                },
+                "off" | "disable" | "false" | "0" => BuiltinAction::EconomicMode {
+                    enabled: Some(false),
+                    persist_global: false,
+                    status_only: false,
+                },
+                "status" | "?" => BuiltinAction::EconomicMode {
+                    enabled: None,
+                    persist_global: false,
+                    status_only: true,
+                },
+                "global on" | "global enable" => BuiltinAction::EconomicMode {
+                    enabled: Some(true),
+                    persist_global: true,
+                    status_only: false,
+                },
+                "global off" | "global disable" => BuiltinAction::EconomicMode {
+                    enabled: Some(false),
+                    persist_global: true,
+                    status_only: false,
+                },
+                _ => BuiltinAction::EconomicMode {
+                    enabled: None,
+                    persist_global: false,
+                    status_only: true,
+                },
+            }
+        },
+    },
+    BuiltinCommand {
         name: "hooks-trust",
         description: "Trust this project for hook execution",
         argument_hint: None,
@@ -809,6 +856,13 @@ pub(super) enum BuiltinAction {
     FlushMemory,
     Dream,
     ContextInfo,
+    /// Cap effective context at 200K for pricing. `enabled: None` with
+    /// `status_only: false` means toggle; `persist_global` writes `[ui].economic_mode`.
+    EconomicMode {
+        enabled: Option<bool>,
+        persist_global: bool,
+        status_only: bool,
+    },
     HooksTrust,
     HooksList,
     HooksAdd {
@@ -875,6 +929,7 @@ impl BuiltinAction {
             BuiltinAction::FlushMemory => "flush",
             BuiltinAction::Dream => "dream",
             BuiltinAction::ContextInfo => "context",
+            BuiltinAction::EconomicMode { .. } => "economic-mode",
             BuiltinAction::HooksTrust => "hooks-trust",
             BuiltinAction::HooksList => "hooks-list",
             BuiltinAction::HooksAdd { .. } => "hooks-add",
@@ -910,6 +965,11 @@ impl BuiltinAction {
             BuiltinAction::FlushMemory => false,
             BuiltinAction::Dream => false,
             BuiltinAction::ContextInfo => false,
+            BuiltinAction::EconomicMode {
+                enabled,
+                persist_global,
+                status_only,
+            } => enabled.is_some() || *persist_global || *status_only,
             BuiltinAction::HooksTrust => false,
             BuiltinAction::HooksList => false,
             BuiltinAction::HooksAdd { .. } => true,
@@ -1685,6 +1745,7 @@ mod tests {
                 "dream",
                 "memory",
                 "context",
+                "economic-mode",
                 "hooks-trust",
                 "hooks-list",
                 "hooks-add",
@@ -2326,6 +2387,69 @@ mod tests {
         assert!(on.iter().any(|n| n == "flush"), "got: {on:?}");
         assert!(on.iter().any(|n| n == "dream"), "got: {on:?}");
         assert!(on.iter().any(|n| n == "memory"), "got: {on:?}");
+    }
+
+    // ── /economic-mode ──────────────────────────────────────────────
+
+    #[test]
+    fn economic_mode_bare_resolves_to_toggle() {
+        assert!(matches!(
+            resolve_builtin("economic-mode", ""),
+            Some(BuiltinAction::EconomicMode {
+                enabled: None,
+                persist_global: false,
+                status_only: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn economic_mode_on_off_and_global_resolve() {
+        assert!(matches!(
+            resolve_builtin("economic-mode", "on"),
+            Some(BuiltinAction::EconomicMode {
+                enabled: Some(true),
+                persist_global: false,
+                status_only: false,
+            })
+        ));
+        assert!(matches!(
+            resolve_builtin("economic-mode", "off"),
+            Some(BuiltinAction::EconomicMode {
+                enabled: Some(false),
+                persist_global: false,
+                status_only: false,
+            })
+        ));
+        assert!(matches!(
+            resolve_builtin("economic-mode", "global off"),
+            Some(BuiltinAction::EconomicMode {
+                enabled: Some(false),
+                persist_global: true,
+                status_only: false,
+            })
+        ));
+        assert!(matches!(
+            resolve_builtin("economic-mode", "status"),
+            Some(BuiltinAction::EconomicMode {
+                status_only: true,
+                ..
+            })
+        ));
+        // Alias `econ` is advertised; resolution goes through name/alias map
+        // in available_commands / parse — resolve_builtin is name-keyed only.
+        let econ = BUILTIN_COMMANDS
+            .iter()
+            .find(|b| b.aliases.contains(&"econ"))
+            .expect("econ alias");
+        assert_eq!(econ.name, "economic-mode");
+        assert!(matches!(
+            (econ.resolve)("on"),
+            BuiltinAction::EconomicMode {
+                enabled: Some(true),
+                ..
+            }
+        ));
     }
 
     // ── /memory ─────────────────────────────────────────────────────

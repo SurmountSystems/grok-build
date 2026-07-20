@@ -1,8 +1,9 @@
 //! Auto-run `/implement` follow-ups after a successful turn ends.
 //!
 //! When enabled (default on), turn end looks for a **sentence/line-leading**
-//! `/implement` command and enqueues the **full multi-line block** (body lines
-//! until EOF or the next non-implement slash command).
+//! `/implement` command and enqueues the **full multi-line block** from the
+//! implement token through EOF (body may include later slash lines that are
+//! part of residual notes — models often paste a whole next-prompt blob).
 //!
 //! Sources (in order):
 //! 1. **User prompt follow-up** — prior user message has non-implement content
@@ -11,12 +12,19 @@
 //!    `/implement` block (models should leave “Next implement prompt” near the
 //!    end). Skipped when the block is an exact echo of the user prompt just
 //!    run (avoids re-queueing the same primary implement).
+//!
+//! When **economic mode** is on (soft-cap context ≈ 200K), auto-queued blocks
+//! clamp explicit `--effort N` / `effort N` above 1 down to 1 so implement
+//! loops stay on the cheap tier (no multi-reviewer fan-out).
 
 use crate::app::agent_view::AgentView;
 use crate::scrollback::block::RenderBlock;
 
 /// Toast shown when a follow-up `/implement` is auto-queued after turn end.
 pub const AUTO_IMPLEMENT_TOAST: &str = "next task /implement detected, automatically running";
+
+/// Max explicit `/implement` effort when economic mode is enabled.
+pub const ECONOMIC_MODE_MAX_IMPLEMENT_EFFORT: u8 = 1;
 
 /// Whether `text` is an `/implement` command at the start of the string
 /// (optional args after whitespace). Case-insensitive command token.
@@ -30,28 +38,6 @@ pub fn is_implement_command_sentence(text: &str) -> bool {
         None => true,
         Some(b) => b.is_ascii_whitespace(),
     }
-}
-
-/// True when a line starts a different top-level slash command (not implement).
-fn is_other_slash_command_line(line: &str) -> bool {
-    let t = line.trim_start();
-    if !t.starts_with('/') {
-        return false;
-    }
-    if is_implement_command_sentence(t) {
-        return false;
-    }
-    // `/path/to/file` is not a slash command — require a command-like token
-    // (no `/` inside the token).
-    let rest = &t[1..];
-    let token_end = rest
-        .find(|c: char| c.is_ascii_whitespace() || c == '/')
-        .unwrap_or(rest.len());
-    let token = &rest[..token_end];
-    !token.is_empty()
-        && token
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Split text into sentence-like units (used only to find mid-line implement
@@ -98,32 +84,110 @@ fn push_unit(out: &mut Vec<String>, s: &str) {
 }
 
 /// From byte offset `start` (must point at `/implement…`), take the full block
-/// through the last line before another top-level slash command (or EOF).
+/// through EOF (trimmed). Body is not cut at a later slash command — residual
+/// prompts often include notes or nested paths after the implement line.
 pub fn extract_implement_block_at(text: &str, start: usize) -> Option<String> {
     if start >= text.len() || !is_implement_command_sentence(&text[start..]) {
         return None;
     }
-    // Prefer the implement token itself as the block start (drop leading prose
-    // on the same line before `/implement`).
-    let rest = &text[start..];
-    let lines: Vec<&str> = rest.lines().collect();
-    if lines.is_empty() {
-        return None;
-    }
-    let mut end_line = lines.len();
-    for (i, line) in lines.iter().enumerate().skip(1) {
-        if is_other_slash_command_line(line) {
-            end_line = i;
-            break;
-        }
-    }
-    let block = lines[..end_line].join("\n");
-    let trimmed = block.trim();
+    let trimmed = text[start..].trim();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Clamp explicit implement effort flags when economic mode is on.
+///
+/// Rewrites leading `/implement --effort N` / `/implement effort N` so any
+/// `N > `[`ECONOMIC_MODE_MAX_IMPLEMENT_EFFORT`] becomes that max. Leaves the
+/// text unchanged when economic mode is off, when no effort flag is present,
+/// or when effort is already ≤ max. Only the first effort flag on the first
+/// line is rewritten (matches skill arg parsing).
+pub fn clamp_implement_effort_for_economic_mode(cmd: &str, economic_mode: bool) -> String {
+    if !economic_mode {
+        return cmd.to_string();
+    }
+    clamp_implement_effort(cmd, ECONOMIC_MODE_MAX_IMPLEMENT_EFFORT)
+}
+
+/// Rewrite the first `--effort N` / `effort N` after `/implement` if `N > max`.
+fn clamp_implement_effort(cmd: &str, max_effort: u8) -> String {
+    let trimmed = cmd.trim_start();
+    if !is_implement_command_sentence(trimmed) {
+        return cmd.to_string();
+    }
+    // Work on the first line only for the flag; keep the rest of the block.
+    let (first_line, rest) = match trimmed.find('\n') {
+        Some(i) => (&trimmed[..i], Some(&trimmed[i..])),
+        None => (trimmed, None),
+    };
+    let Some((prefix, n, suffix)) = split_first_effort_flag(first_line) else {
+        return cmd.to_string();
+    };
+    if n <= max_effort as u32 {
+        return cmd.to_string();
+    }
+    let mut out = String::with_capacity(cmd.len());
+    // Preserve any leading whitespace from the original `cmd`.
+    let lead = cmd.len() - cmd.trim_start().len();
+    out.push_str(&cmd[..lead]);
+    out.push_str(prefix);
+    out.push_str(&max_effort.to_string());
+    out.push_str(suffix);
+    if let Some(r) = rest {
+        out.push_str(r);
+    }
+    out
+}
+
+/// Find the first `--effort N` or `effort N` on an implement first line.
+/// Returns `(text_before_N, N, text_after_N)`.
+fn split_first_effort_flag(first_line: &str) -> Option<(&str, u32, &str)> {
+    let lower = first_line.to_ascii_lowercase();
+    // Prefer `--effort` over bare `effort` when both could match.
+    for needle in ["--effort", "effort"] {
+        let mut search_from = 0usize;
+        while let Some(rel) = lower[search_from..].find(needle) {
+            let abs = search_from + rel;
+            // Token boundary before: start or whitespace.
+            if abs > 0 && !first_line.as_bytes()[abs - 1].is_ascii_whitespace() {
+                search_from = abs + 1;
+                continue;
+            }
+            let after_flag = abs + needle.len();
+            let rest = &first_line[after_flag..];
+            // Require whitespace (or `=`) then digits.
+            let rest_trim_start =
+                rest.trim_start_matches(|c: char| c == '=' || c.is_ascii_whitespace());
+            if rest_trim_start.len() == rest.len() {
+                // No separator between flag and value.
+                search_from = abs + 1;
+                continue;
+            }
+            let digits_end = rest_trim_start
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest_trim_start.len());
+            if digits_end == 0 {
+                search_from = abs + 1;
+                continue;
+            }
+            let num_str = &rest_trim_start[..digits_end];
+            let Ok(n) = num_str.parse::<u32>() else {
+                search_from = abs + 1;
+                continue;
+            };
+            let value_start_in_line = after_flag + (rest.len() - rest_trim_start.len());
+            let value_end_in_line = value_start_in_line + digits_end;
+            return Some((
+                &first_line[..value_start_in_line],
+                n,
+                &first_line[value_end_in_line..],
+            ));
+        }
+    }
+    None
 }
 
 /// Byte offset of a follow-up implement start in `text`, or `None` when the
@@ -260,20 +324,21 @@ pub fn last_turn_assistant_text(agent: &AgentView) -> Option<String> {
 }
 
 /// After a successful non-cancel agent turn, maybe queue a multi-line
-/// `/implement` block. Returns true when enqueued (caller should toast + drain).
-pub fn maybe_enqueue_auto_implement(agent: &mut AgentView, enabled: bool) -> bool {
+/// `/implement` block. Returns `Some(toast)` when enqueued (caller should
+/// show toast + drain), or `None` when nothing was queued.
+pub fn maybe_enqueue_auto_implement(agent: &mut AgentView, enabled: bool) -> Option<String> {
     if !enabled {
-        return false;
+        return None;
     }
     if agent.attached_as_viewer {
-        return false;
+        return None;
     }
     if agent.bash_turn {
-        return false;
+        return None;
     }
     // Don't stack on top of an already-busy local/server queue.
     if !agent.session.pending_prompts.is_empty() || !agent.shared_queue.is_empty() {
-        return false;
+        return None;
     }
 
     let prior = agent.session.prompt_history.first().cloned();
@@ -293,16 +358,30 @@ pub fn maybe_enqueue_auto_implement(agent: &mut AgentView, enabled: bool) -> boo
                 .unwrap_or(true)
         });
 
-    let Some(cmd) = from_user.or(from_assistant) else {
-        return false;
-    };
+    let raw = from_user.or(from_assistant)?;
+
+    let economic = crate::appearance::cache::load_economic_mode();
+    let cmd = clamp_implement_effort_for_economic_mode(&raw, economic);
+    let toast = auto_implement_toast_for(&raw, &cmd, economic);
 
     let ranges = agent
         .prompt
         .slash_controller
         .recognized_token_ranges(&cmd, &agent.session.models);
     agent.session.enqueue_prompt_with_skill_tokens(cmd, ranges);
-    true
+    Some(toast)
+}
+
+/// Toast when a follow-up was auto-queued. Mentions economic effort clamp when
+/// the enqueued text differs from the raw extract (effort was rewritten).
+pub fn auto_implement_toast_for(raw_cmd: &str, enqueued_cmd: &str, economic_mode: bool) -> String {
+    if economic_mode && raw_cmd.trim() != enqueued_cmd.trim() {
+        format!(
+            "{AUTO_IMPLEMENT_TOAST} (economic mode: --effort capped at {ECONOMIC_MODE_MAX_IMPLEMENT_EFFORT})"
+        )
+    } else {
+        AUTO_IMPLEMENT_TOAST.to_string()
+    }
 }
 
 /// After a clean agent turn ends (before queue drain): enqueue a follow-up
@@ -311,8 +390,8 @@ pub fn maybe_enqueue_auto_implement(agent: &mut AgentView, enabled: bool) -> boo
 /// Call only on successful, non-cancel, non-bash turn ends.
 pub fn on_successful_turn_end(agent: &mut AgentView) {
     let enabled = crate::appearance::cache::load_auto_run_implement();
-    if maybe_enqueue_auto_implement(agent, enabled) {
-        agent.show_toast(AUTO_IMPLEMENT_TOAST);
+    if let Some(toast) = maybe_enqueue_auto_implement(agent, enabled) {
+        agent.show_toast(&toast);
     }
 }
 
@@ -408,7 +487,9 @@ Update RESIDUAL.md PRODUCT_FS_NEXT. Stay in cwd; subagent hierarchy; SCORE fail=
     }
 
     #[test]
-    fn extract_stops_before_next_slash_command() {
+    fn extract_grabs_through_eof_including_later_slash_lines() {
+        // Residual blobs sometimes include other slash notes after the body;
+        // take everything through EOF so we do not truncate mid-prompt.
         let prior = "\
 Plan first.
 
@@ -419,10 +500,36 @@ more review notes";
         let got = extract_auto_implement_followup(prior).expect("block");
         assert!(got.contains("1) keep dual residual honest"));
         assert!(
-            !got.contains("/review"),
-            "must not swallow next slash command: {got}"
+            got.contains("/review check security after"),
+            "must keep later slash lines through EOF: {got}"
         );
-        assert!(!got.contains("more review notes"));
+        assert!(got.contains("more review notes"));
+    }
+
+    #[test]
+    fn clamp_effort_when_economic_rewrites_above_max() {
+        let raw = "/implement --effort 5 residual work:\n1) wire Systems.Proc";
+        let got = clamp_implement_effort_for_economic_mode(raw, true);
+        assert!(
+            got.starts_with("/implement --effort 1 "),
+            "expected effort clamped to 1: {got}"
+        );
+        assert!(got.contains("1) wire Systems.Proc"));
+        // Off: unchanged.
+        assert_eq!(clamp_implement_effort_for_economic_mode(raw, false), raw);
+        // Already ≤ max: unchanged.
+        let low = "/implement --effort 1 fix tests";
+        assert_eq!(clamp_implement_effort_for_economic_mode(low, true), low);
+        // Bare `effort N` form.
+        let bare = "/implement effort 3 do the thing";
+        let got_bare = clamp_implement_effort_for_economic_mode(bare, true);
+        assert!(
+            got_bare.starts_with("/implement effort 1 "),
+            "bare effort form: {got_bare}"
+        );
+        // No flag: unchanged.
+        let none = "/implement fix the gate";
+        assert_eq!(clamp_implement_effort_for_economic_mode(none, true), none);
     }
 
     #[test]
@@ -475,6 +582,20 @@ Do the work.
         assert_eq!(
             AUTO_IMPLEMENT_TOAST,
             "next task /implement detected, automatically running"
+        );
+        let raw = "/implement --effort 5 residual";
+        let clamped = clamp_implement_effort_for_economic_mode(raw, true);
+        assert!(
+            auto_implement_toast_for(raw, &clamped, true).contains("economic mode"),
+            "clamped enqueue should mention economic mode in toast"
+        );
+        assert_eq!(
+            auto_implement_toast_for(raw, raw, true),
+            AUTO_IMPLEMENT_TOAST
+        );
+        assert_eq!(
+            auto_implement_toast_for(raw, &clamped, false),
+            AUTO_IMPLEMENT_TOAST
         );
     }
 }

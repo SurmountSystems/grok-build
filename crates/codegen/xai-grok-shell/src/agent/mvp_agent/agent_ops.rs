@@ -3167,15 +3167,24 @@ impl MvpAgent {
         tracing::info!(
             session_id = % session_info.id.0, ? startup_hints, "startup hints"
         );
-        let auto_compact_threshold_percent = {
+        let (auto_compact_threshold_percent, auto_compact_threshold_tokens) = {
             let cfg = self.cfg.borrow();
             let models = self.models_manager.models();
             let model = config::find_model_by_id(&models, &session_model_id.0);
-            crate::util::config::resolve_auto_compact_threshold_percent(
+            let resolved = crate::util::config::resolve_auto_compact_threshold(
                 &cfg,
                 &session_model_id.0,
                 model.map(|e| &e.info),
-            )
+            );
+            let cw = model
+                .map(|e| e.info.context_window.get())
+                .unwrap_or(200_000);
+            match resolved {
+                crate::util::config::AutoCompactThreshold::Percent(p) => (p, None),
+                crate::util::config::AutoCompactThreshold::Tokens(t) => {
+                    (resolved.as_percent_of(cw), Some(t))
+                }
+            }
         };
         let system_prompt_label = {
             let cfg = self.cfg.borrow();
@@ -3462,6 +3471,7 @@ impl MvpAgent {
             let session_key = self.auth_manager.current_or_expired().map(|a| a.key);
             let credentials = xai_chat_state::Credentials {
                 api_key: sampling_config.api_key.clone(),
+                failover_api_keys: sampling_config.failover_api_keys.clone(),
                 auth_type: crate::agent::config::resolve_chat_state_auth_type(
                     sampling_config.model.as_str(),
                     session_key.as_deref(),
@@ -3571,6 +3581,7 @@ impl MvpAgent {
                     startup_hints,
                     client_type,
                     auto_compact_threshold_percent,
+                    auto_compact_threshold_tokens,
                     system_prompt_label,
                     compaction_mode,
                     compaction_verbatim_input,

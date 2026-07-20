@@ -1335,7 +1335,8 @@ lsp_tools = false                      # expose the lsp tool (see LSP Servers be
 codebase_indexing = true               # code graph indexing (true, false, or glob patterns)
 
 [session]
-auto_compact_threshold_percent = 85    # auto-compact at this % of context window
+auto_compact_threshold_percent = 95    # auto-compact at this % of context window (default 95)
+# auto_compact_threshold_tokens = 200000  # optional absolute budget (Grok 4.5: 200k price cliff)
 load_envrc = true                      # load .envrc environment variables into bash commands
 
 [tools]
@@ -1804,8 +1805,9 @@ not a source for models OpenRouter does not host (e.g. Composer-class models).
 **Authenticate** — resolution order:
 
 1. `OPENROUTER_API_KEY` (portable; shared with Zed and other tools)
-2. Grok OSS secret store (OS keyring service `grok-build`, or `~/.grok/provider_credentials.json`)
-3. **Read-only** shared harness probes — including keys already saved in **Zed**:
+2. `OPENROUTER_API_KEYS` (optional extra keys for multi-account failover)
+3. Grok OSS secret store (OS keyring service `grok-build`, or `~/.grok/provider_credentials.json`)
+4. **Read-only** shared harness probes — including keys already saved in **Zed**:
    - Dev channel: `~/.config/zed/development_credentials` (or `%APPDATA%\Zed\…`)
    - OS store: Zed’s Secret Service / Keychain / Credential Manager layout  
      (Linux label `zed-github-account` + `url` attribute; Windows target `zed:url=…`)
@@ -1824,6 +1826,21 @@ grok-oss login --openrouter --api-key "sk-or-..."
 # Clear Grok OSS stored key only (does not unset OPENROUTER_API_KEY or touch Zed)
 grok-oss logout --openrouter
 ```
+
+**Credit failover (multi-account):** when the active key hits a credit /
+spending-limit error (402 / “out of credits”), the sampler automatically tries
+the next configured key on the same host. Provide multiple keys as:
+
+- a comma- or newline-separated list in `OPENROUTER_API_KEY`  
+  (`export OPENROUTER_API_KEY="sk-or-a,sk-or-b"`)
+- and/or `OPENROUTER_API_KEYS` for additional accounts  
+  (`export OPENROUTER_API_KEYS="sk-or-b,sk-or-c"`)
+- and/or a key in the Grok secret store **plus** an env key (env is primary;
+  store is used as failover when distinct)
+- BYOK `api_key` / `env_key` lists in `config.toml` the same way
+
+Keys already equal to the active credential are skipped. Failover is
+request-local (exhausted keys are not reused for that request).
 
 If you already configured OpenRouter in Zed (Settings → AI → LLM Providers), Grok OSS will reuse that key when `OPENROUTER_API_KEY` is unset and no local key is stored.
 
@@ -2660,7 +2677,7 @@ If auto-compact triggers too often, lower the threshold to compact earlier and p
 
 ```toml
 [session]
-auto_compact_threshold_percent = 70    # default is 85
+auto_compact_threshold_percent = 70    # default is 95
 ```
 
 ---

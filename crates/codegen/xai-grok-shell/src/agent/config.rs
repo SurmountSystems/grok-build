@@ -62,7 +62,12 @@ pub const ASSET_SERVER_URL_DEFAULT: &str = "https://assets.grok.com";
 /// ```
 ///
 /// At resolve time the **first set, non-blank** value wins (e.g. SSH
-/// `AcceptEnv LC_*` forwarding of the Bottlerocket token).
+/// `AcceptEnv LC_*` forwarding of the Bottlerocket token). Additional set
+/// names become credit-exhaustion failover keys (see
+/// [`collect_own_credentials`]).
+///
+/// A single env var may also hold comma- or newline-separated keys
+/// (e.g. `OPENROUTER_API_KEY=sk-a,sk-b`); those expand in order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EnvKeys {
@@ -117,15 +122,48 @@ impl EnvKeys {
         &self,
         mut getenv: impl FnMut(&str) -> Option<String>,
     ) -> Option<String> {
+        self.resolve_all_values_with(&mut getenv).into_iter().next()
+    }
+    /// All distinct non-blank values from configured names (each name may
+    /// expand to multiple keys via commas/newlines). Order preserved.
+    pub fn resolve_all_values(&self) -> Vec<String> {
+        self.resolve_all_values_with(|name| std::env::var(name).ok())
+    }
+    /// Testable multi-value resolve.
+    pub fn resolve_all_values_with(
+        &self,
+        mut getenv: impl FnMut(&str) -> Option<String>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
         for name in self.names() {
-            if let Some(value) = getenv(name)
-                && !value.trim().is_empty()
-            {
-                return Some(value);
+            if let Some(value) = getenv(name) {
+                for part in split_api_key_list(&value) {
+                    push_unique_key(&mut out, part);
+                }
             }
         }
-        None
+        out
     }
+}
+
+/// Split a credential list env value on commas and newlines.
+pub(crate) fn split_api_key_list(raw: &str) -> Vec<String> {
+    raw.split([',', '\n', '\r'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn push_unique_key(out: &mut Vec<String>, key: String) {
+    let t = key.trim();
+    if t.is_empty() {
+        return;
+    }
+    if out.iter().any(|k| k.trim() == t) {
+        return;
+    }
+    out.push(t.to_owned());
 }
 /// Semantic equality: compares the ordered name lists, so `One("X")` and
 /// `Many(["X"])` (the shape serde produces for `["X"]`) compare equal.
@@ -1716,11 +1754,20 @@ pub struct SessionConfig {
     ///
     /// `None` means "user didn't set it"; the resolver in
     /// `crate::util::config::resolve_auto_compact_threshold_percent` falls
-    /// through to remote tiers and ultimately the hardcoded default 85.
+    /// through to remote tiers and ultimately the hardcoded default 95.
     /// Read this field via the resolver — not directly — to honor the full
     /// precedence chain (env, per-model, remote, default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_compact_threshold_percent: Option<u8>,
+    /// Absolute token count at which auto-compact fires. When set, takes
+    /// precedence over [`Self::auto_compact_threshold_percent`] for the user
+    /// session tier (still below env override). Useful for pinning to the
+    /// Grok 4.5 long-context price cliff (200k) or a fixed budget.
+    ///
+    /// `None` = percent mode (or unset). Read via
+    /// `resolve_auto_compact_threshold` rather than directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_threshold_tokens: Option<u64>,
     /// Whether to load environment variables from .envrc files.
     /// When enabled, the session will parse .envrc in the workspace directory
     /// and inject the environment variables into bash commands.
@@ -4316,15 +4363,10 @@ impl ModelEntry {
     /// never fall through (see [`resolve_credentials`]). Static + secret store
     /// only: never consults auth-provider tokens.
     pub(crate) fn own_credential(&self) -> Option<String> {
-        first_own_credential(self.api_key.as_deref(), self.env_key.as_ref()).or_else(|| {
-            if crate::auth::openrouter::is_openrouter_base_url(&self.info.base_url) {
-                crate::auth::openrouter::load_openrouter_api_key_default()
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            }
-        })
+        let openrouter = crate::auth::openrouter::is_openrouter_base_url(&self.info.base_url);
+        collect_own_credentials(self.api_key.as_deref(), self.env_key.as_ref(), openrouter)
+            .into_iter()
+            .next()
     }
     /// The provider governing this model's bearer: `None` when a static
     /// `api_key`/`env_key`/OpenRouter store resolves. The turn paths consult
@@ -4705,6 +4747,9 @@ pub struct Features {
 /// Resolved credentials for a model session.
 pub struct ResolvedCredentials {
     pub api_key: Option<String>,
+    /// Extra API keys for credit-exhaustion failover (same host / auth scheme).
+    /// Never includes `api_key`; may be empty.
+    pub failover_api_keys: Vec<String>,
     pub base_url: String,
     pub auth_type: xai_chat_state::AuthType,
     pub auth_scheme: AuthScheme,
@@ -4716,24 +4761,81 @@ pub(crate) fn first_own_credential(
     api_key: Option<&str>,
     env_key: Option<&EnvKeys>,
 ) -> Option<String> {
-    api_key
-        .filter(|k| !k.trim().is_empty())
-        .map(str::to_owned)
-        .or_else(|| env_key.and_then(EnvKeys::resolve_value))
+    collect_own_credentials(api_key, env_key, /* openrouter */ false)
+        .into_iter()
+        .next()
 }
+
+/// Ordered unique BYOK keys: inline `api_key` (may be a comma-list), then every
+/// value from `env_key` names, then (OpenRouter only) secret-store key.
+pub(crate) fn collect_own_credentials(
+    api_key: Option<&str>,
+    env_key: Option<&EnvKeys>,
+    openrouter: bool,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(raw) = api_key {
+        for part in split_api_key_list(raw) {
+            push_unique_key(&mut keys, part);
+        }
+    }
+    if let Some(env) = env_key {
+        for v in env.resolve_all_values() {
+            push_unique_key(&mut keys, v);
+        }
+    }
+    // Also accept OPENROUTER_API_KEYS as an explicit multi-key env (in addition
+    // to comma-lists inside OPENROUTER_API_KEY).
+    if openrouter && let Ok(extra) = std::env::var(crate::auth::openrouter::OPENROUTER_API_KEYS_ENV)
+    {
+        for part in split_api_key_list(&extra) {
+            push_unique_key(&mut keys, part);
+        }
+    }
+    if openrouter {
+        // Prefer reading the Grok secret store directly so a stored key remains
+        // available as failover even when OPENROUTER_API_KEY is set in the env.
+        let store = crate::auth::credentials_store::CredentialsStore::default_store();
+        let url = crate::auth::openrouter::openrouter_credential_url(None);
+        if let Ok(Some((_, store_key))) = store.read(&url) {
+            push_unique_key(&mut keys, store_key);
+        } else if keys.is_empty() {
+            // Fall back to full resolution (env already empty; may hit Zed harness).
+            if let Ok(Some(k)) = crate::auth::openrouter::load_openrouter_api_key_default() {
+                push_unique_key(&mut keys, k);
+            }
+        }
+    }
+    keys
+}
+
+fn split_primary_failover(keys: Vec<String>) -> (Option<String>, Vec<String>) {
+    let mut iter = keys.into_iter();
+    let primary = iter.next();
+    (primary, iter.collect())
+}
+
 /// Resolve credentials for a model.
 /// Priority: model api_key/env_key/OpenRouter secret-store > cached
 /// auth-provider token > session token > XAI_API_KEY.
 ///
-/// When `env_key` lists multiple names, the first set non-empty value is used.
-/// OpenRouter base URLs never fall through to auth-provider, xAI session, or
-/// `XAI_API_KEY` (would send the wrong credential to a third-party host).
+/// When `env_key` lists multiple names (or values contain comma-separated
+/// keys), the first is primary and the rest are credit-failover keys.
+/// OpenRouter base URLs never fall through to xAI session / `XAI_API_KEY`
+/// (would send the wrong credential to a third-party host).
 pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> ResolvedCredentials {
     let info = model.info();
     let is_openrouter = crate::auth::openrouter::is_openrouter_base_url(&info.base_url);
-    let (api_key, base_url, auth_type) = if let Some(key) = model.own_credential() {
+    let own = collect_own_credentials(
+        model.api_key.as_deref(),
+        model.env_key.as_ref(),
+        is_openrouter,
+    );
+    let (api_key, failover_api_keys, base_url, auth_type) = if !own.is_empty() {
+        let (primary, failover) = split_primary_failover(own);
         (
-            Some(key),
+            primary,
+            failover,
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
@@ -4747,6 +4849,7 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
         );
         (
             None,
+            Vec::new(),
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
@@ -4760,6 +4863,7 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
     } else if let Some(key) = session_key {
         (
             Some(key.to_owned()),
+            Vec::new(),
             info.base_url.clone(),
             xai_chat_state::AuthType::SessionToken,
         )
@@ -4768,7 +4872,13 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
             .api_base_url
             .clone()
             .unwrap_or_else(|| info.base_url.clone());
-        (Some(key), url, xai_chat_state::AuthType::ApiKey)
+        // XAI_API_KEY may also be a comma-list for multi-account BYOK.
+        let mut keys = Vec::new();
+        for part in split_api_key_list(&key) {
+            push_unique_key(&mut keys, part);
+        }
+        let (primary, failover) = split_primary_failover(keys);
+        (primary, failover, url, xai_chat_state::AuthType::ApiKey)
     } else {
         if let Some(ref env_keys) = model.env_key
             && !env_keys.is_empty()
@@ -4781,16 +4891,21 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
         }
         (
             None,
+            Vec::new(),
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
     };
     let auth_scheme = info.auth_scheme;
     tracing::debug!(
-        model = % info.model, auth_type = ? auth_type, "resolved credentials"
+        model = % info.model,
+        auth_type = ? auth_type,
+        failover_keys = failover_api_keys.len(),
+        "resolved credentials"
     );
     ResolvedCredentials {
         api_key,
+        failover_api_keys,
         base_url,
         auth_type,
         auth_scheme,
@@ -4810,6 +4925,8 @@ pub fn enforce_disable_api_key_auth(
     {
         creds.auth_type = xai_chat_state::AuthType::SessionToken;
         creds.api_key = session_key.map(str::to_owned);
+        // Session tokens are single-identity; drop BYOK failover keys.
+        creds.failover_api_keys.clear();
         xai_grok_telemetry::unified_log::debug(
             "auth: kill switch blocked a first-party API key at the credential seam",
             None,
@@ -5111,6 +5228,7 @@ pub fn sampling_config_for_model(
     let api_backend = info.api_backend.clone();
     SamplerConfig {
         api_key: credentials.api_key,
+        failover_api_keys: credentials.failover_api_keys,
         model: model_name,
         base_url: credentials.base_url,
         max_completion_tokens,
@@ -5320,7 +5438,12 @@ pub fn to_acp_model_info(
         .map(|(key, model)| {
             let info = model.info();
             let model_id = acp::ModelId::new(Arc::from(key.clone()));
-            let total_context_tokens = info.context_window.get();
+            // Economic mode caps the advertised window so the pager context bar
+            // matches the session effective budget (pricing tier soft-cap).
+            let total_context_tokens = crate::util::config::apply_economic_context_cap(
+                info.context_window.get(),
+                crate::util::config::economic_mode_from_disk(),
+            );
             let meta = {
                 let mut map = serde_json::Map::new();
                 map.insert(
@@ -6441,6 +6564,7 @@ if n == name && f.as_deref() == field
             &model,
             ResolvedCredentials {
                 api_key: Some("fallback-key".to_string()),
+                failover_api_keys: Vec::new(),
                 base_url: model.info().base_url.clone(),
                 auth_type: xai_chat_state::AuthType::ApiKey,
                 auth_scheme: AuthScheme::Bearer,
@@ -6467,6 +6591,7 @@ if n == name && f.as_deref() == field
             );
             let api_key_creds = ResolvedCredentials {
                 api_key: Some("key".into()),
+                failover_api_keys: Vec::new(),
                 base_url: entry
                     .api_base_url
                     .clone()
@@ -6527,6 +6652,44 @@ if n == name && f.as_deref() == field
         );
     }
     #[test]
+    fn env_keys_resolve_all_values_expands_comma_list_and_dedupes() {
+        let keys = EnvKeys::new(["A", "B"]);
+        let all = keys.resolve_all_values_with(|n| match n {
+            "A" => Some("sk-1, sk-2".into()),
+            "B" => Some("sk-2\nsk-3".into()),
+            _ => None,
+        });
+        assert_eq!(all, vec!["sk-1", "sk-2", "sk-3"]);
+    }
+    #[test]
+    fn collect_own_credentials_splits_primary_and_failover() {
+        let keys = collect_own_credentials(
+            Some("primary,failover-a"),
+            Some(&EnvKeys::new(["MISSING_ENV"])),
+            false,
+        );
+        assert_eq!(keys, vec!["primary", "failover-a"]);
+        let model = test_model_entry(
+            "byok",
+            "https://openrouter.ai/api/v1",
+            Some("k1,k2"),
+            None,
+            None,
+        );
+        // Without openrouter env/store, inline list still works.
+        let creds = resolve_credentials(&model, None);
+        assert_eq!(creds.api_key.as_deref(), Some("k1"));
+        assert_eq!(creds.failover_api_keys, vec!["k2".to_string()]);
+        let sampling = sampling_config_for_model(&model, creds, None, None, None, None);
+        assert_eq!(sampling.api_key.as_deref(), Some("k1"));
+        assert_eq!(sampling.failover_api_keys, vec!["k2".to_string()]);
+    }
+    #[test]
+    fn split_api_key_list_trims_commas_and_newlines() {
+        assert_eq!(split_api_key_list(" a , b\nc\r\n , "), vec!["a", "b", "c"]);
+        assert!(split_api_key_list("  , \n").is_empty());
+    }
+    #[test]
     fn env_keys_single_and_array_are_semantically_equal() {
         let from_array: EnvKeys = serde_json::from_str(r#"["X"]"#).unwrap();
         assert_eq!(EnvKeys::new(["X"]), from_array);
@@ -6550,7 +6713,7 @@ if n == name && f.as_deref() == field
         );
         assert_eq!(
             EnvKeys::single("GROK_TEST_WS_PAD").resolve_value_with(|_| Some("  tok  ".into())),
-            Some("  tok  ".into())
+            Some("tok".into())
         );
     }
     #[test]
@@ -6887,6 +7050,7 @@ if n == name && f.as_deref() == field
     fn api_key_creds(base_url: &str) -> ResolvedCredentials {
         ResolvedCredentials {
             api_key: Some("xai-secret".to_string()),
+            failover_api_keys: Vec::new(),
             base_url: base_url.to_string(),
             auth_type: xai_chat_state::AuthType::ApiKey,
             auth_scheme: Default::default(),
@@ -7202,6 +7366,16 @@ if n == name && f.as_deref() == field
     fn default_auto_compact_threshold_is_none() {
         let cfg = Config::default();
         assert_eq!(cfg.session.auto_compact_threshold_percent, None);
+        assert_eq!(cfg.session.auto_compact_threshold_tokens, None);
+        // Product contract: resolver default (when both unset) is 95%.
+        assert_eq!(
+            crate::util::config::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+            95
+        );
+        assert_eq!(
+            crate::util::config::resolve_auto_compact_threshold(&cfg, "any-model", None),
+            crate::util::config::AutoCompactThreshold::Percent(95)
+        );
     }
     #[test]
     fn parses_auto_compact_threshold_percent() {
@@ -7214,6 +7388,23 @@ if n == name && f.as_deref() == field
         .unwrap();
         let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
         assert_eq!(cfg.session.auto_compact_threshold_percent, Some(75));
+        assert_eq!(cfg.session.auto_compact_threshold_tokens, None);
+    }
+    #[test]
+    fn parses_auto_compact_threshold_tokens() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [session]
+            auto_compact_threshold_tokens = 200000
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        assert_eq!(cfg.session.auto_compact_threshold_tokens, Some(200_000));
+        assert_eq!(
+            crate::util::config::resolve_auto_compact_threshold(&cfg, "any-model", None),
+            crate::util::config::AutoCompactThreshold::Tokens(200_000)
+        );
     }
     #[test]
     fn compaction_mode_precedence_env_over_config_over_remote_over_default() {
@@ -7711,7 +7902,11 @@ if n == name && f.as_deref() == field
         let acp_model = acp_models.values().next().expect("should have one model");
         let meta = acp_model.meta.as_ref().expect("meta should be present");
         assert_eq!(meta["agentType"], "codex");
-        assert_eq!(meta["totalContextTokens"], 256_000);
+        // Economic mode defaults on and soft-caps advertised ACP context.
+        assert_eq!(
+            meta["totalContextTokens"],
+            crate::util::config::ECONOMIC_CONTEXT_CAP
+        );
     }
     #[test]
     fn acp_model_meta_always_includes_agent_type() {
@@ -7723,7 +7918,10 @@ if n == name && f.as_deref() == field
         let acp_models = to_acp_model_info(&models);
         let acp_model = acp_models.values().next().expect("should have one model");
         let meta = acp_model.meta.as_ref().expect("meta should be present");
-        assert_eq!(meta["totalContextTokens"], 256_000);
+        assert_eq!(
+            meta["totalContextTokens"],
+            crate::util::config::ECONOMIC_CONTEXT_CAP
+        );
         assert_eq!(
             meta["agentType"], DEFAULT_AGENT_TYPE,
             "agentType should always be in meta, defaulting to DEFAULT_AGENT_TYPE"

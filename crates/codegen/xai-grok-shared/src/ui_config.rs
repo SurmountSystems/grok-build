@@ -146,6 +146,15 @@ pub struct UiConfig {
     /// Written by the pager's settings modal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_run_implement: Option<bool>,
+    /// Soft-cap effective model context at 200K tokens so Grok 4.5 requests
+    /// stay on the lower pricing tier (prices double above 200K). Catalog
+    /// windows remain larger (e.g. 500K); compaction and the context bar use
+    /// the capped size when this is on. `None` = on (client default). Also
+    /// clamps auto-queued `/implement --effort N` to 1. Written by the
+    /// pager's settings modal; overridable per conversation via
+    /// `/economic-mode` when that command is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economic_mode: Option<bool>,
     /// Startup cursor style: `None` (default) inherits the terminal's own
     /// style; `Some(true)` forces the legacy blinking block, `Some(false)` a
     /// steady block. Config-file-only knob (no /settings row).
@@ -279,6 +288,7 @@ impl Default for UiConfig {
             collapsed_edit_blocks: None,
             prompt_suggestions: None,
             auto_run_implement: None,
+            economic_mode: None,
             cursor_blink: None,
             screen_mode: None,
             double_click_action: None,

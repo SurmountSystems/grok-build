@@ -251,7 +251,16 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             silent,
             subscription_tier,
             autotopup,
-        } => handle_billing_fetched(app, agent_id, balance, silent, subscription_tier, autotopup),
+            openrouter_balance,
+        } => handle_billing_fetched(
+            app,
+            agent_id,
+            balance,
+            silent,
+            subscription_tier,
+            autotopup,
+            openrouter_balance,
+        ),
         TaskResult::BillingError {
             agent_id,
             error,
@@ -266,9 +275,16 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::AppBillingFetched { balance, autotopup } => {
+        TaskResult::AppBillingFetched {
+            balance,
+            autotopup,
+            openrouter_balance,
+        } => {
             app.credit_balance = balance;
             apply_auto_topup(&mut app.auto_topup, &autotopup);
+            if let Some(or) = openrouter_balance {
+                app.openrouter_credit_balance = Some(or);
+            }
             vec![]
         }
         TaskResult::GateRefreshed { settings } => handle_gate_refreshed(app, settings),

@@ -56,6 +56,7 @@ fn dispatch_billing(
             silent,
             subscription_tier,
             autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
+            openrouter_balance: None,
         }),
         app,
     );
@@ -823,6 +824,7 @@ fn billing_fetched_stores_autotopup_on_app_and_agent() {
             silent: true,
             subscription_tier: None,
             autotopup: crate::views::credit_bar::AutoTopupFetch::Resolved(autotopup),
+            openrouter_balance: None,
         }),
         &mut app,
     );
@@ -852,6 +854,7 @@ fn billing_fetched_unchanged_autotopup_keeps_cached_rule() {
             silent: true,
             subscription_tier: None,
             autotopup: resolved,
+            openrouter_balance: None,
         }),
         &mut app,
     );
@@ -863,6 +866,7 @@ fn billing_fetched_unchanged_autotopup_keeps_cached_rule() {
             silent: true,
             subscription_tier: None,
             autotopup: crate::views::credit_bar::AutoTopupFetch::Unchanged,
+            openrouter_balance: None,
         }),
         &mut app,
     );
@@ -891,6 +895,7 @@ fn billing_fetched_cleared_autotopup_resets_cache() {
                     max_amount_cents: None,
                 },
             ),
+            openrouter_balance: None,
         }),
         &mut app,
     );
@@ -903,6 +908,7 @@ fn billing_fetched_cleared_autotopup_resets_cache() {
             silent: true,
             subscription_tier: None,
             autotopup: crate::views::credit_bar::AutoTopupFetch::Cleared,
+            openrouter_balance: None,
         }),
         &mut app,
     );
@@ -923,6 +929,7 @@ fn app_billing_fetched_stores_autotopup() {
             autotopup: crate::views::credit_bar::AutoTopupFetch::Resolved(
                 crate::views::credit_bar::AutoTopupInfo::disabled(),
             ),
+            openrouter_balance: None,
         }),
         &mut app,
     );

@@ -404,6 +404,7 @@ impl SessionActor {
         }
         SamplingConfig {
             api_key: creds.api_key,
+            failover_api_keys: creds.failover_api_keys,
             base_url: cfg.base_url,
             model: cfg.model,
             max_completion_tokens: cfg.max_completion_tokens,
@@ -718,7 +719,14 @@ impl SessionActor {
                     && let Some(new_cw) = std::num::NonZeroU64::new(cw)
                     && self.compaction.context_window_override.is_none()
                 {
-                    cfg.context_window = new_cw;
+                    if new_cw.get() > self.compaction.model_context_window.get() {
+                        self.compaction.model_context_window.set(new_cw.get());
+                    }
+                    let effective = crate::util::config::apply_economic_context_cap(
+                        self.compaction.model_context_window.get().max(new_cw.get()),
+                        self.compaction.economic_mode.get(),
+                    );
+                    cfg.context_window = std::num::NonZeroU64::new(effective).unwrap_or(new_cw);
                     self.chat_state_handle.update_sampling_config(cfg);
                 }
                 let trigger_info = compaction::AutoCompactTriggerInfo {

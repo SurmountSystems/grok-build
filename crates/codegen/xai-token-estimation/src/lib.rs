@@ -84,6 +84,36 @@ pub fn exceeds_threshold(used: u64, context_window: u64, threshold_percent: u8) 
     used.saturating_mul(100) >= context_window.saturating_mul(threshold_percent as u64)
 }
 
+/// True when `used` reaches an absolute token threshold (optionally clamped
+/// to `context_window` when the window is known and non-zero).
+///
+/// Prefer this when the user configured auto-compact as a token count rather
+/// than a percent of the window.
+#[inline]
+pub fn exceeds_absolute_threshold(used: u64, threshold_tokens: u64, context_window: u64) -> bool {
+    let limit = if context_window == 0 {
+        threshold_tokens
+    } else {
+        threshold_tokens.min(context_window)
+    };
+    used >= limit
+}
+
+/// Resolve a percent-or-tokens preference to an absolute token count for the
+/// given window, then gate. `threshold_tokens = None` uses percent mode.
+#[inline]
+pub fn exceeds_threshold_resolved(
+    used: u64,
+    context_window: u64,
+    threshold_percent: u8,
+    threshold_tokens: Option<u64>,
+) -> bool {
+    match threshold_tokens {
+        Some(t) => exceeds_absolute_threshold(used, t, context_window),
+        None => exceeds_threshold(used, context_window, threshold_percent),
+    }
+}
+
 /// True when `used * 100 >= context_window * threshold_percent - headroom * 100`,
 /// the scaled form of [`exceeds_threshold`] minus a token headroom.
 /// Returns `false` for `context_window == 0`.

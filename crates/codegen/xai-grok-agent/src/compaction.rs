@@ -8,7 +8,7 @@
 #[derive(Debug, Clone)]
 pub struct CompactionPolicy {
     /// Percentage of context window that triggers auto-compaction.
-    /// E.g., 85 means compact when 85% of the context window is used.
+    /// E.g., 95 means compact when 95% of the context window is used.
     pub auto_compact_threshold_percent: u32,
 
     /// Model to use for generating the compaction summary.
@@ -36,7 +36,7 @@ pub struct CompactionPolicy {
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
-            auto_compact_threshold_percent: 85,
+            auto_compact_threshold_percent: 95,
             compact_model: None,
             memory_flush_enabled: false,
             wall_clock_budget_secs: 300,

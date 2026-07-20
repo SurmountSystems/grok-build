@@ -1351,6 +1351,8 @@ pub(crate) async fn run(
     app.show_tips = config_session_bools.show_tips;
     app.auto_update = config_session_bools.auto_update;
     app.ask_user_question_timeout_enabled = config_session_bools.ask_user_question_timeout_enabled;
+    app.auto_compact_threshold_percent = config_session_bools.auto_compact_threshold_percent;
+    app.auto_compact_threshold_tokens = config_session_bools.auto_compact_threshold_tokens;
     // Prime thread-local caches so first render doesn't hit disk.
     crate::appearance::cache::prime(&app.current_ui);
     // Re-derive the render-value compact flag from the hydrated `current_ui`:
@@ -2728,13 +2730,15 @@ pub(crate) fn load_initial_ui_config() -> xai_grok_shell::agent::config::UiConfi
     ui_value.try_into::<UiConfig>().unwrap_or_default()
 }
 
-/// Config `Option<bool>` mirrors seeded once at startup. `None` = no
-/// TOML override; the modal falls back to the per-setting default.
+/// Config mirrors seeded once at startup. `None` = no TOML override;
+/// the modal falls back to the per-setting default.
 #[derive(Default)]
 struct InitialConfigSessionBools {
     show_tips: Option<bool>,
     auto_update: Option<bool>,
     ask_user_question_timeout_enabled: Option<bool>,
+    auto_compact_threshold_percent: Option<u8>,
+    auto_compact_threshold_tokens: Option<u64>,
 }
 
 fn load_initial_config_session_bools() -> InitialConfigSessionBools {
@@ -2742,6 +2746,23 @@ fn load_initial_config_session_bools() -> InitialConfigSessionBools {
         return InitialConfigSessionBools::default();
     };
     let cli_bool = |key: &str| -> Option<bool> { root.get("cli")?.get(key)?.as_bool() };
+    let session = root.get("session");
+    let auto_compact = session
+        .and_then(|s| s.get("auto_compact_threshold_percent"))
+        .and_then(|v| {
+            v.as_integer()
+                .and_then(|i| u8::try_from(i).ok())
+                .or_else(|| v.as_str()?.parse().ok())
+        })
+        .filter(|p| *p <= 100);
+    let auto_compact_tokens = session
+        .and_then(|s| s.get("auto_compact_threshold_tokens"))
+        .and_then(|v| {
+            v.as_integer()
+                .and_then(|i| u64::try_from(i).ok())
+                .or_else(|| v.as_str()?.replace('_', "").parse().ok())
+        })
+        .filter(|t| *t > 0);
     InitialConfigSessionBools {
         show_tips: cli_bool("show_tips"),
         auto_update: cli_bool("auto_update"),
@@ -2750,6 +2771,8 @@ fn load_initial_config_session_bools() -> InitialConfigSessionBools {
             .and_then(|t| t.get("ask_user_question"))
             .and_then(|a| a.get("timeout_enabled"))
             .and_then(|v| v.as_bool()),
+        auto_compact_threshold_percent: auto_compact,
+        auto_compact_threshold_tokens: auto_compact_tokens,
     }
 }
 

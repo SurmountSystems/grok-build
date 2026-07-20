@@ -195,6 +195,9 @@ pub enum SessionCommand {
         /// `compaction.threshold_percent` (which is `Cell<u8>` so it can
         /// update without `&mut self`).
         auto_compact_threshold_percent: u8,
+        /// Absolute token threshold when the user chose token-count mode;
+        /// `None` keeps percent mode.
+        auto_compact_threshold_tokens: Option<u64>,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
     },
     /// Zero-turn harness rebuild: build a brand-new `Agent` from the

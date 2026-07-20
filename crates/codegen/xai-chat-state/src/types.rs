@@ -118,6 +118,9 @@ pub enum AuthType {
 pub struct Credentials {
     /// API key for authentication.
     pub api_key: Option<String>,
+    /// Additional API keys for credit-exhaustion failover (opaque to chat-state).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover_api_keys: Vec<String>,
     /// Whether this is a session token (refreshable) or user-provided api key.
     #[serde(default)]
     pub auth_type: AuthType,

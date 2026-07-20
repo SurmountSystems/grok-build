@@ -847,6 +847,9 @@ pub struct AgentView {
     pub credit_balance: Option<crate::views::credit_bar::CreditBalance>,
     /// Auto top-up rule paired with `credit_balance` for the prompt warning.
     pub auto_topup: Option<crate::views::credit_bar::AutoTopupInfo>,
+    /// OpenRouter account credits for the prompt footer when the active model
+    /// is OpenRouter-backed.
+    pub openrouter_credit_balance: Option<crate::views::credit_bar::OpenRouterCreditBalance>,
     /// Current goal orchestration state. Set by `GoalUpdated` session
     /// notifications, cleared when a new session starts.
     pub goal_state: Option<super::agent::GoalDisplayState>,

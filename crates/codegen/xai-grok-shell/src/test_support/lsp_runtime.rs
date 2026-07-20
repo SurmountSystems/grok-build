@@ -40,6 +40,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         client_hooks: Default::default(),
         sampling_config: xai_grok_sampler::SamplerConfig {
             api_key: None,
+            failover_api_keys: Vec::new(),
             base_url: String::new(),
             model: String::new(),
             max_completion_tokens: None,

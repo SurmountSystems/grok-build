@@ -205,7 +205,11 @@ fn dispatch_load_session_ungated(
         &app.tier_restricted_commands,
     );
     agent_mut.chat_kind = chat_kind || app.chat_mode;
-    agent_mut.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+    agent_mut.apply_credit_balance(
+        app.credit_balance.clone(),
+        app.auto_topup.clone(),
+        app.openrouter_credit_balance,
+    );
     agent_mut
         .prompt
         .slash_controller
@@ -848,7 +852,11 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
             &app.tier_restricted_commands,
         );
         agent.chat_kind = app.chat_mode;
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+        agent.apply_credit_balance(
+            app.credit_balance.clone(),
+            app.auto_topup.clone(),
+            app.openrouter_credit_balance,
+        );
         agent
             .prompt
             .slash_controller
@@ -1123,7 +1131,11 @@ pub(in crate::app::dispatch) fn handle_session_restored(
         supersede_open_reload_window(agent, agent_id, "SessionRestored");
         agent.bind_session_id(sid);
         agent.chat_kind = app.chat_mode;
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+        agent.apply_credit_balance(
+            app.credit_balance.clone(),
+            app.auto_topup.clone(),
+            app.openrouter_credit_balance,
+        );
         agent.scrollback.push_block(RenderBlock::system(format!(
             "Session restored. Loading {local_session_id}..."
         )));

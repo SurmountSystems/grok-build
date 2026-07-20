@@ -115,6 +115,7 @@ pub(crate) async fn spawn_session_actor(
     mut startup_hints: StartupHints,
     client_type: ClientType,
     auto_compact_threshold_percent: u8,
+    auto_compact_threshold_tokens: Option<u64>,
     system_prompt_label: String,
     compaction_mode: xai_chat_state::CompactionMode,
     compaction_verbatim_input: bool,
@@ -397,11 +398,26 @@ pub(crate) async fn spawn_session_actor(
             std::num::NonZeroU64::new(DEFAULT_CONTEXT_WINDOW)
                 .expect("DEFAULT_CONTEXT_WINDOW is non-zero")
         });
+    let economic_mode = crate::util::config::economic_mode_from_disk();
+    let effective_context_window = context_window_override.unwrap_or_else(|| {
+        let capped = crate::util::config::apply_economic_context_cap(
+            baseline_context_window.get(),
+            economic_mode,
+        );
+        std::num::NonZeroU64::new(capped).unwrap_or(baseline_context_window)
+    });
     if let Some(cw) = context_window_override {
         tracing::warn!(
             override_context_window = cw.get(),
             original_context_window = baseline_context_window.get(),
             "GROK_DEBUG_CONTEXT_WINDOW override active"
+        );
+    } else if economic_mode && effective_context_window.get() < baseline_context_window.get() {
+        tracing::info!(
+            catalog_context_window = baseline_context_window.get(),
+            effective_context_window = effective_context_window.get(),
+            cap = crate::util::config::ECONOMIC_CONTEXT_CAP,
+            "economic mode: effective context window capped for pricing"
         );
     }
     let chat_state_sampling_config = xai_grok_sampling_types::SamplingConfig {
@@ -412,7 +428,7 @@ pub(crate) async fn spawn_session_actor(
         top_p: sampling_config.top_p,
         api_backend: sampling_config.api_backend.clone(),
         extra_headers: sampling_config.extra_headers.clone(),
-        context_window: context_window_override.unwrap_or(baseline_context_window),
+        context_window: effective_context_window,
         reasoning_effort: sampling_config.reasoning_effort,
         stream_tool_calls: Some(sampling_config.stream_tool_calls),
     };
@@ -1424,8 +1440,11 @@ pub(crate) async fn spawn_session_actor(
         forked_tool_override,
         compaction: super::compaction_config::CompactionConfig {
             threshold_percent: std::cell::Cell::new(auto_compact_threshold_percent),
+            threshold_tokens: std::cell::Cell::new(auto_compact_threshold_tokens),
             force_compact: force_compact.clone(),
             context_window_override,
+            economic_mode: std::cell::Cell::new(economic_mode),
+            model_context_window: std::cell::Cell::new(baseline_context_window.get()),
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
@@ -1999,6 +2018,7 @@ pub(crate) async fn spawn_session_on_thread(
     startup_hints: StartupHints,
     client_type: ClientType,
     auto_compact_threshold_percent: u8,
+    auto_compact_threshold_tokens: Option<u64>,
     system_prompt_label: String,
     compaction_mode: xai_chat_state::CompactionMode,
     compaction_verbatim_input: bool,
@@ -2164,6 +2184,7 @@ pub(crate) async fn spawn_session_on_thread(
                         startup_hints,
                         client_type,
                         auto_compact_threshold_percent,
+                        auto_compact_threshold_tokens,
                         system_prompt_label,
                         compaction_mode,
                         compaction_verbatim_input,

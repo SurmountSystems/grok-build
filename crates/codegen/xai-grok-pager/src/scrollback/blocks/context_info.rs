@@ -673,7 +673,7 @@ mod tests {
             message_tokens: 29_900,
             free_tokens: 963_300,
             usage_pct: 4,
-            auto_compact_threshold_percent: 85,
+            auto_compact_threshold_percent: 95,
             usage_categories: vec![],
         }
     }
@@ -769,7 +769,7 @@ mod tests {
         // avoid stacking two warning-styled lines that contradict each
         // other (manual /compact vs. auto-compact about to fire).
         let mut snap = snapshot();
-        snap.usage_pct = 85; // the historical default (and value in snapshot() helper)
+        snap.usage_pct = 95; // at the auto-compact threshold (snapshot default)
         let block = ContextInfoBlock::new(snap, "grok-4");
         let theme = test_theme();
         let lines = block.build_lines(&theme, BarLayout::WIDE);
@@ -783,15 +783,15 @@ mod tests {
         let lines = block.build_lines(&theme, BarLayout::WIDE);
         let all = all_text(&lines);
         assert!(
-            all.contains("Auto-compact at 85%") && all.contains("tokens remaining"),
-            "expected `Auto-compact at 85% · ~X tokens remaining` line, got:\n{all}"
+            all.contains("Auto-compact at 95%") && all.contains("tokens remaining"),
+            "expected `Auto-compact at 95% · ~X tokens remaining` line, got:\n{all}"
         );
     }
 
     #[test]
     fn build_lines_auto_compact_eta_uses_millions_for_wide_windows() {
-        // 4M window at 0% used: remaining = ceil(4_000_000 * 85 / 100) = 3_400_000.
-        // Should render via fmt_tok_big as "3.4m", not "3400k".
+        // 4M window at 0% used: remaining = ceil(4_000_000 * 95 / 100) = 3_800_000.
+        // Should render via fmt_tok_big as "3.8m", not "3800k".
         let mut snap = snapshot();
         snap.total = 4_000_000;
         snap.used = 0;
@@ -801,21 +801,21 @@ mod tests {
         let lines = block.build_lines(&theme, BarLayout::WIDE);
         let all = all_text(&lines);
         assert!(
-            all.contains("~3.4m tokens remaining"),
+            all.contains("~3.8m tokens remaining"),
             "expected ETA to use millions, got:\n{all}"
         );
     }
 
     #[test]
     fn build_lines_auto_compact_eta_arithmetic_at_known_snapshot() {
-        // 1M window, 36_700 used: ceil(850_000) - 36_700 = 813_300 → "813k".
+        // 1M window, 36_700 used: ceil(950_000) - 36_700 = 913_300 → "913k".
         let block = ContextInfoBlock::new(snapshot(), "grok-4");
         let theme = test_theme();
         let lines = block.build_lines(&theme, BarLayout::WIDE);
         let all = all_text(&lines);
         assert!(
-            all.contains("~813k tokens remaining"),
-            "expected `~813k tokens remaining`, got:\n{all}"
+            all.contains("~913k tokens remaining"),
+            "expected `~913k tokens remaining`, got:\n{all}"
         );
     }
 
@@ -862,7 +862,7 @@ mod tests {
     #[test]
     fn build_lines_shows_imminent_auto_compact_at_threshold() {
         let mut snap = snapshot();
-        snap.usage_pct = 85;
+        snap.usage_pct = 95;
         let block = ContextInfoBlock::new(snap, "grok-4");
         let theme = test_theme();
         let lines = block.build_lines(&theme, BarLayout::WIDE);

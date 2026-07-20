@@ -1123,6 +1123,7 @@ async fn build_sampler_client(
     let resolved = resolve_api_key(api_key, grok_home_path).await?;
     let config = xai_grok_sampler::SamplerConfig {
         api_key: Some(resolved),
+        failover_api_keys: Vec::new(),
         base_url,
         model,
         max_completion_tokens: Some(LAZINESS_MAX_OUTPUT_TOKENS),

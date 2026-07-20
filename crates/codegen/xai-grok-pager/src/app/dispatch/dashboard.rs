@@ -1398,6 +1398,8 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                 plan_mode_active: false,
                 show_tips: show_tips_from_app,
                 auto_update: auto_update_from_app,
+                auto_compact_threshold_percent: app.auto_compact_threshold_percent,
+                auto_compact_threshold_tokens: app.auto_compact_threshold_tokens,
                 vim_mode: crate::appearance::cache::load_vim_mode(),
                 scroll_speed: crate::appearance::cache::load_scroll_speed(),
                 respect_manual_folds: respect_manual_folds_from_app,

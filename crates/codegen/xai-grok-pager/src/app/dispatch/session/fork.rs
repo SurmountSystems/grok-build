@@ -218,7 +218,11 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
             &app.tier_restricted_commands,
         );
         agent.chat_kind = parent_chat_kind;
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+        agent.apply_credit_balance(
+            app.credit_balance.clone(),
+            app.auto_topup.clone(),
+            app.openrouter_credit_balance,
+        );
         agent
             .prompt
             .slash_controller
@@ -357,7 +361,11 @@ pub(in crate::app::dispatch) fn dispatch_project_selected(
     let chat_kind = consume_chat_kind(app);
     if let Some(agent) = app.agents.get_mut(&id) {
         agent.chat_kind = chat_kind;
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+        agent.apply_credit_balance(
+            app.credit_balance.clone(),
+            app.auto_topup.clone(),
+            app.openrouter_credit_balance,
+        );
     }
     effects.push(Effect::CreateSession {
         agent_id: id,
@@ -547,7 +555,11 @@ pub(in crate::app::dispatch) fn handle_worktree_forked(
         }
         let effective_chat = conversation_entry || app.chat_mode;
         agent.chat_kind = effective_chat;
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+        agent.apply_credit_balance(
+            app.credit_balance.clone(),
+            app.auto_topup.clone(),
+            app.openrouter_credit_balance,
+        );
         return vec![Effect::LoadSession {
             agent_id,
             session_id: session_id_str,

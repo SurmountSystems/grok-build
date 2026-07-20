@@ -169,6 +169,7 @@ pub(crate) async fn run_request_task(
     }
 
     let mut request = request;
+    let mut config = config;
     let mut retry_count: u32 = 0;
     // Doom-loop recovery keeps its own resample budget, independent of the
     // transport/empty budget above.
@@ -365,6 +366,53 @@ pub(crate) async fn run_request_task(
     }
 }
 
+/// Pop the next distinct failover key and rebuild the client to use it.
+///
+/// Returns `true` when a key was applied. The exhausted active key (and any
+/// duplicates of it) are dropped from the failover list so they are not
+/// retried for this request.
+fn try_rotate_to_failover_key(config: &mut SamplerConfig, client: &mut SamplingClient) -> bool {
+    let active = config.api_key.as_deref().unwrap_or("").trim().to_owned();
+    // Drop exhausted primary + blanks so we never re-select them.
+    config.failover_api_keys.retain(|k| {
+        let t = k.trim();
+        !t.is_empty() && t != active
+    });
+    let Some(next_key) = config.failover_api_keys.first().cloned() else {
+        return false;
+    };
+    config.failover_api_keys.remove(0);
+    // Also drop any further duplicates of the key we are switching to.
+    let next_trim = next_key.trim().to_owned();
+    config.failover_api_keys.retain(|k| k.trim() != next_trim);
+    let prev_fp = fingerprint_secret(&active);
+    let next_fp = fingerprint_secret(&next_key);
+    tracing::info!(
+        target: crate::sampling_log::TARGET,
+        from_key = %prev_fp,
+        to_key = %next_fp,
+        remaining_failover = config.failover_api_keys.len(),
+        "credit exhausted on active API key; failing over to next credential"
+    );
+    config.api_key = Some(next_key);
+    // Live resolvers would re-inject the exhausted primary; clear so the
+    // rotated key is what goes on the wire.
+    config.bearer_resolver = None;
+    match SamplingClient::new(config.clone()) {
+        Ok(fresh) => {
+            *client = fresh;
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to rebuild sampling client after key failover"
+            );
+            false
+        }
+    }
+}
+
 /// Apply a [`RetryDecision`]. Returns `true` if the loop should
 /// continue, `false` if the request is finished (either fatal or
 /// emit-to-session). Performs the side-effects of the decision:
@@ -384,6 +432,15 @@ async fn apply_retry_decision(
     cancel_token: &CancellationToken,
     completion_tx: &mut Option<oneshot::Sender<CompletionResult>>,
 ) -> bool {
+    // Credit exhaustion is fatal for one account but not for the request if
+    // another key with balance is configured. Rotate before classify so we
+    // do not surface a billing failure while failover keys remain.
+    if err.is_credit_exhausted() && try_rotate_to_failover_key(config, client) {
+        *retry_count += 1;
+        emit_retrying(event_tx, request_id, *retry_count, max_retries, err, config);
+        return true;
+    }
+
     let rate_limit_threshold = if retry_policy.rate_limit_retry_threshold == 0 {
         retry_mod::RATE_LIMIT_RETRY_THRESHOLD
     } else {
@@ -1072,5 +1129,39 @@ mod tests {
             SamplingError::EventStreamError(msg) => assert_eq!(msg, "first"),
             other => panic!("expected EventStreamError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rotate_failover_key_pops_next_distinct_key() {
+        let mut config = SamplerConfig {
+            api_key: Some("key-a".into()),
+            failover_api_keys: vec!["key-a".into(), "key-b".into(), "key-c".into()],
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model: "x-ai/grok-4.5".into(),
+            ..Default::default()
+        };
+        let mut client = SamplingClient::new(config.clone()).expect("client");
+        assert!(try_rotate_to_failover_key(&mut config, &mut client));
+        assert_eq!(config.api_key.as_deref(), Some("key-b"));
+        // Exhausted primary duplicate dropped; only key-c remains.
+        assert_eq!(config.failover_api_keys, vec!["key-c".to_string()]);
+        assert!(try_rotate_to_failover_key(&mut config, &mut client));
+        assert_eq!(config.api_key.as_deref(), Some("key-c"));
+        assert!(config.failover_api_keys.is_empty());
+        assert!(!try_rotate_to_failover_key(&mut config, &mut client));
+    }
+
+    #[test]
+    fn credit_exhausted_without_failover_does_not_rotate() {
+        let mut config = SamplerConfig {
+            api_key: Some("only".into()),
+            failover_api_keys: vec![],
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model: "x-ai/grok-4.5".into(),
+            ..Default::default()
+        };
+        let mut client = SamplingClient::new(config.clone()).expect("client");
+        assert!(!try_rotate_to_failover_key(&mut config, &mut client));
+        assert_eq!(config.api_key.as_deref(), Some("only"));
     }
 }

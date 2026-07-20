@@ -82,6 +82,7 @@ mod tests {
     fn cfg() -> SamplerConfig {
         SamplerConfig {
             api_key: None,
+            failover_api_keys: Vec::new(),
             base_url: "https://example.test".into(),
             model: "test-model".into(),
             max_completion_tokens: None,

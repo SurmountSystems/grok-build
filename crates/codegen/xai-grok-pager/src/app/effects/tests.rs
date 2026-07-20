@@ -2011,7 +2011,7 @@ fn make_session_info(
             context: ContextInfo {
                 used,
                 total,
-                auto_compact_threshold_percent: 85,
+                auto_compact_threshold_percent: 95,
                 ..Default::default()
             },
         },

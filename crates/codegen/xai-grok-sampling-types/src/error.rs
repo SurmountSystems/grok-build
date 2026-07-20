@@ -291,6 +291,23 @@ if matches!(status.as_u16(), 400 | 500) && message.contains("Could not process i
             _ => false,
         }
     }
+
+    /// True when the provider rejected the request because the account is out
+    /// of credits / over its spending limit (not a transient throttle).
+    ///
+    /// Used by multi-key failover: another credential with remaining balance
+    /// may still succeed. Matches 402 Payment Required and credit-flavored
+    /// 403/429 bodies (OpenRouter and xAI Build wording).
+    pub fn is_credit_exhausted(&self) -> bool {
+        match self {
+            SamplingError::Api {
+                status, message, ..
+            } => is_credit_exhausted_status_and_message(status.as_u16(), message),
+            SamplingError::StreamError { message, .. } => is_credit_exhausted_message(message),
+            SamplingError::Auth(message) => is_credit_exhausted_message(message),
+            _ => false,
+        }
+    }
 }
 
 impl From<reqwest::Error> for SamplingError {
@@ -432,6 +449,35 @@ pub fn is_context_length_error(message: &str) -> bool {
         || m.contains("maximum prompt length")
         || m.contains("maximum context length")
         || m.contains("context_length_exceeded")
+}
+
+/// Credit / spending-limit wording shared by xAI Build, OpenRouter, and proxies.
+pub fn is_credit_exhausted_message(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("out of credits")
+        || m.contains("run out of credits")
+        || m.contains("spending-limit")
+        || m.contains("spending limit")
+        || m.contains("usage balance exhausted")
+        || m.contains("usage limit reached")
+        || m.contains("insufficient credits")
+        || m.contains("insufficient_quota")
+        || m.contains("payment required")
+        || m.contains("credit balance is too low")
+        || m.contains("exceeded your current quota")
+        || m.contains("add credits")
+}
+
+fn is_credit_exhausted_status_and_message(status: u16, message: &str) -> bool {
+    if status == 402 {
+        return true;
+    }
+    // 403 is overloaded (policy, ZDR, credits). Only treat as credits when the
+    // body says so — never promote bare 403 into failover.
+    if matches!(status, 403 | 429 | 400) && is_credit_exhausted_message(message) {
+        return true;
+    }
+    is_credit_exhausted_message(message) && status != 401
 }
 
 /// Decide whether a [`reqwest::Error`] is worth retrying.
@@ -690,6 +736,63 @@ mod tests {
         assert!(err.is_retryable(), "429 should be retryable");
         assert!(!err.is_auth_error());
         assert!(!err.is_payload_too_large());
+        assert!(
+            !err.is_credit_exhausted(),
+            "plain 429 is throttle, not credits"
+        );
+    }
+
+    #[test]
+    fn credit_exhausted_detects_402_and_wording() {
+        let payment = SamplingError::Api {
+            status: StatusCode::PAYMENT_REQUIRED,
+            message: "Payment Required".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        };
+        assert!(payment.is_credit_exhausted());
+        assert!(!payment.is_auth_error());
+
+        let or_body = SamplingError::Api {
+            status: StatusCode::FORBIDDEN,
+            message: "status 403: run out of credits".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        };
+        assert!(or_body.is_credit_exhausted());
+        assert!(!or_body.is_auth_error());
+
+        let build = SamplingError::Api {
+            status: StatusCode::PAYMENT_REQUIRED,
+            message: "Grok Build usage balance exhausted".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        };
+        assert!(build.is_credit_exhausted());
+
+        let plain_403 = SamplingError::Api {
+            status: StatusCode::FORBIDDEN,
+            message: "Content violates usage guidelines.".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        };
+        assert!(!plain_403.is_credit_exhausted());
+
+        let unauthorized = SamplingError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            message: "out of credits".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        };
+        assert!(
+            !unauthorized.is_credit_exhausted(),
+            "401 stays auth even if body mentions credits"
+        );
     }
 
     #[test]

@@ -216,6 +216,60 @@ const PLAN_MODE_CHOICES: &[EnumChoice] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Auto-compact threshold catalog.
+//
+// SHELL-owned dual preference: percent of context window OR absolute token
+// count (Grok 4.5 model-card presets). Discrete choices so the modal stays
+// scannable; raw TOML / env still accept any percent 0..=100 or token count.
+// Default matches `DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT` (95%).
+//
+// Canonicals:
+//   "85" | "90" | "95" | "98"  → percent mode
+//   "200k"                     → 200_000 tokens (Grok 4.5 long-context price cliff)
+//   "475k"                     → 475_000 tokens (95% of Grok 4.5 500k window)
+// ---------------------------------------------------------------------------
+
+/// Canonical string for the registry default (must match
+/// `xai_grok_shell::util::config::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT`).
+pub(crate) const AUTO_COMPACT_THRESHOLD_DEFAULT_CANONICAL: &str = "95";
+
+const AUTO_COMPACT_THRESHOLD_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        canonical: "85",
+        display: "85%",
+        description: "Compact earlier — frees context sooner, more frequent summaries.",
+    },
+    EnumChoice {
+        canonical: "90",
+        display: "90%",
+        description: "Compact a bit earlier than the default.",
+    },
+    EnumChoice {
+        canonical: "95",
+        display: "95%",
+        description: "Default. Compact when the context window is nearly full.",
+    },
+    EnumChoice {
+        canonical: "98",
+        display: "98%",
+        description: "Compact as late as practical — longer threads before summarising.",
+    },
+    EnumChoice {
+        canonical: "200k",
+        display: "200k tokens",
+        description: "Grok 4.5 long-context price cliff (same cap Economic mode uses) — \
+                      stay at short-context rates (entire request doubles above 200k).",
+    },
+    EnumChoice {
+        canonical: "475k",
+        display: "475k tokens",
+        description: "95% of the Grok 4.5 500k catalog window as an absolute budget. \
+                      With Economic mode on the effective window is already 200k, so \
+                      prefer 200k tokens or a % threshold instead.",
+    },
+];
+
+// ---------------------------------------------------------------------------
 // Mermaid-rendering catalog.
 //
 // SHELL-owned: persisted to `[ui].render_mermaid`, with a pager-side
@@ -1225,9 +1279,11 @@ pub fn default_settings() -> Vec<SettingMeta> {
             owner: SettingOwner::Shell,
             label: "Auto-run /implement",
             description: "After a successful turn, automatically run a full multi-line \
-                          /implement block from a user-prompt follow-up or from a trailing \
-                          residual in the assistant reply (line must start with /implement). \
-                          Prefer leaving “Next implement prompt” near the end of the reply.",
+                          /implement block (from the /implement token through end of message) \
+                          from a user-prompt follow-up or a trailing residual in the assistant \
+                          reply. Prefer leaving “Next implement prompt” near the end of the \
+                          reply. When Economic mode is on, auto-queued blocks clamp explicit \
+                          --effort above 1 down to 1 (single reviewer).",
             keywords: &[
                 "implement",
                 "auto",
@@ -1243,11 +1299,98 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 "residual",
                 "multi-line",
                 "multiline",
+                "effort",
+                "economic",
             ],
             kind: SettingKind::Bool {
                 default: ui_default.auto_run_implement.unwrap_or(true),
             },
             restart_required: false,
+            hidden_in_minimal: false,
+        },
+        // SHELL-owned: `[ui].economic_mode` + process-wide cache. Default ON —
+        // soft-caps effective context at the Grok 4.5 long-context price cliff
+        // (200K) and clamps auto-queued /implement --effort to 1. Override per
+        // conversation with `/economic-mode`.
+        SettingMeta {
+            key: "economic_mode",
+            category: SettingCategory::Agent,
+            owner: SettingOwner::Shell,
+            label: "Economic mode",
+            description: "Cap effective context at 200K tokens so Grok 4.5 requests stay on the \
+                          lower pricing tier (prices double above 200K for the entire request). \
+                          Catalog context remains larger (e.g. 500K); compaction, the context \
+                          bar, and auto-compact % thresholds use the capped size. Also clamps \
+                          auto-run /implement --effort above 1 to 1. Default on. Override for \
+                          one conversation with /economic-mode. Pair with Auto-compact at → \
+                          200k tokens to summarise before the cliff on uncapped sessions.",
+            keywords: &[
+                "economic",
+                "economy",
+                "pricing",
+                "price",
+                "cost",
+                "tokens",
+                "context",
+                "window",
+                "200k",
+                "cap",
+                "budget",
+                "cheap",
+                "implement",
+                "effort",
+                "compact",
+            ],
+            kind: SettingKind::Bool {
+                default: ui_default.economic_mode.unwrap_or(true),
+            },
+            // New sessions pick up the global default; active sessions use
+            // `/economic-mode` for an immediate override.
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        // SHELL-owned dual auto-compact preference (percent or absolute tokens).
+        // Restart-required: sessions resolve the threshold once at build time.
+        // Key kept as auto_compact_threshold_percent for config.toml continuity;
+        // token choices write `[session].auto_compact_threshold_tokens` instead.
+        SettingMeta {
+            key: "auto_compact_threshold_percent",
+            category: SettingCategory::Session,
+            owner: SettingOwner::Shell,
+            label: "Auto-compact at",
+            description: "When the conversation reaches this threshold, Grok summarises older \
+                          turns to free space. Choose a % of the effective model context window \
+                          (with Economic mode on, the window is soft-capped at 200k), or a \
+                          fixed token count (Grok 4.5 card: 200k = long-context price cliff \
+                          where costs double for the entire request; 475k = 95% of 500k — \
+                          useful when Economic mode is off). Restart required for open sessions.",
+            keywords: &[
+                "auto",
+                "compact",
+                "compaction",
+                "threshold",
+                "context",
+                "window",
+                "summarize",
+                "summarise",
+                "memory",
+                "tokens",
+                "percent",
+                "200k",
+                "475k",
+                "price",
+                "cliff",
+                "98",
+                "95",
+                "90",
+                "85",
+            ],
+            kind: SettingKind::Enum {
+                default: AUTO_COMPACT_THRESHOLD_DEFAULT_CANONICAL,
+                choices: AUTO_COMPACT_THRESHOLD_CHOICES,
+                supports_preview: false,
+            },
+            restart_required: true,
             hidden_in_minimal: false,
         },
         // SHELL-owned startup-time settings (restart_required: true).

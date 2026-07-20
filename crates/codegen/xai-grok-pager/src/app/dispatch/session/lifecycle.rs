@@ -343,7 +343,11 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
             &app.active_announcements,
             &app.tier_restricted_commands,
         );
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+        agent.apply_credit_balance(
+            app.credit_balance.clone(),
+            app.auto_topup.clone(),
+            app.openrouter_credit_balance,
+        );
         agent
             .prompt
             .slash_controller
@@ -359,7 +363,11 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
         let chat_kind = consume_chat_kind(app);
         if let Some(agent) = app.agents.get_mut(&agent_id) {
             agent.chat_kind = chat_kind;
-            agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+            agent.apply_credit_balance(
+                app.credit_balance.clone(),
+                app.auto_topup.clone(),
+                app.openrouter_credit_balance,
+            );
             agent.mcp_init_progress = Some(McpInitProgress {
                 total: 0,
                 connected: 0,
@@ -683,7 +691,11 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             &app.tier_restricted_commands,
         );
         agent.chat_kind = chat_kind;
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+        agent.apply_credit_balance(
+            app.credit_balance.clone(),
+            app.auto_topup.clone(),
+            app.openrouter_credit_balance,
+        );
         agent
             .prompt
             .slash_controller
@@ -772,7 +784,11 @@ pub(in crate::app::dispatch) fn skip_picker_and_create_session(
     let chat_kind = consume_chat_kind(app);
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.chat_kind = chat_kind;
-        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+        agent.apply_credit_balance(
+            app.credit_balance.clone(),
+            app.auto_topup.clone(),
+            app.openrouter_credit_balance,
+        );
         agent.mcp_init_progress = Some(McpInitProgress {
             total: 0,
             connected: 0,

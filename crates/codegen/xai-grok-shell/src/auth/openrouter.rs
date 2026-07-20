@@ -21,7 +21,14 @@ use super::harness_secrets;
 pub const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
 
 /// Environment variable for the OpenRouter API key (env wins over secret store).
+///
+/// May hold a single key or a comma-/newline-separated list; additional keys
+/// are used as credit-exhaustion failover (see also [`OPENROUTER_API_KEYS_ENV`]).
 pub const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+/// Optional extra OpenRouter keys for multi-account credit failover.
+/// Comma- or newline-separated. Merged after [`OPENROUTER_API_KEY_ENV`].
+pub const OPENROUTER_API_KEYS_ENV: &str = "OPENROUTER_API_KEYS";
 
 /// Catalog key shown in the model picker (separate from native xAI models).
 pub const OPENROUTER_GROK_45_CATALOG_ID: &str = "openrouter-grok-4.5";
@@ -150,6 +157,80 @@ pub fn clear_openrouter_api_key(store: &CredentialsStore) -> Result<(), Credenti
     store.delete(&openrouter_credential_url(None))
 }
 
+/// Whether a catalog / model id is the OpenRouter-backed Grok entry (or a
+/// future `openrouter-*` catalog id).
+pub fn is_openrouter_catalog_id(model_id: &str) -> bool {
+    let id = model_id.trim();
+    id == OPENROUTER_GROK_45_CATALOG_ID || id.starts_with("openrouter-")
+}
+
+/// Account-wide credits payload from `GET /api/v1/credits`.
+///
+/// Works with regular user API keys (not only management keys). Balance is
+/// `total_credits - total_usage` in USD.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OpenRouterCreditsData {
+    pub total_credits: f64,
+    pub total_usage: f64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OpenRouterCreditsResponse {
+    pub data: OpenRouterCreditsData,
+}
+
+/// Remaining account balance in USD from a `/credits` response body.
+pub fn openrouter_balance_usd_from_credits(data: &OpenRouterCreditsData) -> f64 {
+    data.total_credits - data.total_usage
+}
+
+/// Convert a USD balance to whole cents (rounded half away from zero).
+pub fn usd_to_cents(usd: f64) -> i64 {
+    if !usd.is_finite() {
+        return 0;
+    }
+    (usd * 100.0).round() as i64
+}
+
+/// Fetch remaining OpenRouter account credits (USD cents) for the configured key.
+///
+/// Returns `None` when no key is available, the request fails, or the body
+/// cannot be parsed. Callers treat that as "keep last known / hide OR line".
+pub async fn fetch_openrouter_credit_balance_cents() -> Option<i64> {
+    let key = load_openrouter_api_key_default().ok().flatten()?;
+    fetch_openrouter_credit_balance_cents_with_key(&key).await
+}
+
+/// Same as [`fetch_openrouter_credit_balance_cents`] with an explicit API key.
+pub async fn fetch_openrouter_credit_balance_cents_with_key(api_key: &str) -> Option<i64> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let url = format!("{OPENROUTER_API_URL}/credits");
+    let client = crate::http::shared_client();
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {key}"))
+        .header("HTTP-Referer", OPENROUTER_HTTP_REFERER)
+        .header(OPENROUTER_X_OPENROUTER_TITLE_HEADER, OPENROUTER_X_TITLE)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        tracing::debug!(
+            status = response.status().as_u16(),
+            "openrouter credits: non-success status"
+        );
+        return None;
+    }
+    let parsed: OpenRouterCreditsResponse = response.json().await.ok()?;
+    Some(usd_to_cents(openrouter_balance_usd_from_credits(
+        &parsed.data,
+    )))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OpenRouterAuthError {
     #[error("{OPENROUTER_API_KEY_ENV} is set; unset it before storing a key in the secret store")]
@@ -225,6 +306,28 @@ mod tests {
         assert!(!is_openrouter_base_url(
             "https://cli-chat-proxy.grok.com/v1"
         ));
+    }
+
+    #[test]
+    fn catalog_id_detection() {
+        assert!(is_openrouter_catalog_id(OPENROUTER_GROK_45_CATALOG_ID));
+        assert!(is_openrouter_catalog_id("openrouter-other"));
+        assert!(!is_openrouter_catalog_id("grok-4.5"));
+        assert!(!is_openrouter_catalog_id("x-ai/grok-4.5"));
+    }
+
+    #[test]
+    fn credits_balance_usd_and_cents() {
+        let data = OpenRouterCreditsData {
+            total_credits: 2600.0,
+            total_usage: 2468.488674684,
+        };
+        let usd = openrouter_balance_usd_from_credits(&data);
+        assert!((usd - 131.511325316).abs() < 1e-9);
+        assert_eq!(usd_to_cents(usd), 13151);
+        assert_eq!(usd_to_cents(63.86), 6386);
+        assert_eq!(usd_to_cents(10.0), 1000);
+        assert_eq!(usd_to_cents(f64::NAN), 0);
     }
 
     #[test]

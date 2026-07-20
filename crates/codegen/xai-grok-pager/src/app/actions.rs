@@ -502,6 +502,10 @@ pub enum Action {
     /// mirror and persists to `[ui].auto_run_implement` via
     /// `Effect::PersistSetting`.
     SetAutoRunImplement(bool),
+    /// Set economic mode (200K context soft-cap for pricing). SHELL-owned:
+    /// process-wide cache + `[ui].economic_mode`. New sessions seed from this;
+    /// use `/economic-mode` for the current conversation.
+    SetEconomicMode(bool),
     /// Set `[scrollback.scroll].respect_manual_folds`. PAGER-owned:
     /// live-applied via `AppView::set_appearance` and persisted to
     /// pager.toml via `Effect::PersistSetting`.
@@ -582,6 +586,11 @@ pub enum Action {
     /// Commit the `auto_update` preference. Persisted to `[cli].auto_update`.
     /// Restart-required — auto-update check fires once at startup.
     SetAutoUpdate(bool),
+    /// Commit auto-compact threshold: percent of window **or** absolute tokens.
+    /// Persists `[session].auto_compact_threshold_percent` or
+    /// `[session].auto_compact_threshold_tokens` (clearing the sibling field).
+    /// Restart-required — sessions resolve the threshold at build time.
+    SetAutoCompactThreshold(crate::settings::AutoCompactThresholdChoice),
     /// Commit `[ui.display_refresh].auto_cadence_enabled`. Restart-required —
     /// cadence is pinned once at startup.
     SetDisplayRefreshAutoCadence(bool),
@@ -2724,11 +2733,15 @@ pub enum TaskResult {
         subscription_tier: Option<String>,
         /// Auto top-up rule fetch result; `Unchanged` keeps any cached rule.
         autotopup: crate::views::credit_bar::AutoTopupFetch,
+        /// OpenRouter account credits when a key is available (`None` = keep cache).
+        openrouter_balance: Option<crate::views::credit_bar::OpenRouterCreditBalance>,
     },
     /// App-level billing data (welcome screen).
     AppBillingFetched {
         balance: Option<crate::views::credit_bar::CreditBalance>,
         autotopup: crate::views::credit_bar::AutoTopupFetch,
+        /// OpenRouter account credits when a key is available (`None` = keep cache).
+        openrouter_balance: Option<crate::views::credit_bar::OpenRouterCreditBalance>,
     },
     GateRefreshed {
         settings: Option<xai_grok_shell::util::config::RemoteSettings>,

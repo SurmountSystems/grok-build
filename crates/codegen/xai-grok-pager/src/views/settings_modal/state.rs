@@ -858,6 +858,8 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "show_tips" => Some(Action::SetShowTips(new)),
         "auto_update" => Some(Action::SetAutoUpdate(new)),
         "display_refresh_auto_cadence" => Some(Action::SetDisplayRefreshAutoCadence(new)),
+        "auto_run_implement" => Some(Action::SetAutoRunImplement(new)),
+        "economic_mode" => Some(Action::SetEconomicMode(new)),
         _ => None,
     }
 }
@@ -933,6 +935,10 @@ pub(super) fn action_for_enum_commit(key: SettingKey, choice: &'static str) -> O
         }
         "default_selected_permission" => {
             Some(Action::SetDefaultSelectedPermission(choice.to_string()))
+        }
+        "auto_compact_threshold_percent" => {
+            crate::settings::parse_auto_compact_threshold_canonical(choice)
+                .map(Action::SetAutoCompactThreshold)
         }
         _ => None,
     }

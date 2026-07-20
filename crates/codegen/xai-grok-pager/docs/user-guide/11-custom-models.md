@@ -98,6 +98,17 @@ Grok resolves the API key in this order:
 3. Your signed-in session token (from `grok login`), for a model with no `api_key`/`env_key` of its own
 4. The `XAI_API_KEY` environment variable (global fallback; Grok also accepts `GROK_CODE_XAI_API_KEY` for backward compatibility)
 
+### Credit failover (multi-account)
+
+When the active key is rejected for **credit / spending-limit** reasons (HTTP 402, or bodies like “out of credits”), Grok OSS automatically retries the same request with the next configured key on that model’s host. Provide multiple keys by:
+
+- Comma- or newline-separating values in `api_key` or in an env var  
+  (`api_key = "sk-a,sk-b"` or `export OPENROUTER_API_KEY="sk-a,sk-b"`)
+- Listing several env names: `env_key = ["KEY_A", "KEY_B"]` (first set wins as primary; other set values are failover)
+- For OpenRouter: `OPENROUTER_API_KEYS` plus optional secret-store key from `grok-oss login --openrouter`
+
+Exhausted keys are not reused for that request. Ordinary rate limits (429 without credit wording) still wait and retry on the same key.
+
 ### Context Window
 
 The `context_window` value tells Grok when to trigger auto-compaction. When you override a known model, Grok inherits that model's context window. When you define a new model and omit `context_window`, Grok defaults to 200,000 tokens, so set it explicitly to match your provider.

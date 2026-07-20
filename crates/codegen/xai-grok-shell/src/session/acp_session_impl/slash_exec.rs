@@ -80,6 +80,101 @@ impl SessionActor {
                 ok_end_turn(0, None)
             }
             BuiltinAction::ContextInfo => ok_end_turn(0, None),
+            BuiltinAction::EconomicMode {
+                enabled,
+                persist_global,
+                status_only,
+            } => {
+                let catalog = {
+                    let tracked = self.compaction.model_context_window.get();
+                    if tracked > 0 {
+                        tracked
+                    } else {
+                        self.chat_state_handle
+                            .get_sampling_config()
+                            .await
+                            .map(|c| c.context_window.get())
+                            .unwrap_or(crate::util::config::ECONOMIC_CONTEXT_CAP)
+                    }
+                };
+                if catalog > 0 {
+                    self.compaction.model_context_window.set(catalog);
+                }
+
+                if status_only {
+                    let on = self.compaction.economic_mode.get();
+                    let effective = crate::util::config::apply_economic_context_cap(catalog, on);
+                    let msg = format!(
+                        "Economic mode is {} for this session (effective context {} tokens; catalog {}).\n\
+                         Prices double above {} tokens for Grok 4.5. Toggle with `/economic-mode on|off`, \
+                         or persist default with `/economic-mode global on|off`.",
+                        if on { "ON" } else { "OFF" },
+                        effective,
+                        catalog,
+                        crate::util::config::ECONOMIC_CONTEXT_CAP,
+                    );
+                    self.send_slash_command_output(&msg).await;
+                    return ok_end_turn(0, None);
+                }
+
+                let new_enabled = enabled.unwrap_or_else(|| !self.compaction.economic_mode.get());
+                self.compaction.economic_mode.set(new_enabled);
+
+                if self.compaction.context_window_override.is_none() {
+                    if let Some(mut cfg) = self.chat_state_handle.get_sampling_config().await {
+                        let effective =
+                            crate::util::config::apply_economic_context_cap(catalog, new_enabled);
+                        if let Some(cw) = std::num::NonZeroU64::new(effective) {
+                            cfg.context_window = cw;
+                            self.chat_state_handle.update_sampling_config(cfg);
+                            self.signals_handle().update_context_usage(
+                                self.chat_state_handle.get_estimated_total_tokens().await,
+                                effective,
+                            );
+                        }
+                    }
+                }
+
+                if persist_global {
+                    if let Err(e) = crate::util::config::set_economic_mode(new_enabled).await {
+                        tracing::warn!(error = %e, "failed to persist [ui].economic_mode");
+                        let msg = format!(
+                            "Economic mode {} for this session (effective context {} tokens), \
+                             but failed to persist global default: {e}",
+                            if new_enabled { "enabled" } else { "disabled" },
+                            crate::util::config::apply_economic_context_cap(catalog, new_enabled),
+                        );
+                        self.send_slash_command_output(&msg).await;
+                        return ok_end_turn(0, None);
+                    }
+                }
+
+                let effective =
+                    crate::util::config::apply_economic_context_cap(catalog, new_enabled);
+                let scope = if persist_global {
+                    "this session and as the global default"
+                } else {
+                    "this session"
+                };
+                let msg = format!(
+                    "Economic mode {} for {scope} (effective context {} tokens; catalog {}).\n\
+                     Grok 4.5 pricing doubles above {} tokens; keep this on to stay on the lower tier.",
+                    if new_enabled { "enabled" } else { "disabled" },
+                    effective,
+                    catalog,
+                    crate::util::config::ECONOMIC_CONTEXT_CAP,
+                );
+                tracing::info!(
+                    session_id = %self.session_info.id.0,
+                    enabled = new_enabled,
+                    persist_global,
+                    catalog_context_window = catalog,
+                    effective_context_window = effective,
+                    "economic mode updated via /economic-mode"
+                );
+                self.send_slash_command_output(&msg).await;
+                ok_end_turn(0, None)
+            }
             BuiltinAction::HooksTrust => {
                 let msg = match Self::do_hooks_trust_project(&self.session_info.cwd) {
                     Ok(root) => {

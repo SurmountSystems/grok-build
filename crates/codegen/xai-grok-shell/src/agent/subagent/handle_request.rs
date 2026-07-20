@@ -816,6 +816,7 @@ pub(crate) async fn handle_subagent_request(
     let inherited_auth_type = subagent_auth_type(model_entry, &ctx.auth_method_id);
     let credentials = xai_chat_state::Credentials {
         api_key: effective_sampling_config.api_key.clone(),
+        failover_api_keys: effective_sampling_config.failover_api_keys.clone(),
         auth_type: inherited_auth_type,
         alpha_test_key: ctx.alpha_test_key.clone(),
         client_version: effective_sampling_config.client_version.clone(),
@@ -1129,6 +1130,8 @@ pub(crate) async fn handle_subagent_request(
             },
             xai_grok_workspace::permission::ClientType::Generic,
             ctx.resolve_auto_compact_threshold_percent(&subagent_model_id),
+            // Absolute-token mode is session-scoped only; subagents keep percent tiers.
+            None,
             xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
             xai_chat_state::CompactionMode::Summary,
             ctx.resolve_compaction_verbatim_input(),

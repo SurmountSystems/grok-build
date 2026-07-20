@@ -71,6 +71,7 @@ impl MockServer {
 fn test_config(base_url: String, model: &str) -> SamplerConfig {
     SamplerConfig {
         api_key: Some("test-key".into()),
+        failover_api_keys: Vec::new(),
         base_url,
         model: model.into(),
         max_completion_tokens: Some(1024),

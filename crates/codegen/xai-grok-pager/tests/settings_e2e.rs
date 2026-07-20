@@ -61,6 +61,8 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "show_thinking_blocks",
     "prompt_suggestions",
     "auto_run_implement",
+    "economic_mode",
+    "auto_compact_threshold_percent",
     "group_tool_verbs",
     "collapsed_edit_blocks",
     "respect_manual_folds",
@@ -275,6 +277,9 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
                 b, expected,
                 "SetAutoRunImplement value differs from expected"
             )
+        }
+        ("economic_mode", Action::SetEconomicMode(b)) => {
+            assert_eq!(b, expected, "SetEconomicMode value differs from expected")
         }
         ("group_tool_verbs", Action::SetGroupToolVerbs(b)) => {
             assert_eq!(b, expected, "SetGroupToolVerbs value differs from expected")
@@ -1793,6 +1798,7 @@ fn registry_kind_membership_through_pr_14() {
             "multiline_mode",
             "prompt_suggestions",
             "auto_run_implement",
+            "economic_mode",
             "respect_manual_folds",
             "show_thinking_blocks",
             "show_timeline",
@@ -1826,6 +1832,7 @@ fn registry_kind_membership_through_pr_14() {
     assert_eq!(
         enum_keys,
         vec![
+            "auto_compact_threshold_percent",
             "auto_dark_theme",
             "auto_light_theme",
             "coding_data_sharing",
@@ -1895,6 +1902,7 @@ fn enum_settings_membership_through_pr_14() {
     assert_eq!(
         enum_keys,
         vec![
+            "auto_compact_threshold_percent",
             "auto_dark_theme",
             "auto_light_theme",
             "coding_data_sharing",
@@ -1979,6 +1987,8 @@ fn defaults_round_trip_through_registry() {
             "show_thinking_blocks" => SettingValue::Bool(true),
             "prompt_suggestions" => SettingValue::Bool(true),
             "auto_run_implement" => SettingValue::Bool(true),
+            "economic_mode" => SettingValue::Bool(true),
+            "auto_compact_threshold_percent" => SettingValue::Enum("95"),
             "group_tool_verbs" => SettingValue::Bool(true),
             "collapsed_edit_blocks" => SettingValue::Bool(false),
             "respect_manual_folds" => SettingValue::Bool(false),
@@ -2060,6 +2070,7 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetShowThinkingBlocks(_))
             | SettingsKeyOutcome::Action(Action::SetPromptSuggestions(_))
             | SettingsKeyOutcome::Action(Action::SetAutoRunImplement(_))
+            | SettingsKeyOutcome::Action(Action::SetEconomicMode(_))
             | SettingsKeyOutcome::Action(Action::SetGroupToolVerbs(_))
             | SettingsKeyOutcome::Action(Action::SetCollapsedEditBlocks(_))
             | SettingsKeyOutcome::Action(Action::SetInvertScroll(_))
@@ -7475,6 +7486,204 @@ fn auto_run_implement_renders_under_agent_category_shell_owned() {
         SettingKind::Bool { default } => assert!(*default, "default must be true"),
         other => panic!("expected Bool kind for auto_run_implement, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// economic_mode — SHELL-owned Bool (Agent, default true)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn economic_mode_space_dispatches_typed_setter() {
+    xai_grok_pager::appearance::cache::set_economic_mode(false);
+    let mut s = make_state();
+    navigate_to(&mut s, "economic_mode");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "economic_mode", true);
+    xai_grok_pager::appearance::cache::set_economic_mode(true);
+}
+
+#[test]
+fn economic_mode_enter_dispatches_typed_setter() {
+    xai_grok_pager::appearance::cache::set_economic_mode(false);
+    let mut s = make_state();
+    navigate_to(&mut s, "economic_mode");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert_set_bool_action(outcome, "economic_mode", true);
+    xai_grok_pager::appearance::cache::set_economic_mode(true);
+}
+
+#[test]
+fn economic_mode_cache_on_dispatches_off() {
+    xai_grok_pager::appearance::cache::set_economic_mode(true);
+    let mut s = SettingsModalState::new(
+        Arc::new(SettingsRegistry::defaults()),
+        UiConfig::default(),
+        PagerLocalSnapshot::default(),
+    );
+    navigate_to(&mut s, "economic_mode");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "economic_mode", false);
+    xai_grok_pager::appearance::cache::set_economic_mode(true);
+}
+
+#[test]
+fn economic_mode_renders_under_agent_category_shell_owned() {
+    let reg = SettingsRegistry::defaults();
+    let meta = reg
+        .find("economic_mode")
+        .expect("economic_mode must be registered");
+    assert_eq!(meta.category, SettingCategory::Agent);
+    assert_eq!(meta.owner, SettingOwner::Shell);
+    match &meta.kind {
+        SettingKind::Bool { default } => assert!(*default, "default must be true"),
+        other => panic!("expected Bool kind for economic_mode, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// auto_compact_threshold_percent — SHELL-owned dual Enum (Session, default "95")
+// ---------------------------------------------------------------------------
+
+/// Enter on the auto-compact row opens the picker seeded at the default `95`.
+#[test]
+fn enter_on_auto_compact_threshold_row_enters_picking_enum() {
+    let mut s = make_state();
+    navigate_to(&mut s, "auto_compact_threshold_percent");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert!(
+        matches!(outcome, SettingsKeyOutcome::Changed),
+        "Enter on auto_compact_threshold_percent row must transition to PickingEnum, got {outcome:?}"
+    );
+    match &s.mode {
+        SettingsModalMode::PickingEnum {
+            key,
+            original_value,
+            ..
+        } => {
+            assert_eq!(*key, "auto_compact_threshold_percent");
+            assert_eq!(
+                original_value,
+                &SettingValue::Enum("95"),
+                "default dual threshold → original '95'"
+            );
+        }
+        other => panic!("expected PickingEnum mode, got {other:?}"),
+    }
+}
+
+/// Nav in the picker must not dispatch a preview Action (`supports_preview: false`).
+#[test]
+fn auto_compact_threshold_picker_nav_does_not_dispatch_preview() {
+    for nav_key in &[
+        KeyCode::Down,
+        KeyCode::Char('j'),
+        KeyCode::Up,
+        KeyCode::Char('k'),
+    ] {
+        let mut s = make_state();
+        navigate_to(&mut s, "auto_compact_threshold_percent");
+        let _ = handle_settings_key(&mut s, &press(KeyCode::Enter));
+        assert!(matches!(s.mode, SettingsModalMode::PickingEnum { .. }));
+
+        if matches!(nav_key, KeyCode::Up | KeyCode::Char('k')) {
+            let _ = handle_settings_key(&mut s, &press(KeyCode::Down));
+        }
+
+        let outcome = handle_settings_key(&mut s, &press(*nav_key));
+        assert!(
+            matches!(outcome, SettingsKeyOutcome::Changed),
+            "Nav key {nav_key:?} in auto_compact_threshold picker MUST NOT dispatch a preview              Action. Got {outcome:?}",
+        );
+        assert!(matches!(s.mode, SettingsModalMode::PickingEnum { .. }));
+    }
+}
+
+/// Enter on a focused choice commits via `Action::SetAutoCompactThreshold`.
+/// Seed is `95` (index 2); one Down moves to `98` (index 3).
+#[test]
+fn auto_compact_threshold_picker_enter_dispatches_set_commit() {
+    use xai_grok_pager::settings::AutoCompactThresholdChoice;
+    let mut s = make_state();
+    navigate_to(&mut s, "auto_compact_threshold_percent");
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    // Fresh state seeds at "95"; Down moves to "98".
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Down));
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    match outcome {
+        SettingsKeyOutcome::Action(Action::SetAutoCompactThreshold(choice)) => {
+            assert_eq!(
+                choice,
+                AutoCompactThresholdChoice::Percent(98),
+                "Enter must commit 98% → SetAutoCompactThreshold(Percent(98))"
+            );
+        }
+        other => panic!("expected Action::SetAutoCompactThreshold commit, got {other:?}"),
+    }
+    assert!(
+        matches!(s.mode, SettingsModalMode::Browse),
+        "Enter commit must return to Browse"
+    );
+}
+
+/// Catalog is EXACTLY the dual percent + Grok 4.5 token presets in order.
+#[test]
+fn auto_compact_threshold_choices_use_canonical_strings() {
+    let reg = SettingsRegistry::defaults();
+    let meta = reg.find("auto_compact_threshold_percent").unwrap();
+    let canonicals: Vec<&str> = match &meta.kind {
+        SettingKind::Enum { choices, .. } => choices.iter().map(|c| c.canonical).collect(),
+        _ => panic!("auto_compact_threshold_percent must be Enum"),
+    };
+    assert_eq!(
+        canonicals,
+        vec!["85", "90", "95", "98", "200k", "475k"],
+        "auto_compact_threshold_percent catalog must stay in sync with          parse_auto_compact_threshold_canonical",
+    );
+}
+
+/// Value-column click opens the picker in one click (mouse ↔ keyboard parity).
+#[test]
+fn mouse_click_on_auto_compact_threshold_indicator_opens_picker_in_one_click() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "auto_compact_threshold_percent") as u16;
+
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert!(
+        matches!(outcome, SettingsKeyOutcome::Changed),
+        "value click must open picker in one click, got: {outcome:?}",
+    );
+    match &s.mode {
+        SettingsModalMode::PickingEnum { key, .. } => {
+            assert_eq!(*key, "auto_compact_threshold_percent")
+        }
+        _ => panic!("value click on auto_compact_threshold_percent must enter PickingEnum"),
+    }
+}
+
+#[test]
+fn auto_compact_threshold_renders_under_session_category_shell_owned() {
+    let reg = SettingsRegistry::defaults();
+    let meta = reg
+        .find("auto_compact_threshold_percent")
+        .expect("auto_compact_threshold_percent must be registered");
+    assert_eq!(meta.category, SettingCategory::Session);
+    assert_eq!(meta.owner, SettingOwner::Shell);
+    match &meta.kind {
+        SettingKind::Enum { default, .. } => {
+            assert_eq!(*default, "95", "default must be 95%")
+        }
+        other => panic!("expected Enum kind for auto_compact_threshold_percent, got {other:?}"),
+    }
+    assert!(
+        meta.restart_required,
+        "auto-compact threshold is resolved at session build time"
+    );
 }
 
 #[test]

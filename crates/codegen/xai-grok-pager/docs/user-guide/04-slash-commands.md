@@ -27,7 +27,27 @@ Compress conversation history to reclaim context-window space. Pass a note to te
 /compact keep the auth implementation details
 ```
 
-Grok also auto-compacts once the context window hits 85% (tune it with `[session] auto_compact_threshold_percent`).
+When the context window fills up, Grok auto-compacts at 95% usage by default
+(configurable via `/settings` → **Auto-compact at**, or
+`[session] auto_compact_threshold_percent` / `auto_compact_threshold_tokens` in
+config.toml; UI choices 85 / 90 / 95 / 98% or Grok 4.5 card presets 200k / 475k tokens).
+Percent thresholds apply to the *effective* window — with **Economic mode** on
+(default), that window is soft-capped at 200k tokens (Grok 4.5 price cliff).
+
+### `/economic-mode`
+
+Cap (or uncap) effective context at 200k tokens for cheaper Grok 4.5 pricing.
+Default **on** for new sessions (`[ui] economic_mode`). Also clamps auto-run
+`/implement --effort` above 1 down to 1.
+
+```
+/economic-mode              # toggle this conversation
+/economic-mode on|off       # set this conversation
+/economic-mode status       # show session state
+/economic-mode global on|off  # session + persist [ui].economic_mode
+```
+
+Aliases: `/economic`, `/econ`
 
 ### `/context`
 

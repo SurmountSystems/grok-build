@@ -348,6 +348,7 @@ pub(super) fn handle_billing_fetched(
     silent: bool,
     subscription_tier: Option<String>,
     autotopup: crate::views::credit_bar::AutoTopupFetch,
+    openrouter_balance: Option<crate::views::credit_bar::OpenRouterCreditBalance>,
 ) -> Vec<Effect> {
     // Parse/transport failures route to `BillingError`, so a `None`
     // balance here means the response carried no billing config. Clear
@@ -358,20 +359,27 @@ pub(super) fn handle_billing_fetched(
     // `Resolved` updates the cached rule, `Cleared` resets it to unknown
     // (no credits), `Unchanged` keeps the last-known-good (fetch failed).
     apply_auto_topup(&mut app.auto_topup, &autotopup);
+    // OpenRouter: only overwrite when the fetch succeeded (`Some`).
+    if let Some(or) = openrouter_balance {
+        app.openrouter_credit_balance = Some(or);
+    }
     app.billing_poll_wanted = balance
         .as_ref()
         .map(|b| b.usage_pct >= 99.0)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        // Keep polling when OpenRouter is in use so the footer balance refreshes.
+        || app.openrouter_credit_balance.is_some();
     if let Some(tier) = subscription_tier {
         app.subscription_tier = Some(tier);
     }
     // Render the `/usage` summary from the now-current cached rule.
     let summary_topup = app.auto_topup.clone();
+    let app_or = app.openrouter_credit_balance;
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         // Gateway/chat-kind: do not attach Build coding credits.
         let mut topup = agent.auto_topup.clone();
         apply_auto_topup(&mut topup, &autotopup);
-        agent.apply_credit_balance(balance.clone(), topup);
+        agent.apply_credit_balance(balance.clone(), topup, app_or);
         if !silent && !agent.chat_kind {
             let msg = match &balance {
                 Some(bal) => {

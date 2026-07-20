@@ -206,6 +206,15 @@ pub async fn set_auto_run_implement(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.auto_run_implement = Some(value)).await
 }
 
+/// Persist `[ui].economic_mode` via `update_config`.
+///
+/// Soft-caps effective context at [`super::ECONOMIC_CONTEXT_CAP`] for Grok 4.5
+/// pricing. Default ON when unset. Active sessions use `/economic-mode` for an
+/// immediate override; this write seeds new sessions and the global default.
+pub async fn set_economic_mode(value: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.economic_mode = Some(value)).await
+}
+
 /// Persist `[toolset.ask_user_question].timeout_enabled` via `update_config`
 /// (the user tier of the shell's tiered resolver; the effective value is
 /// re-resolved at agent build).
@@ -298,4 +307,32 @@ pub async fn set_show_tips(value: bool) -> Result<()> {
 /// Restart-required: auto-update check fires once on startup.
 pub async fn set_auto_update(value: bool) -> Result<()> {
     update_config(|cfg| cfg.cli.auto_update = Some(value)).await
+}
+
+/// Persist `[session].auto_compact_threshold_percent` via `update_config`.
+///
+/// Clears any absolute-token preference so percent mode is active.
+/// Restart-required: sessions resolve the threshold once at build time.
+/// Callers should pass a value in `0..=100` (the settings modal uses discrete
+/// choices 85/90/95/98).
+pub async fn set_auto_compact_threshold_percent(value: u8) -> Result<()> {
+    update_config(|cfg| {
+        cfg.session.auto_compact_threshold_percent = Some(value);
+        cfg.session.auto_compact_threshold_tokens = None;
+    })
+    .await
+}
+
+/// Persist `[session].auto_compact_threshold_tokens` via `update_config`.
+///
+/// Clears the session percent field so absolute-token mode wins the resolver
+/// (still below env overrides). Restart-required for open sessions.
+/// Grok 4.5 card presets: 200_000 (long-context price cliff) and 475_000
+/// (95% of the 500k window).
+pub async fn set_auto_compact_threshold_tokens(value: u64) -> Result<()> {
+    update_config(|cfg| {
+        cfg.session.auto_compact_threshold_tokens = Some(value);
+        cfg.session.auto_compact_threshold_percent = None;
+    })
+    .await
 }

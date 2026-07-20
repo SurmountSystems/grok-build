@@ -1063,6 +1063,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "economic_mode" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("economic_mode", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_economic_mode(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
         "keep_text_selection" => {
             let SettingValue::Enum(s) = value else {
                 return Err(kind_mismatch("keep_text_selection", "Enum", &value));
@@ -1145,6 +1153,31 @@ pub(crate) async fn persist_setting(
             xai_grok_shell::util::config::set_auto_update(b)
                 .await
                 .map_err(|e| e.to_string())
+        }
+        "auto_compact_threshold_percent" => {
+            let SettingValue::Enum(s) = value else {
+                return Err(kind_mismatch(
+                    "auto_compact_threshold_percent",
+                    "Enum",
+                    &value,
+                ));
+            };
+            use crate::settings::AutoCompactThresholdChoice;
+            match crate::settings::parse_auto_compact_threshold_canonical(s) {
+                Some(AutoCompactThresholdChoice::Percent(pct)) => {
+                    xai_grok_shell::util::config::set_auto_compact_threshold_percent(pct)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                Some(AutoCompactThresholdChoice::Tokens(t)) => {
+                    xai_grok_shell::util::config::set_auto_compact_threshold_tokens(t)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                None => Err(format!(
+                    "persist_setting(auto_compact_threshold_percent) invalid choice: {s:?}"
+                )),
+            }
         }
         "fork_secondary_model" => {
             let SettingValue::String(s) = value else {
@@ -1401,6 +1434,18 @@ pub(super) fn has_prepaid_credits(
     balance: Option<&crate::views::credit_bar::CreditBalance>,
 ) -> bool {
     balance.and_then(|b| b.prepaid_balance_cents).map(i64::abs).is_some_and(|c| c > 0)
+}
+
+/// Fetch OpenRouter account credits for the footer when a key is configured.
+///
+/// Returns `None` on missing key / transport / parse errors so callers keep
+/// any previously cached balance.
+pub(super) async fn fetch_openrouter_credit_balance(
+) -> Option<crate::views::credit_bar::OpenRouterCreditBalance> {
+    let cents = xai_grok_shell::auth::fetch_openrouter_credit_balance_cents().await?;
+    Some(crate::views::credit_bar::OpenRouterCreditBalance {
+        balance_cents: cents,
+    })
 }
 /// Fetch the user's auto top-up rule via the `x.ai/auto-topup-rule` extension.
 /// A transport failure yields [`AutoTopupFetch::Unchanged`] so the caller keeps

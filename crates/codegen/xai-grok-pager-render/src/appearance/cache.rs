@@ -44,6 +44,8 @@ const COLLAPSED_EDIT_BLOCKS_DEFAULT: bool = false;
 const PROMPT_SUGGESTIONS_DEFAULT: bool = true;
 /// Auto-run follow-up `/implement` from the prior prompt after a turn ends.
 const AUTO_RUN_IMPLEMENT_DEFAULT: bool = true;
+/// Soft-cap context at the 200K pricing tier; default ON when unset.
+const ECONOMIC_MODE_DEFAULT: bool = true;
 const KEEP_TEXT_SELECTION_DEFAULT: TextSelection = TextSelection::Flash;
 /// Scroll speed default (1-100 scale, matches the legacy `[ui].scroll_speed`).
 const SCROLL_SPEED_DEFAULT: u8 = 50;
@@ -417,6 +419,36 @@ pub fn set_auto_run_implement(enabled: bool) {
     AUTO_RUN_IMPLEMENT_LOADED.with(|l| l.set(true));
 }
 
+// -- economic_mode -----------------------------------------------------------
+
+thread_local! {
+    static ECONOMIC_MODE_CURRENT: Cell<bool> = const { Cell::new(ECONOMIC_MODE_DEFAULT) };
+    static ECONOMIC_MODE_LOADED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Read cached `economic_mode`, seeding from `[ui]` on first call.
+/// Default ON when unset (stay under the 200K pricing tier).
+pub fn load_economic_mode() -> bool {
+    ECONOMIC_MODE_LOADED.with(|loaded| {
+        if !loaded.get() {
+            ECONOMIC_MODE_CURRENT.with(|c| {
+                c.set(load_bool_from_effective_config(
+                    "economic_mode",
+                    ECONOMIC_MODE_DEFAULT,
+                ))
+            });
+            loaded.set(true);
+        }
+    });
+    ECONOMIC_MODE_CURRENT.with(|c| c.get())
+}
+
+/// Replace cached `economic_mode`.
+pub fn set_economic_mode(enabled: bool) {
+    ECONOMIC_MODE_CURRENT.with(|c| c.set(enabled));
+    ECONOMIC_MODE_LOADED.with(|l| l.set(true));
+}
+
 // -- keep_text_selection (`flash` | `hold`) ----------------------------------
 
 thread_local! {
@@ -658,6 +690,7 @@ pub fn prime(ui: &UiConfig) {
     let _ = load_collapsed_edit_blocks();
     let _ = load_prompt_suggestions();
     let _ = load_auto_run_implement();
+    let _ = load_economic_mode();
     // `default_selected_permission` owns its own cache in `permission_cursor`.
     crate::appearance::permission_cursor::prime();
 }
@@ -792,6 +825,10 @@ mod tests {
         assert_eq!(
             AUTO_RUN_IMPLEMENT_DEFAULT,
             ui.auto_run_implement.unwrap_or(AUTO_RUN_IMPLEMENT_DEFAULT)
+        );
+        assert_eq!(
+            ECONOMIC_MODE_DEFAULT,
+            ui.economic_mode.unwrap_or(ECONOMIC_MODE_DEFAULT)
         );
         assert_eq!(KEEP_TEXT_SELECTION_DEFAULT, text_selection_from_ui(&ui));
         assert_eq!(
@@ -938,6 +975,18 @@ mod tests {
             assert!(!load_auto_run_implement());
             set_auto_run_implement(true);
             assert!(load_auto_run_implement());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn set_then_load_round_trips_economic_mode() {
+        std::thread::spawn(|| {
+            set_economic_mode(false);
+            assert!(!load_economic_mode());
+            set_economic_mode(true);
+            assert!(load_economic_mode());
         })
         .join()
         .unwrap();

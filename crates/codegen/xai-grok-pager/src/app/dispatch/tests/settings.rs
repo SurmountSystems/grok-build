@@ -1115,6 +1115,141 @@ fn pr13_set_show_tips_emits_persist_with_rollback() {
     }
     assert_eq!(app.show_tips, Some(true));
 }
+// ── auto_compact_threshold (percent or tokens) ─────────────────────
+
+#[test]
+fn set_auto_compact_threshold_first_commit_of_default_persists() {
+    use crate::settings::{AutoCompactThresholdChoice, SettingValue};
+    let mut app = test_app_with_agent();
+    assert_eq!(app.auto_compact_threshold_percent, None);
+    assert_eq!(app.auto_compact_threshold_tokens, None);
+    let effects = dispatch(
+        Action::SetAutoCompactThreshold(AutoCompactThresholdChoice::Percent(95)),
+        &mut app,
+    );
+    assert_eq!(
+        effects.len(),
+        1,
+        "first commit of the default must persist (not silently no-op)"
+    );
+    assert_eq!(app.auto_compact_threshold_percent, Some(95));
+    assert_eq!(app.auto_compact_threshold_tokens, None);
+    match &effects[0] {
+        Effect::PersistSetting {
+            key,
+            value,
+            rollback_value,
+        } => {
+            assert_eq!(*key, "auto_compact_threshold_percent");
+            assert_eq!(*value, SettingValue::Enum("95"));
+            // prev was None → effective default 95 is the rollback canonical.
+            assert_eq!(*rollback_value, SettingValue::Enum("95"));
+        }
+        other => panic!("expected PersistSetting, got {other:?}"),
+    }
+}
+
+/// Product contract: built-in default preference is 95% (not a token preset).
+#[test]
+fn auto_compact_threshold_default_is_95_percent() {
+    use crate::settings::{
+        AutoCompactThresholdChoice, SettingValue, canonical_auto_compact_threshold,
+    };
+    assert_eq!(
+        xai_grok_shell::util::config::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+        95
+    );
+    assert_eq!(canonical_auto_compact_threshold(None, None), "95");
+    assert_eq!(
+        crate::settings::defs::AUTO_COMPACT_THRESHOLD_DEFAULT_CANONICAL,
+        "95"
+    );
+    // Dispatching the default choice leaves percent mode active.
+    let mut app = test_app_with_agent();
+    let _ = dispatch(
+        Action::SetAutoCompactThreshold(AutoCompactThresholdChoice::Percent(95)),
+        &mut app,
+    );
+    assert_eq!(app.auto_compact_threshold_percent, Some(95));
+    assert_eq!(app.auto_compact_threshold_tokens, None);
+    // Token preset is opt-in, not the default.
+    let effects = dispatch(
+        Action::SetAutoCompactThreshold(AutoCompactThresholdChoice::Tokens(200_000)),
+        &mut app,
+    );
+    assert_eq!(app.auto_compact_threshold_tokens, Some(200_000));
+    assert_eq!(app.auto_compact_threshold_percent, None);
+    match &effects[0] {
+        Effect::PersistSetting { value, .. } => {
+            assert_eq!(*value, SettingValue::Enum("200k"));
+        }
+        other => panic!("expected PersistSetting, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_auto_compact_threshold_idempotent_re_commit() {
+    use crate::settings::AutoCompactThresholdChoice;
+    let mut app = test_app_with_agent();
+    let _ = dispatch(
+        Action::SetAutoCompactThreshold(AutoCompactThresholdChoice::Percent(98)),
+        &mut app,
+    );
+    assert_eq!(app.auto_compact_threshold_percent, Some(98));
+    let effects = dispatch(
+        Action::SetAutoCompactThreshold(AutoCompactThresholdChoice::Percent(98)),
+        &mut app,
+    );
+    assert!(
+        effects.is_empty(),
+        "re-committing the same value must be idempotent, got {effects:?}"
+    );
+}
+
+#[test]
+fn set_auto_compact_threshold_toast_includes_restart_marker() {
+    use crate::settings::AutoCompactThresholdChoice;
+    let mut app = test_app_with_agent();
+    let _ = dispatch(
+        Action::SetAutoCompactThreshold(AutoCompactThresholdChoice::Percent(98)),
+        &mut app,
+    );
+    let toast = read_toast(&app);
+    assert!(
+        toast.contains("98%"),
+        "toast must include the value, got {toast:?}"
+    );
+    assert!(
+        toast.contains("restart to apply"),
+        "toast must include the deferred-effect cue, got {toast:?}"
+    );
+}
+
+#[test]
+fn auto_compact_rollback_from_none_state_restores_none() {
+    use crate::settings::{AutoCompactThresholdChoice, SettingValue};
+    let mut app = test_app_with_agent();
+    assert_eq!(app.auto_compact_threshold_percent, None);
+    let effects = dispatch(
+        Action::SetAutoCompactThreshold(AutoCompactThresholdChoice::Percent(98)),
+        &mut app,
+    );
+    let rollback_value = match &effects[0] {
+        Effect::PersistSetting { rollback_value, .. } => rollback_value.clone(),
+        _ => panic!("expected PersistSetting"),
+    };
+    // Effective default before first commit is 95.
+    assert_eq!(rollback_value, SettingValue::Enum("95"));
+    assert_eq!(app.auto_compact_threshold_percent, Some(98));
+    apply_setting_rollback(&mut app, "auto_compact_threshold_percent", &rollback_value);
+    assert_eq!(
+        app.auto_compact_threshold_percent, None,
+        "rollback from prev=None must restore None (not Some(95)) so AppView \
+         stays in sync with disk after a failed first-commit persist"
+    );
+    assert_eq!(app.auto_compact_threshold_tokens, None);
+}
+
 /// Idempotency — re-committing the same value is a no-op
 /// (no Effect). Mirror of `set_auto_compact_threshold_percent_idempotent_re_commit`.
 #[test]
@@ -1307,6 +1442,14 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "auto_update" => {
             let _ = dispatch(Action::SetAutoUpdate(false), app);
         }
+        "auto_compact_threshold_percent" => {
+            let _ = dispatch(
+                Action::SetAutoCompactThreshold(
+                    crate::settings::AutoCompactThresholdChoice::Percent(98),
+                ),
+                app,
+            );
+        }
         "vim_mode" => {
             let _ = dispatch(Action::SetVimMode(true), app);
         }
@@ -1354,6 +1497,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "auto_run_implement" => {
             let _ = dispatch(Action::SetAutoRunImplement(false), app);
+        }
+        "economic_mode" => {
+            let _ = dispatch(Action::SetEconomicMode(false), app);
         }
         "respect_manual_folds" => {
             let _ = dispatch(

@@ -9,26 +9,43 @@ impl SessionActor {
         apply_prompt_override: bool,
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
+        auto_compact_threshold_tokens: Option<u64>,
     ) -> Result<acp::ModelId, acp::Error> {
         let model_id = acp::ModelId::new(sampling_config.model.clone());
-        let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
-            std::num::NonZeroU64::new(sampling_config.context_window).unwrap_or_else(|| {
+        let catalog_context_window = std::num::NonZeroU64::new(sampling_config.context_window)
+            .unwrap_or_else(|| {
                 std::num::NonZeroU64::new(DEFAULT_CONTEXT_WINDOW)
                     .expect("DEFAULT_CONTEXT_WINDOW is non-zero")
-            })
+            });
+        self.compaction
+            .model_context_window
+            .set(catalog_context_window.get());
+        let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
+            let capped = crate::util::config::apply_economic_context_cap(
+                catalog_context_window.get(),
+                self.compaction.economic_mode.get(),
+            );
+            std::num::NonZeroU64::new(capped).unwrap_or(catalog_context_window)
         });
         let prev_threshold = self.compaction.threshold_percent.get();
-        if prev_threshold != auto_compact_threshold_percent {
+        let prev_tokens = self.compaction.threshold_tokens.get();
+        if prev_threshold != auto_compact_threshold_percent
+            || prev_tokens != auto_compact_threshold_tokens
+        {
             tracing::info!(
                 session_id = % self.session_info.id.0, new_model = % sampling_config
                 .model, old_threshold = prev_threshold, new_threshold =
                 auto_compact_threshold_percent,
-                "auto_compact_threshold_percent updated for model switch"
+                ?auto_compact_threshold_tokens,
+                "auto_compact_threshold updated for model switch"
             );
         }
         self.compaction
             .threshold_percent
             .set(auto_compact_threshold_percent);
+        self.compaction
+            .threshold_tokens
+            .set(auto_compact_threshold_tokens);
         self.supports_backend_search
             .set(sampling_config.supports_backend_search);
         self.compactions_remaining
@@ -66,6 +83,7 @@ impl SessionActor {
         self.chat_state_handle
             .update_credentials(xai_chat_state::Credentials {
                 api_key: sampling_config.api_key.clone(),
+                failover_api_keys: sampling_config.failover_api_keys.clone(),
                 auth_type: crate::agent::config::resolve_chat_state_auth_type(
                     sampling_config.model.as_str(),
                     session_key.as_deref(),

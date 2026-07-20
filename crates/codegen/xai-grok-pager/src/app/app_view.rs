@@ -715,6 +715,9 @@ pub struct AppView {
     pub credit_balance: Option<crate::views::credit_bar::CreditBalance>,
     /// App-level auto top-up rule paired with `credit_balance` for the warning.
     pub auto_topup: Option<crate::views::credit_bar::AutoTopupInfo>,
+    /// OpenRouter account credits (when an OR key is configured). Shown in the
+    /// prompt footer when the active model is OpenRouter-backed.
+    pub openrouter_credit_balance: Option<crate::views::credit_bar::OpenRouterCreditBalance>,
     /// Periodic billing poll requested (credits >= 99%).
     pub billing_poll_wanted: bool,
     /// Leader-mode session roster (FleetView dashboard). Populated from
@@ -1033,6 +1036,13 @@ pub struct AppView {
     pub coding_data_retention_opt_out: bool,
     /// Persisted `[cli].show_tips` mirror. `None` = no override (default `true`).
     pub show_tips: Option<bool>,
+    /// Persisted `[session].auto_compact_threshold_percent` mirror.
+    /// `None` = no override (default 95). Restart-required for open sessions.
+    /// Cleared when [`Self::auto_compact_threshold_tokens`] is set.
+    pub auto_compact_threshold_percent: Option<u8>,
+    /// Persisted `[session].auto_compact_threshold_tokens` mirror.
+    /// When set, absolute-token mode wins over percent. Restart-required.
+    pub auto_compact_threshold_tokens: Option<u64>,
     /// Persisted `[cli].auto_update` mirror. `None` = no override (default `true`).
     pub auto_update: Option<bool>,
     /// Persisted `[toolset.ask_user_question].timeout_enabled` mirror, seeded
@@ -1383,6 +1393,8 @@ impl AppView {
             team_role: None,
             coding_data_retention_opt_out: true,
             show_tips: None,
+            auto_compact_threshold_percent: None,
+            auto_compact_threshold_tokens: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
             zdr_access_enabled: false,
@@ -1416,6 +1428,7 @@ impl AppView {
             leader_mode: false,
             credit_balance: None,
             auto_topup: None,
+            openrouter_credit_balance: None,
             billing_poll_wanted: false,
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),
@@ -5354,6 +5367,8 @@ pub(crate) mod tests {
             team_role: None,
             coding_data_retention_opt_out: true,
             show_tips: None,
+            auto_compact_threshold_percent: None,
+            auto_compact_threshold_tokens: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
             zdr_access_enabled: false,
@@ -5440,6 +5455,7 @@ pub(crate) mod tests {
             leader_mode: true,
             credit_balance: None,
             auto_topup: None,
+            openrouter_credit_balance: None,
             billing_poll_wanted: false,
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),

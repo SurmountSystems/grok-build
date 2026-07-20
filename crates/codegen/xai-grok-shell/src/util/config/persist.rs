@@ -532,6 +532,7 @@ mod tests {
         // and auto_compact_threshold_percent: Some(70).
         let cfg = crate::agent::config::SessionConfig {
             auto_compact_threshold_percent: Some(70),
+            auto_compact_threshold_tokens: None,
             load_envrc: None,
         };
         merge_section(&mut table, "session", &cfg);
@@ -1087,6 +1088,7 @@ auto_update = true
         let cfg = crate::agent::config::SessionConfig {
             load_envrc: Some(true),
             auto_compact_threshold_percent: None,
+            auto_compact_threshold_tokens: None,
         };
         merge_section(&mut table, "session", &cfg);
         let s = table.get("session").unwrap().as_table().unwrap();
@@ -1101,7 +1103,7 @@ auto_update = true
     // ── resolve_auto_compact_threshold_percent: precedence matrix ──────────
     //
     // Covers every boundary in the resolver chain:
-    //   env > user [model.<id>] > user [session] > GB per-model > GB global > 85
+    //   env > user [model.<id>] > user [session] > GB per-model > GB global > 95
     //
     // Env-var tests share a process-wide mutex to avoid set_var races.
 
@@ -1200,14 +1202,15 @@ auto_update = true
         // ── Tier 6: default (all unset) ─────────────────────────────────
 
         #[test]
-        fn all_unset_returns_default_85() {
+        fn all_unset_returns_default_95() {
             let _g = EnvVarGuard::unset();
             let cfg = make_cfg(None, None, None);
             assert_eq!(resolve(&cfg, None), DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT);
+            assert_eq!(DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT, 95);
         }
 
         #[test]
-        fn all_unset_no_model_info_returns_default_85() {
+        fn all_unset_no_model_info_returns_default_95() {
             let _g = EnvVarGuard::unset();
             let cfg = make_cfg(None, None, None);
             assert_eq!(

@@ -154,7 +154,15 @@ The optional `context` argument lets you provide additional instructions about w
 
 ### Auto-Compact
 
-Grok automatically compacts the conversation when the context window approaches its limit. You will see a notification when auto-compact triggers. The `context_window` setting on your model configuration controls when this threshold is reached.
+Grok automatically compacts the conversation when usage reaches the auto-compact
+threshold (default **95%** of the model context window). Configure it from
+`/settings` → **Auto-compact at** (85 / 90 / 95 / 98%, or absolute **200k** /
+**475k** tokens from the Grok 4.5 model card — 200k is the long-context price
+cliff where the entire request bills at 2× rates) or
+`[session] auto_compact_threshold_percent` / `auto_compact_threshold_tokens` in
+config.toml. A restart is required for open sessions. Percent mode scales with
+the model's `context_window`; token mode pins a fixed budget (clamped to the
+window on smaller models).
 
 ---
 

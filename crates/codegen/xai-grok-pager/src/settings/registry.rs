@@ -259,6 +259,12 @@ pub struct PagerLocalSnapshot {
     pub show_tips: Option<bool>,
     /// `[cli].auto_update` mirror. `None` = no TOML override → default `true`.
     pub auto_update: Option<bool>,
+    /// `[session].auto_compact_threshold_percent` mirror.
+    /// `None` = no TOML override → default 95 (unless tokens are set).
+    pub auto_compact_threshold_percent: Option<u8>,
+    /// `[session].auto_compact_threshold_tokens` mirror.
+    /// When `Some`, absolute-token mode wins over percent for the session tier.
+    pub auto_compact_threshold_tokens: Option<u64>,
     /// Process-wide vim-mode scrollback flag. Mirrors
     /// `appearance::cache::load_vim_mode()` at snapshot time.
     pub vim_mode: bool,
@@ -293,6 +299,8 @@ impl Default for PagerLocalSnapshot {
             plan_mode_active: false,
             show_tips: None,
             auto_update: None,
+            auto_compact_threshold_percent: None,
+            auto_compact_threshold_tokens: None,
             vim_mode: false,
             // Matches the registry default and
             // `appearance::cache::SCROLL_SPEED_DEFAULT`. Bare `u8::default()`
@@ -315,6 +323,111 @@ pub fn canonical_voice_capture_mode(value: Option<&str>) -> &'static str {
     } else {
         "hold"
     }
+}
+
+/// Parsed auto-compact modal choice: percent of window or absolute tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoCompactThresholdChoice {
+    Percent(u8),
+    Tokens(u64),
+}
+
+impl AutoCompactThresholdChoice {
+    /// Registry / toast canonical string.
+    pub fn as_canonical(self) -> &'static str {
+        match self {
+            Self::Percent(p) => canonical_auto_compact_threshold_percent(p),
+            Self::Tokens(t) => canonical_auto_compact_threshold_tokens(t),
+        }
+    }
+}
+
+/// Map a numeric percent onto a modal enum canonical (`"85"`…`"98"`).
+///
+/// Exact matches pass through; any other value snaps to the nearest percent
+/// choice so the picker always has a selected row.
+pub fn canonical_auto_compact_threshold_percent(percent: u8) -> &'static str {
+    match percent {
+        85 => "85",
+        90 => "90",
+        95 => "95",
+        98 => "98",
+        other => {
+            const CHOICES: &[(u8, &str)] = &[(85, "85"), (90, "90"), (95, "95"), (98, "98")];
+            CHOICES
+                .iter()
+                .min_by_key(|(c, _)| c.abs_diff(other))
+                .map(|(_, s)| *s)
+                .unwrap_or("95")
+        }
+    }
+}
+
+/// Map an absolute token count onto a modal enum canonical (`"200k"` / `"475k"`).
+///
+/// Exact Grok 4.5 card presets pass through; other values snap to the nearest
+/// token preset so the picker has a selected row.
+pub fn canonical_auto_compact_threshold_tokens(tokens: u64) -> &'static str {
+    use xai_grok_shell::util::config::{
+        GROK_45_DEFAULT_AUTO_COMPACT_TOKENS, GROK_45_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS,
+    };
+    match tokens {
+        t if t == GROK_45_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS => "200k",
+        t if t == GROK_45_DEFAULT_AUTO_COMPACT_TOKENS => "475k",
+        other => {
+            const CHOICES: &[(u64, &str)] = &[
+                (GROK_45_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS, "200k"),
+                (GROK_45_DEFAULT_AUTO_COMPACT_TOKENS, "475k"),
+            ];
+            CHOICES
+                .iter()
+                .min_by_key(|(c, _)| c.abs_diff(other))
+                .map(|(_, s)| *s)
+                .unwrap_or("200k")
+        }
+    }
+}
+
+/// Resolve the live modal canonical from session percent and/or tokens mirrors.
+///
+/// Token mode wins when `tokens` is `Some` (matches shell resolver session tier).
+pub fn canonical_auto_compact_threshold(percent: Option<u8>, tokens: Option<u64>) -> &'static str {
+    if let Some(t) = tokens.filter(|&t| t > 0) {
+        return canonical_auto_compact_threshold_tokens(t);
+    }
+    let pct =
+        percent.unwrap_or(xai_grok_shell::util::config::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT);
+    canonical_auto_compact_threshold_percent(pct)
+}
+
+/// Parse a modal enum canonical into percent or absolute tokens.
+///
+/// Accepts `"85"`…`"98"` (percent) and `"200k"` / `"475k"` (Grok 4.5 card).
+pub fn parse_auto_compact_threshold_canonical(
+    canonical: &str,
+) -> Option<AutoCompactThresholdChoice> {
+    use xai_grok_shell::util::config::{
+        GROK_45_DEFAULT_AUTO_COMPACT_TOKENS, GROK_45_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS,
+    };
+    let s = canonical.trim();
+    match s {
+        "200k" | "200K" => Some(AutoCompactThresholdChoice::Tokens(
+            GROK_45_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS,
+        )),
+        "475k" | "475K" => Some(AutoCompactThresholdChoice::Tokens(
+            GROK_45_DEFAULT_AUTO_COMPACT_TOKENS,
+        )),
+        other => {
+            let n: u8 = other.parse().ok()?;
+            matches!(n, 85 | 90 | 95 | 98).then_some(AutoCompactThresholdChoice::Percent(n))
+        }
+    }
+}
+
+/// Backward-compatible alias: percent-only canonicalize (nearest of 85/90/95/98).
+#[inline]
+pub fn canonical_auto_compact_threshold_from_percent(percent: u8) -> &'static str {
+    canonical_auto_compact_threshold_percent(percent)
 }
 
 /// Canonicalize a raw voice STT language to a settings choice.
@@ -553,6 +666,9 @@ pub fn current_value_for(
         "auto_run_implement" => Some(SettingValue::Bool(
             crate::appearance::cache::load_auto_run_implement(),
         )),
+        "economic_mode" => Some(SettingValue::Bool(
+            crate::appearance::cache::load_economic_mode(),
+        )),
         "respect_manual_folds" => Some(SettingValue::Bool(pager.respect_manual_folds)),
         // SHELL — canonicalized from `[ui].hunk_tracker_mode`.
         "hunk_tracker_mode" => Some(SettingValue::Enum(canonical_hunk_tracker_mode(
@@ -660,6 +776,13 @@ pub fn current_value_for(
         // CLI batch: snapshot mirrors; `None` → effective default `true`.
         "show_tips" => Some(SettingValue::Bool(pager.show_tips.unwrap_or(true))),
         "auto_update" => Some(SettingValue::Bool(pager.auto_update.unwrap_or(true))),
+        // Session auto-compact: token mode wins; else percent (default 95).
+        "auto_compact_threshold_percent" => {
+            Some(SettingValue::Enum(canonical_auto_compact_threshold(
+                pager.auto_compact_threshold_percent,
+                pager.auto_compact_threshold_tokens,
+            )))
+        }
         // fork_secondary_model: baseline value folds to empty string.
         "fork_secondary_model" => Some(SettingValue::String({
             let baseline = xai_grok_shell::models::default_model();
@@ -891,6 +1014,20 @@ mod tests {
                          (matches auto_update.rs's `.unwrap_or(true)`)"
                     );
                 }
+                // Session auto-compact: no UiConfig field; default pinned to
+                // the shell/compaction crate constant (95).
+                ("auto_compact_threshold_percent", SettingKind::Enum { default, .. }) => {
+                    assert_eq!(
+                        *default,
+                        crate::settings::defs::AUTO_COMPACT_THRESHOLD_DEFAULT_CANONICAL,
+                        "auto_compact_threshold_percent registry default must be \"95\""
+                    );
+                    assert_eq!(
+                        xai_grok_shell::util::config::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                        95,
+                        "shell DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT drifted from 95"
+                    );
+                }
                 // vim_mode: Option<bool>; None → false.
                 ("vim_mode", SettingKind::Bool { default }) => {
                     assert_eq!(
@@ -959,6 +1096,15 @@ mod tests {
                         "auto_run_implement default drifts from UiConfig::default()"
                     );
                     assert!(*default, "auto_run_implement must default ON");
+                }
+                // economic_mode: Option<bool>; None → true (client default).
+                ("economic_mode", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.economic_mode.unwrap_or(true),
+                        "economic_mode default drifts from UiConfig::default()"
+                    );
+                    assert!(*default, "economic_mode must default ON");
                 }
                 ("keep_text_selection", SettingKind::Enum { default, .. }) => {
                     let expected = if ui.keep_text_selection_enabled() {
@@ -1226,6 +1372,79 @@ mod tests {
         assert_eq!(canonical_voice_capture_mode(Some("hold_send")), "hold");
         assert_eq!(canonical_voice_capture_mode(Some("")), "hold");
         assert_eq!(canonical_voice_capture_mode(None), "hold");
+    }
+
+    #[test]
+    fn canonical_auto_compact_threshold_exact_and_nearest() {
+        assert_eq!(canonical_auto_compact_threshold_percent(85), "85");
+        assert_eq!(canonical_auto_compact_threshold_percent(90), "90");
+        assert_eq!(canonical_auto_compact_threshold_percent(95), "95");
+        assert_eq!(canonical_auto_compact_threshold_percent(98), "98");
+        // Midpoints / off-catalog snap to nearest discrete choice.
+        assert_eq!(canonical_auto_compact_threshold_percent(87), "85");
+        assert_eq!(canonical_auto_compact_threshold_percent(88), "90");
+        assert_eq!(canonical_auto_compact_threshold_percent(93), "95");
+        assert_eq!(canonical_auto_compact_threshold_percent(100), "98");
+        assert_eq!(canonical_auto_compact_threshold_percent(0), "85");
+        assert_eq!(
+            parse_auto_compact_threshold_canonical("98"),
+            Some(AutoCompactThresholdChoice::Percent(98))
+        );
+        assert_eq!(
+            parse_auto_compact_threshold_canonical("200k"),
+            Some(AutoCompactThresholdChoice::Tokens(200_000))
+        );
+        assert_eq!(
+            parse_auto_compact_threshold_canonical("475k"),
+            Some(AutoCompactThresholdChoice::Tokens(475_000))
+        );
+        assert_eq!(canonical_auto_compact_threshold_tokens(200_000), "200k");
+        assert_eq!(canonical_auto_compact_threshold_tokens(475_000), "475k");
+        assert_eq!(parse_auto_compact_threshold_canonical("91"), None);
+        assert_eq!(parse_auto_compact_threshold_canonical("bogus"), None);
+    }
+
+    /// Product contract: unset mirrors resolve to the 95% default choice.
+    #[test]
+    fn auto_compact_threshold_current_value_defaults_to_95() {
+        let pager = PagerLocalSnapshot::default();
+        let ui = UiConfig::default();
+        assert_eq!(
+            current_value_for("auto_compact_threshold_percent", &ui, &pager),
+            Some(SettingValue::Enum("95")),
+        );
+        assert_eq!(
+            canonical_auto_compact_threshold(None, None),
+            "95",
+            "default auto-compact preference must be 95%"
+        );
+        let pager = PagerLocalSnapshot {
+            auto_compact_threshold_percent: Some(98),
+            ..Default::default()
+        };
+        assert_eq!(
+            current_value_for("auto_compact_threshold_percent", &ui, &pager),
+            Some(SettingValue::Enum("98")),
+        );
+        // Token mode wins over percent when both are set.
+        let pager = PagerLocalSnapshot {
+            auto_compact_threshold_percent: Some(98),
+            auto_compact_threshold_tokens: Some(200_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            current_value_for("auto_compact_threshold_percent", &ui, &pager),
+            Some(SettingValue::Enum("200k")),
+        );
+        // Off-catalog numeric still snaps for the picker row.
+        let pager = PagerLocalSnapshot {
+            auto_compact_threshold_percent: Some(70),
+            ..Default::default()
+        };
+        assert_eq!(
+            current_value_for("auto_compact_threshold_percent", &ui, &pager),
+            Some(SettingValue::Enum("85")),
+        );
     }
 
     /// With the UI key unset, `current_value_for` shows the live language

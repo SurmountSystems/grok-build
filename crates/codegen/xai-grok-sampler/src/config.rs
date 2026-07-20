@@ -48,6 +48,12 @@ pub enum AuthScheme {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplerConfig {
     pub api_key: Option<String>,
+    /// Additional API keys tried when the active key hits a credit /
+    /// spending-limit error ([`xai_grok_sampling_types::SamplingError::is_credit_exhausted`]).
+    /// Order is preference; keys already equal to `api_key` are ignored.
+    /// Empty (default) disables multi-key failover.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover_api_keys: Vec<String>,
     pub base_url: String,
     pub model: String,
     pub max_completion_tokens: Option<u32>,
@@ -132,6 +138,7 @@ impl Default for SamplerConfig {
     fn default() -> Self {
         Self {
             api_key: None,
+            failover_api_keys: Vec::new(),
             base_url: String::new(),
             model: String::new(),
             max_completion_tokens: None,

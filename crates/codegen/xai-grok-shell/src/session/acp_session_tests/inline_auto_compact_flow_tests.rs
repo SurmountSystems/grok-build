@@ -106,8 +106,11 @@ async fn create_test_actor(
         forked_tool_override: None,
         compaction: crate::session::compaction_config::CompactionConfig {
             threshold_percent: std::cell::Cell::new(threshold_percent),
+            threshold_tokens: std::cell::Cell::new(None),
             force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             context_window_override: None,
+            economic_mode: std::cell::Cell::new(false),
+            model_context_window: std::cell::Cell::new(0),
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
@@ -346,6 +349,46 @@ async fn test_context_window_override_to_smaller_triggers_compact() {
         })
         .await;
 }
+/// Economic mode soft-caps effective context at 200K even when the catalog
+/// (or a response header) advertises a larger window.
+#[tokio::test(flavor = "current_thread")]
+async fn test_economic_mode_caps_header_upgrade_at_200k() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(200_000, 500_000, 85, gateway_tx, persistence_tx).await;
+            actor.compaction.economic_mode.set(true);
+            actor.compaction.model_context_window.set(500_000);
+            // Start at the economic effective window.
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.context_window = std::num::NonZeroU64::new(200_000).unwrap();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+            actor
+                .handle_model_metadata_update(crate::sampling::ResponseModelMetadata {
+                    context_window: Some(1_000_000),
+                    max_completion_tokens: None,
+                    models_etag: None,
+                })
+                .await;
+            let cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            assert_eq!(
+                cfg.context_window.get(),
+                200_000,
+                "economic mode must keep effective window at pricing cap"
+            );
+            assert_eq!(
+                actor.compaction.model_context_window.get(),
+                1_000_000,
+                "catalog window should still track the larger header value"
+            );
+        })
+        .await;
+}
+
 /// Response-header downgrade guard: `handle_model_metadata_update`
 /// must reject a smaller context_window from response headers but
 /// accept a larger one.
@@ -541,8 +584,11 @@ async fn create_test_actor_with_memory(
         forked_tool_override: None,
         compaction: crate::session::compaction_config::CompactionConfig {
             threshold_percent: std::cell::Cell::new(threshold_percent),
+            threshold_tokens: std::cell::Cell::new(None),
             force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             context_window_override: None,
+            economic_mode: std::cell::Cell::new(false),
+            model_context_window: std::cell::Cell::new(0),
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
@@ -1254,6 +1300,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             );
             chat_state_handle.update_credentials(xai_chat_state::types::Credentials {
                 api_key: Some("test-key".to_string()),
+                failover_api_keys: Vec::new(),
                 auth_type: Default::default(),
                 alpha_test_key: None,
                 client_version: None,
@@ -1314,8 +1361,11 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 forked_tool_override: None,
                 compaction: crate::session::compaction_config::CompactionConfig {
                     threshold_percent: std::cell::Cell::new(85),
+                    threshold_tokens: std::cell::Cell::new(None),
                     force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     context_window_override: None,
+                    economic_mode: std::cell::Cell::new(false),
+                    model_context_window: std::cell::Cell::new(0),
                     count: std::sync::atomic::AtomicU64::new(0),
                     auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
                     previous_model: std::cell::Cell::new(None),

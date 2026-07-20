@@ -131,7 +131,14 @@ pub struct CompactionConfig {
     /// `Cell` so the value can be re-resolved at model-switch time without
     /// holding `&mut self` on the actor. `SessionActor` is `!Send`, so
     /// `Cell` is sufficient (no atomic ordering needed).
+    ///
+    /// When [`Self::threshold_tokens`] is `Some`, this is the *display*
+    /// equivalent (`tokens * 100 / context_window`) and the absolute token
+    /// count is what the gate uses.
     pub threshold_percent: Cell<u8>,
+    /// Absolute token threshold when the user chose token-count mode.
+    /// `None` = percent mode (use [`Self::threshold_percent`]).
+    pub threshold_tokens: Cell<Option<u64>>,
     /// Debug: when set, next auto-compact check triggers unconditionally.
     pub force_compact: Arc<AtomicBool>,
     /// Auto-compaction suppression state (`SUPPRESS_*`) after a deterministic
@@ -139,6 +146,15 @@ pub struct CompactionConfig {
     pub auto_compact_suppressed: AtomicU8,
     /// Locks the context window when `GROK_DEBUG_CONTEXT_WINDOW` is set.
     pub context_window_override: Option<std::num::NonZeroU64>,
+    /// Soft-cap effective context at 200K for pricing (see
+    /// [`crate::util::config::ECONOMIC_CONTEXT_CAP`]). Seeded from
+    /// `[ui].economic_mode` at session spawn; toggled per conversation with
+    /// `/economic-mode`. `Cell` so slash handlers can flip without `&mut self`.
+    pub economic_mode: Cell<bool>,
+    /// Uncapped catalog context window for the active model (before economic
+    /// cap). Updated on model switch / metadata refresh so disabling economic
+    /// mode can restore the full window.
+    pub model_context_window: Cell<u64>,
     pub count: AtomicU64,
     /// Set at turn end; consumed at next turn start for model-switch compaction.
     /// `Cell` because `SessionActor` is `!Send`.

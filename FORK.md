@@ -90,6 +90,7 @@ Keep diffs **small and product-facing** so merges stay tractable:
 ## Divergences checklist (update when you add fork-only work)
 
 - [x] OpenRouter Grok 4.5 model option + secret store / Zed credential probe
+- [x] Multi-key credit failover (`OPENROUTER_API_KEY` lists / `OPENROUTER_API_KEYS`)
 - [x] Binary name `grok-oss` and Grok OSS branding
 - [x] AUR packaging sources (`packaging/aur/`)
 - [x] CONTRIBUTING accepts PRs on this fork

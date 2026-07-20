@@ -1,18 +1,20 @@
 //! Settings UI: command palette, settings modal, toggles, resets, and rollback.
 
 use super::setters::{
-    pr13_effective_default, set_ask_user_question_timeout_enabled_inner, set_auto_dark_theme_inner,
-    set_auto_light_theme_inner, set_auto_run_implement_inner, set_auto_update_inner,
-    set_collapsed_edit_blocks_inner, set_compact_mode, set_compact_mode_inner,
-    set_contextual_hint_inner, set_default_model_inner, set_default_selected_permission_inner,
-    set_display_refresh_auto_cadence_inner, set_fork_secondary_model_inner,
-    set_group_tool_verbs_inner, set_hunk_tracker_mode_inner, set_invert_scroll_inner,
-    set_keep_text_selection_inner, set_max_thoughts_width_inner, set_multiline_mode,
-    set_prompt_suggestions_inner, set_remember_tool_approvals_inner, set_render_mermaid_inner,
-    set_respect_manual_folds_inner, set_scroll_lines_inner, set_scroll_mode_inner,
-    set_scroll_speed_inner, set_show_thinking_blocks_inner, set_show_tips_inner,
-    set_simple_mode_inner, set_theme_inner, set_timestamps, set_timestamps_inner,
-    set_vim_mode_inner, set_voice_capture_mode_inner, set_voice_stt_language_inner,
+    pr13_effective_default, set_ask_user_question_timeout_enabled_inner,
+    set_auto_compact_threshold_percent_inner, set_auto_compact_threshold_tokens_inner,
+    set_auto_dark_theme_inner, set_auto_light_theme_inner, set_auto_run_implement_inner,
+    set_auto_update_inner, set_collapsed_edit_blocks_inner, set_compact_mode,
+    set_compact_mode_inner, set_contextual_hint_inner, set_default_model_inner,
+    set_default_selected_permission_inner, set_display_refresh_auto_cadence_inner,
+    set_economic_mode_inner, set_fork_secondary_model_inner, set_group_tool_verbs_inner,
+    set_hunk_tracker_mode_inner, set_invert_scroll_inner, set_keep_text_selection_inner,
+    set_max_thoughts_width_inner, set_multiline_mode, set_prompt_suggestions_inner,
+    set_remember_tool_approvals_inner, set_render_mermaid_inner, set_respect_manual_folds_inner,
+    set_screen_mode_inner, set_scroll_lines_inner, set_scroll_mode_inner, set_scroll_speed_inner,
+    set_show_thinking_blocks_inner, set_show_tips_inner, set_simple_mode_inner, set_theme_inner,
+    set_timeline_inner, set_timestamps, set_timestamps_inner, set_vim_mode_inner,
+    set_voice_capture_mode_inner, set_voice_stt_language_inner,
 };
 use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{ActiveView, AppView};
@@ -48,6 +50,8 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let coding_data_sharing_opt_out_from_app = app.coding_data_retention_opt_out;
     let show_tips_from_app = app.show_tips;
     let auto_update_from_app = app.auto_update;
+    let auto_compact_from_app = app.auto_compact_threshold_percent;
+    let auto_compact_tokens_from_app = app.auto_compact_threshold_tokens;
     let respect_manual_folds_from_app = app.appearance.scrollback.scroll.respect_manual_folds;
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
@@ -83,6 +87,8 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
                 show_tips: show_tips_from_app,
                 auto_update: auto_update_from_app,
+                auto_compact_threshold_percent: auto_compact_from_app,
+                auto_compact_threshold_tokens: auto_compact_tokens_from_app,
                 vim_mode: crate::appearance::cache::load_vim_mode(),
                 scroll_speed: crate::appearance::cache::load_scroll_speed(),
                 respect_manual_folds: respect_manual_folds_from_app,
@@ -158,6 +164,8 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
     let coding_data_sharing_opt_out_from_app = app.coding_data_retention_opt_out;
     let show_tips_from_app = app.show_tips;
     let auto_update_from_app = app.auto_update;
+    let auto_compact_from_app = app.auto_compact_threshold_percent;
+    let auto_compact_tokens_from_app = app.auto_compact_threshold_tokens;
     let respect_manual_folds_from_app = app.appearance.scrollback.scroll.respect_manual_folds;
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
@@ -199,6 +207,8 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(app: &mut AppView) -> Vec
         plan_mode_active: agent.plan_mode_pending.unwrap_or(agent.plan_mode_active),
         show_tips: show_tips_from_app,
         auto_update: auto_update_from_app,
+        auto_compact_threshold_percent: auto_compact_from_app,
+        auto_compact_threshold_tokens: auto_compact_tokens_from_app,
         vim_mode: crate::appearance::cache::load_vim_mode(),
         scroll_speed: crate::appearance::cache::load_scroll_speed(),
         respect_manual_folds: respect_manual_folds_from_app,
@@ -669,6 +679,8 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         plan_mode_active: agent_plan_mode(app),
         show_tips: app.show_tips,
         auto_update: app.auto_update,
+        auto_compact_threshold_percent: app.auto_compact_threshold_percent,
+        auto_compact_threshold_tokens: app.auto_compact_threshold_tokens,
         vim_mode: crate::appearance::cache::load_vim_mode(),
         scroll_speed: crate::appearance::cache::load_scroll_speed(),
         respect_manual_folds: app.appearance.scrollback.scroll.respect_manual_folds,
@@ -742,6 +754,7 @@ pub(in crate::app::dispatch) fn action_for_reset(
         }
         ("prompt_suggestions", SettingValue::Bool(b)) => Some(Action::SetPromptSuggestions(*b)),
         ("auto_run_implement", SettingValue::Bool(b)) => Some(Action::SetAutoRunImplement(*b)),
+        ("economic_mode", SettingValue::Bool(b)) => Some(Action::SetEconomicMode(*b)),
         ("respect_manual_folds", SettingValue::Bool(b)) => Some(Action::SetRespectManualFolds(*b)),
         ("default_selected_permission", SettingValue::Enum(s)) => {
             Some(Action::SetDefaultSelectedPermission((*s).to_owned()))
@@ -829,6 +842,10 @@ pub(in crate::app::dispatch) fn action_for_reset(
         // show_tips / auto_update / display_refresh_auto_cadence: direct bool.
         ("show_tips", SettingValue::Bool(b)) => Some(Action::SetShowTips(*b)),
         ("auto_update", SettingValue::Bool(b)) => Some(Action::SetAutoUpdate(*b)),
+        ("auto_compact_threshold_percent", SettingValue::Enum(s)) => {
+            crate::settings::parse_auto_compact_threshold_canonical(s)
+                .map(Action::SetAutoCompactThreshold)
+        }
         ("display_refresh_auto_cadence", SettingValue::Bool(b)) => {
             Some(Action::SetDisplayRefreshAutoCadence(*b))
         }
@@ -1079,6 +1096,7 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         }
         ("prompt_suggestions", SettingValue::Bool(b)) => set_prompt_suggestions_inner(app, *b),
         ("auto_run_implement", SettingValue::Bool(b)) => set_auto_run_implement_inner(app, *b),
+        ("economic_mode", SettingValue::Bool(b)) => set_economic_mode_inner(app, *b),
         // keep_text_selection: restore the cache mirror to the canonical value.
         ("keep_text_selection", SettingValue::Enum(s)) => {
             if let Some(kind) = crate::appearance::TextSelection::from_canonical(s) {
@@ -1124,6 +1142,29 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
                 app.auto_update = None;
             } else {
                 set_auto_update_inner(app, *b);
+            }
+        }
+        ("auto_compact_threshold_percent", SettingValue::Enum(s)) => {
+            use crate::settings::AutoCompactThresholdChoice;
+            let default_canon = crate::settings::defs::AUTO_COMPACT_THRESHOLD_DEFAULT_CANONICAL;
+            match crate::settings::parse_auto_compact_threshold_canonical(s) {
+                Some(AutoCompactThresholdChoice::Percent(pct))
+                    if *s == default_canon
+                        || pct
+                            == xai_grok_shell::util::config::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT =>
+                {
+                    // Keep AppView in sync with disk after a failed first-commit of default:
+                    // disk is still None/None.
+                    app.auto_compact_threshold_percent = None;
+                    app.auto_compact_threshold_tokens = None;
+                }
+                Some(AutoCompactThresholdChoice::Percent(pct)) => {
+                    set_auto_compact_threshold_percent_inner(app, pct);
+                }
+                Some(AutoCompactThresholdChoice::Tokens(t)) => {
+                    set_auto_compact_threshold_tokens_inner(app, t);
+                }
+                None => {}
             }
         }
         // fork_secondary_model: empty rollback restores baseline default.

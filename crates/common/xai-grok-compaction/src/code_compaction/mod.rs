@@ -39,7 +39,9 @@ pub use compact::{
     apply_full_replace_compaction, sample_full_replace_summary,
 };
 pub use config::{
-    DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT, FullReplaceConfig, MIN_SUMMARY_SEED_CHARS,
+    AutoCompactThreshold, DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT, FullReplaceConfig,
+    GROK_45_CONTEXT_WINDOW_TOKENS, GROK_45_DEFAULT_AUTO_COMPACT_TOKENS,
+    GROK_45_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS, MIN_SUMMARY_SEED_CHARS,
 };
 pub use failure::{
     FailureKind, classify_http_status, classify_stream_event_error, is_context_length_error,
