@@ -163,7 +163,7 @@ See ~/.grok/README.md for more information.
     /// `~/.grok/config.toml` or when the `GROK_AGENT_DASHBOARD=0` env
     /// var is set.
     Dashboard,
-    /// Routstr balance, top up, refund, and local funding helpers
+    /// Routstr balance, top up, refund, fee ladder, and local funding helpers
     Routstr(RoutstrArgs),
 }
 
@@ -179,11 +179,21 @@ pub struct RoutstrArgs {
 pub enum RoutstrCommand {
     /// Show remaining Routstr prepaid balance (requires API key)
     Balance,
-    /// Guide top up of Routstr prepaid float (Lightning/Cashu; partial until CDK/LN)
+    /// Create a live Routstr Lightning invoice (mainnet) or check payment status.
+    ///
+    /// Default amount: 1000 sats (API allows 1..=1_000_000). Pay BOLT11 with any
+    /// Lightning wallet; on pay, status returns `sk-…` and we store it (unless
+    /// `ROUTSTR_API_KEY` is set). Residual copy only if create fails.
     Topup {
-        /// Optional amount in sats for guidance copy
+        /// Amount in sats (default 1000; min 1, max 1_000_000)
         #[arg(long)]
         sats: Option<u64>,
+        /// Poll a previously created invoice id (store api_key when paid)
+        #[arg(long)]
+        status: Option<String>,
+        /// Create invoice and print QR without polling for payment
+        #[arg(long)]
+        no_poll: bool,
     },
     /// Guide refund of unused Routstr float back toward Cashu (stub until CDK)
     Refund,
@@ -234,6 +244,67 @@ pub enum RoutstrCommand {
         /// default 5; product uses BIP-125 recommended absolute fee, not floor rate)
         #[arg(long)]
         fee_rate: Option<u64>,
+    },
+    /// Build a CPFP child that spends a wallet-owned parent output (package fee bump).
+    ///
+    /// Dry-run by default. Pass `--parent-fee`, `--parent-vbytes`, and each
+    /// `--parent txid:vout:amount:address` (output of the stuck parent you control).
+    /// Optional `--extra-input` confirmed UTXOs fund the child fee when the parent
+    /// alone is short. Does **not** replace the parent. `--broadcast` submits the
+    /// child via rate-limited mempool.space after SeedVault unlock + re-entry.
+    Cpfp {
+        /// Destination Bitcoin address for the child payment
+        address: String,
+        /// Amount to send in satoshis on the child
+        sats: u64,
+        /// Absolute fee of the underpaying parent transaction in sats
+        #[arg(long)]
+        parent_fee: u64,
+        /// Virtual size of the parent transaction
+        #[arg(long)]
+        parent_vbytes: u64,
+        /// Parent output the child must spend: `txid:vout:amount_sats:address`
+        /// (repeatable; at least one required)
+        #[arg(long = "parent", required = true, value_name = "TXID:VOUT:AMOUNT:ADDR")]
+        parents: Vec<String>,
+        /// Optional confirmed UTXO to fund child fee: `txid:vout:amount_sats:address`
+        #[arg(long = "extra-input", value_name = "TXID:VOUT:AMOUNT:ADDR")]
+        extra_inputs: Vec<String>,
+        /// Submit the child to the network (default: dry-run only)
+        #[arg(long)]
+        broadcast: bool,
+        /// Target **package** fee rate in sat/vB (omit for explorer halfHour /
+        /// default 5; product uses plan_cpfp_child_fee minimum absolute child fee)
+        #[arg(long)]
+        fee_rate: Option<u64>,
+    },
+    /// Print mempool.space recommended fee estimate ladder (sat/vB only)
+    ///
+    /// Ladder only — does not rebuild transactions. Not RBF (`grok routstr rbf`)
+    /// or CPFP (`grok routstr cpfp`). Live fetch via rate-limited explorer; never
+    /// invents rates when the explorer is unavailable (network error, rate-limit,
+    /// or parse failure).
+    #[command(
+        about = grok_bitcoin_wallet::funding_cli::FEES_CLI_ABOUT,
+        long_about = grok_bitcoin_wallet::funding_cli::FEES_CLI_LONG_ABOUT
+    )]
+    Fees {
+        /// Bitcoin network (default: `GROK_BITCOIN_NETWORK` or mainnet)
+        #[arg(long)]
+        network: Option<String>,
+    },
+    /// List local wallet UTXOs and on-chain balance (gap-limit ChainSource sync).
+    ///
+    /// Requires SeedVault unlock + recovery-phrase re-entry (same gate as spend).
+    /// Never invents UTXOs; empty wallet prints zero balance. Not a spend path.
+    #[command(
+        about = grok_bitcoin_wallet::funding_cli::UTXOS_CLI_ABOUT,
+        long_about = grok_bitcoin_wallet::funding_cli::UTXOS_CLI_LONG_ABOUT
+    )]
+    Utxos {
+        /// Bitcoin network (default: `GROK_BITCOIN_NETWORK` or mainnet)
+        #[arg(long)]
+        network: Option<String>,
     },
 }
 /// Arguments for the `wrap` subcommand: the command to run, then its args.
@@ -1347,8 +1418,34 @@ mod tests {
             .expect("routstr topup parses");
         match args.command {
             Some(Command::Routstr(RoutstrArgs {
-                command: RoutstrCommand::Topup { sats: Some(21_000) },
+                command: RoutstrCommand::Topup {
+                    sats: Some(21_000),
+                    status: None,
+                    no_poll: false,
+                },
             })) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routstr_topup_parses_status() {
+        let args = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "topup",
+            "--status",
+            "inv123",
+        ])
+        .expect("routstr topup status parses");
+        match args.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command: RoutstrCommand::Topup {
+                    sats: None,
+                    status: Some(id),
+                    no_poll: false,
+                },
+            })) if id == "inv123" => {}
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -1574,6 +1671,278 @@ mod tests {
                 );
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routstr_cpfp_parses_dry_run_and_broadcast() {
+        let sample_parent = format!(
+            "{}:1:80000:bc1qtestaddress000000000000000000000",
+            "cd".repeat(32)
+        );
+        let sample_extra = format!(
+            "{}:0:50000:bc1qtestaddress000000000000000000000",
+            "ef".repeat(32)
+        );
+        let dry = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "cpfp",
+            "bc1qtestaddress000000000000000000000",
+            "40000",
+            "--parent-fee",
+            "200",
+            "--parent-vbytes",
+            "200",
+            "--parent",
+            &sample_parent,
+        ])
+        .expect("routstr cpfp dry-run parses");
+        match dry.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Cpfp {
+                        address,
+                        sats: 40_000,
+                        parent_fee: 200,
+                        parent_vbytes: 200,
+                        ref parents,
+                        ref extra_inputs,
+                        broadcast: false,
+                        fee_rate: None,
+                    },
+            })) => {
+                assert!(address.starts_with("bc1q"));
+                assert_eq!(parents.len(), 1);
+                assert_eq!(parents[0], sample_parent);
+                assert!(extra_inputs.is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let live = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "cpfp",
+            "bc1qtestaddress000000000000000000000",
+            "30000",
+            "--parent-fee",
+            "100",
+            "--parent-vbytes",
+            "141",
+            "--parent",
+            &sample_parent,
+            "--extra-input",
+            &sample_extra,
+            "--broadcast",
+            "--fee-rate",
+            "20",
+        ])
+        .expect("routstr cpfp --broadcast parses");
+        match live.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Cpfp {
+                        sats: 30_000,
+                        parent_fee: 100,
+                        parent_vbytes: 141,
+                        broadcast: true,
+                        fee_rate: Some(20),
+                        ref parents,
+                        ref extra_inputs,
+                        ..
+                    },
+            })) => {
+                assert_eq!(parents.len(), 1);
+                assert_eq!(extra_inputs.len(), 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routstr_cpfp_requires_parent_flags() {
+        let err = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "cpfp",
+            "bc1qtestaddress000000000000000000000",
+            "40000",
+        ])
+        .expect_err("cpfp without required flags must fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let err = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "cpfp",
+            "bc1qtestaddress000000000000000000000",
+            "40000",
+            "--parent-fee",
+            "200",
+            "--parent-vbytes",
+            "200",
+            // no --parent
+        ])
+        .expect_err("cpfp without --parent must fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn routstr_cpfp_fee_rate_zero_rejected_by_product_parse() {
+        let sample_parent = format!("{}:1:80000:bc1qrecv", "cd".repeat(32));
+        let parsed = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "cpfp",
+            "bc1qtestaddress000000000000000000000",
+            "1000",
+            "--parent-fee",
+            "200",
+            "--parent-vbytes",
+            "200",
+            "--parent",
+            &sample_parent,
+            "--fee-rate",
+            "0",
+        ])
+        .expect("clap allows fee_rate 0; product rejects later");
+        match parsed.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Cpfp {
+                        fee_rate: Some(0),
+                        ref parents,
+                        parent_fee: 200,
+                        parent_vbytes: 200,
+                        ref extra_inputs,
+                        ..
+                    },
+            })) => {
+                assert_eq!(parents.len(), 1);
+                let err = grok_bitcoin_wallet::funding_cli::parse_cpfp_child_request(
+                    "bc1qtestaddress000000000000000000000",
+                    1000,
+                    200,
+                    200,
+                    parents,
+                    extra_inputs,
+                    false,
+                    Some(0),
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string().to_ascii_lowercase().contains("fee"),
+                    "{err}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routstr_fees_parses_default_and_network() {
+        let bare =
+            PagerArgs::try_parse_from(["grok", "routstr", "fees"]).expect("routstr fees parses");
+        match bare.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command: RoutstrCommand::Fees { network: None },
+            })) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        let with_net =
+            PagerArgs::try_parse_from(["grok", "routstr", "fees", "--network", "signet"])
+                .expect("routstr fees --network parses");
+        match with_net.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Fees {
+                        network: Some(ref n),
+                    },
+            })) => {
+                assert_eq!(n, "signet");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // fees has no --fee-rate (ladder only; RBF/CPFP keep their own rates).
+        let err = PagerArgs::try_parse_from(["grok", "routstr", "fees", "--fee-rate", "5"])
+            .expect_err("fees must not accept --fee-rate");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn routstr_utxos_parses_default_and_network() {
+        let bare =
+            PagerArgs::try_parse_from(["grok", "routstr", "utxos"]).expect("routstr utxos parses");
+        match bare.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command: RoutstrCommand::Utxos { network: None },
+            })) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        let with_net =
+            PagerArgs::try_parse_from(["grok", "routstr", "utxos", "--network", "signet"])
+                .expect("routstr utxos --network parses");
+        match with_net.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Utxos {
+                        network: Some(ref n),
+                    },
+            })) => {
+                assert_eq!(n, "signet");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // utxos is observational — not a spend/broadcast path.
+        let err = PagerArgs::try_parse_from(["grok", "routstr", "utxos", "--broadcast"])
+            .expect_err("utxos must not accept --broadcast");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn routstr_fees_clap_help_is_ladder_only_not_rebuild() {
+        use clap::CommandFactory;
+        let mut root = PagerArgs::command();
+        let routstr = root
+            .find_subcommand_mut("routstr")
+            .expect("routstr subcommand");
+        let fees = routstr
+            .find_subcommand_mut("fees")
+            .expect("fees subcommand");
+        let about = fees.get_about().map(|s| s.to_string()).unwrap_or_default();
+        let long = fees
+            .get_long_about()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let help = fees.render_long_help().to_string();
+        let joined = format!("{about}\n{long}\n{help}").to_ascii_lowercase();
+
+        // Shared wallet constants (about/long_about) — must not drift from honesty.
+        assert_eq!(about, grok_bitcoin_wallet::funding_cli::FEES_CLI_ABOUT);
+        assert_eq!(long, grok_bitcoin_wallet::funding_cli::FEES_CLI_LONG_ABOUT);
+
+        assert!(
+            joined.contains("ladder"),
+            "fees help must say ladder: {joined}"
+        );
+        assert!(
+            joined.contains("never invents") || joined.contains("unavailable"),
+            "fees help must be honest about unavailable estimates: {joined}"
+        );
+        assert!(
+            joined.contains("rbf") && joined.contains("cpfp"),
+            "fees help should point at rbf/cpfp as separate: {joined}"
+        );
+        // Not a rebuild/broadcast path (negative phrasing like "does not rebuild" is OK).
+        assert!(
+            !joined.contains("broadcast") && !joined.contains("--broadcast"),
+            "fees help must not claim broadcast: {joined}"
+        );
+        if joined.contains("rebuild") {
+            assert!(
+                joined.contains("does not rebuild") || joined.contains("not rebuild"),
+                "fees help may only mention rebuild to deny it: {joined}"
+            );
         }
     }
 

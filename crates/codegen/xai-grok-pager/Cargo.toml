@@ -54,6 +54,8 @@ portable-pty = "0.9"
 # Utilities
 derive_more = { workspace = true, features = ["deref", "deref_mut"] }
 anyhow = { workspace = true }
+# Best-effort wipe of SensitiveString / modal draft on Drop (BIP-39 secrets).
+zeroize = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { workspace = true }
 rand = { workspace = true }
@@ -287,4 +289,13 @@ default-bazel = [
 jemalloc = []
 sandbox-enforce = ["xai-grok-sandbox/enforce"]
 release-dist = []
+# Optional live UTXO list backends for routstr spend (forward shell → wallet).
+# Not default CI. Prefer enabling on `xai-grok-pager-bin` for the product binary:
+#   cargo build -p xai-grok-pager-bin --features esplora
+#   GROK_BITCOIN_CHAIN_SOURCE=esplora GROK_BITCOIN_ESPLORA_URL=https://blockstream.info/api
+#   cargo build -p xai-grok-pager-bin --features electrum
+#   GROK_BITCOIN_CHAIN_SOURCE=electrum GROK_BITCOIN_ELECTRUM_ADDR=host:port
+#   optional GROK_BITCOIN_ELECTRUM_TLS=1 or ssl://host:port (default plaintext)
+esplora = ["xai-grok-shell/esplora"]
+electrum = ["xai-grok-shell/electrum"]
 

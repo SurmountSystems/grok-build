@@ -78,13 +78,33 @@ pub fn derive_bip84_receive_address_with_passphrase(
 }
 
 /// Map `GROK_BITCOIN_NETWORK` / our enum to `bitcoin::Network`.
+///
+/// Accepts the same product strings as [`crate::address_ux::BitcoinNetwork::from_env_str`]
+/// (including `testnet4`) plus `regtest`. Testnet4 maps to [`Network::Testnet`]
+/// because this bitcoin crate pin has no distinct Testnet4 variant (same as
+/// Electrum address gating in [`crate::chain_select`]).
 pub fn network_from_str(s: &str) -> Option<Network> {
     match s.trim().to_ascii_lowercase().as_str() {
         "mainnet" | "bitcoin" | "main" => Some(Network::Bitcoin),
         "signet" => Some(Network::Signet),
-        "testnet" | "testnet3" => Some(Network::Testnet),
+        // testnet4 → Testnet: no distinct Testnet4 in bitcoin crate pin.
+        "testnet" | "testnet3" | "testnet4" => Some(Network::Testnet),
         "regtest" => Some(Network::Regtest),
         _ => None,
+    }
+}
+
+/// Map product [`crate::address_ux::BitcoinNetwork`] to `bitcoin::Network`.
+///
+/// Single shared conversion for BIP84 descriptors, Electrum address checks, and
+/// product CLI paths. Testnet4 → Testnet (no distinct variant in this pin).
+/// Prefer this over re-parsing env strings with different acceptance sets.
+pub fn bitcoin_network_to_network(network: crate::address_ux::BitcoinNetwork) -> Network {
+    use crate::address_ux::BitcoinNetwork;
+    match network {
+        BitcoinNetwork::Mainnet => Network::Bitcoin,
+        BitcoinNetwork::Signet => Network::Signet,
+        BitcoinNetwork::Testnet | BitcoinNetwork::Testnet4 => Network::Testnet,
     }
 }
 
@@ -92,8 +112,22 @@ pub fn network_from_str(s: &str) -> Option<Network> {
 ///
 /// Unknown values return [`WalletError::Onchain`] (no silent mainnet fallback).
 /// Empty / whitespace-only `network_str` is treated as mainnet.
+/// Empty BIP-39 passphrase (default path). Prefer
+/// [`derive_bip84_receive_address_env_network_with_passphrase`] for passphrase wallets.
 pub fn derive_bip84_receive_address_env_network(
     mnemonic: &MnemonicSecret,
+    network_str: &str,
+    index: u32,
+) -> Result<String> {
+    derive_bip84_receive_address_env_network_with_passphrase(mnemonic, "", network_str, index)
+}
+
+/// Same as [`derive_bip84_receive_address_env_network`] with BIP-39 passphrase.
+///
+/// Passphrase must match spend/sign paths. Never log it.
+pub fn derive_bip84_receive_address_env_network_with_passphrase(
+    mnemonic: &MnemonicSecret,
+    passphrase: &str,
     network_str: &str,
     index: u32,
 ) -> Result<String> {
@@ -104,11 +138,11 @@ pub fn derive_bip84_receive_address_env_network(
         network_from_str(trimmed).ok_or_else(|| {
             WalletError::Onchain(format!(
                 "unknown GROK_BITCOIN_NETWORK value {trimmed:?}; \
-                 use mainnet, signet, testnet, or regtest"
+                 use mainnet, signet, testnet, testnet4, or regtest"
             ))
         })?
     };
-    derive_bip84_receive_address(mnemonic, network, index)
+    derive_bip84_receive_address_with_passphrase(mnemonic, passphrase, network, index)
 }
 
 #[cfg(test)]
@@ -129,6 +163,25 @@ mod tests {
     }
 
     #[test]
+    fn passphrase_changes_receive_address_env_network() {
+        let m = import_mnemonic(VECTOR).unwrap();
+        let empty = derive_bip84_receive_address_env_network(&m, "mainnet", 0).unwrap();
+        let with = derive_bip84_receive_address_env_network_with_passphrase(
+            &m,
+            "extra-words",
+            "mainnet",
+            0,
+        )
+        .unwrap();
+        assert_ne!(empty, with);
+        assert_eq!(
+            with,
+            derive_bip84_receive_address_with_passphrase(&m, "extra-words", Network::Bitcoin, 0)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn env_network_rejects_typo() {
         let m = import_mnemonic(VECTOR).unwrap();
         let err = derive_bip84_receive_address_env_network(&m, "mainet", 0).unwrap_err();
@@ -137,6 +190,42 @@ mod tests {
         assert!(ok.starts_with("tb1") || ok.starts_with("bcrt") || !ok.is_empty());
         let main = derive_bip84_receive_address_env_network(&m, "", 0).unwrap();
         assert!(main.starts_with("bc1q"));
+    }
+
+    /// Product CLI advertises testnet4; wallet construction must accept it.
+    #[test]
+    fn network_from_str_accepts_testnet4_as_testnet() {
+        assert_eq!(network_from_str("testnet4"), Some(Network::Testnet));
+        assert_eq!(network_from_str("Testnet4"), Some(Network::Testnet));
+        assert_eq!(network_from_str("testnet"), Some(Network::Testnet));
+        assert_eq!(network_from_str("testnet3"), Some(Network::Testnet));
+        // Shared product enum → bitcoin::Network mapping matches.
+        use crate::address_ux::BitcoinNetwork;
+        assert_eq!(
+            bitcoin_network_to_network(BitcoinNetwork::Testnet4),
+            Network::Testnet
+        );
+        assert_eq!(
+            bitcoin_network_to_network(BitcoinNetwork::Testnet),
+            Network::Testnet
+        );
+        assert_eq!(
+            bitcoin_network_to_network(BitcoinNetwork::Mainnet),
+            Network::Bitcoin
+        );
+        assert_eq!(
+            bitcoin_network_to_network(BitcoinNetwork::Signet),
+            Network::Signet
+        );
+    }
+
+    #[test]
+    fn env_network_testnet4_derives_testnet_address() {
+        let m = import_mnemonic(VECTOR).unwrap();
+        let a = derive_bip84_receive_address_env_network(&m, "testnet4", 0).unwrap();
+        let b = derive_bip84_receive_address(&m, Network::Testnet, 0).unwrap();
+        assert_eq!(a, b, "testnet4 must map to the same BIP84 path as testnet");
+        assert!(a.starts_with("tb1") || a.starts_with("bcrt"), "got {a}");
     }
 
     #[test]

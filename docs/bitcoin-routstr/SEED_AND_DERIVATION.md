@@ -53,7 +53,15 @@ Implementation: `nostr::Keys::from_mnemonic` / `FromMnemonic` with nip06 feature
 - Confirm destructive replace if a wallet already exists.
 - Same derivation paths as generate.
 
-## Passphrase (advanced, post-v1 ok)
+## Passphrase (advanced)
 
 Optional BIP-39 passphrase changes all children; must be backed up separately;
 empty passphrase is the default path.
+
+Product spend / RBF / CPFP / fund address paths accept a passphrase via the
+process env **`GROK_BITCOIN_BIP39_PASSPHRASE`** at unlock/sign time only
+(library `prepare_*` / `*_from_selection` and product prepares take
+`passphrase: &str`). TUI private re-entry: `/routstr unlock pass …` opens a
+masked modal (empty Enter = default path for that unlock; never chat history).
+It is **never** stored in SeedVault, CredentialsStore, `watch_session.json`,
+or chat. Missing/empty env (and no modal override) → default path.

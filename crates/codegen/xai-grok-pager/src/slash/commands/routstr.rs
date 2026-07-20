@@ -4,6 +4,10 @@
 //! (`/routstr unlock pw:<password> <phrase words…>`). Passwords containing
 //! spaces are not supported on this path; use a private terminal or change
 //! the AEAD password to a single token.
+//!
+//! Optional private BIP-39 passphrase: `/routstr unlock pass [pw:…] <phrase>`
+//! opens a masked modal (never chat history / CredentialsStore / watch_session).
+//! Env `GROK_BITCOIN_BIP39_PASSPHRASE` still works without the `pass` flag.
 
 use crate::app::actions::{Action, SensitiveString};
 use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand};
@@ -25,11 +29,11 @@ impl SlashCommand for RoutstrCommand {
     }
 
     fn description(&self) -> &str {
-        "Routstr balance, local Bitcoin fund, spend, rbf, top up, refund, watch"
+        "Routstr balance, local Bitcoin fund, spend, rbf, cpfp, utxos, top up, refund, watch"
     }
 
     fn usage(&self) -> &str {
-        "/routstr [balance|fund|unlock|spend|rbf|topup|refund|watch|stop|qr] [args]"
+        "/routstr [balance|fund|unlock|spend|rbf|cpfp|utxos|topup|refund|watch|stop|qr] [args]"
     }
 
     fn takes_args(&self) -> bool {
@@ -38,7 +42,7 @@ impl SlashCommand for RoutstrCommand {
 
     fn arg_placeholder(&self) -> Option<&str> {
         Some(
-            "balance | fund | unlock <phrase> | spend <addr> <sats> [broadcast] | rbf <addr> <sats> original-fee=… | topup [sats] | refund | watch <addr> | stop | qr [addr]",
+            "balance | fund | unlock <phrase> | spend <addr> <sats> [broadcast] | rbf <addr> <sats> original-fee=… | cpfp <addr> <sats> parent-fee=… | utxos [--network …] | topup [sats] | refund | watch <addr> | stop | qr [addr]",
         )
     }
 
@@ -60,8 +64,9 @@ impl SlashCommand for RoutstrCommand {
                 display: "unlock".to_string(),
                 match_text: "unlock".to_string(),
                 insert_text: "unlock ".to_string(),
-                description: "Re-enter recovery phrase after /routstr fund, spend, or rbf"
-                    .to_string(),
+                description:
+                    "Re-enter recovery phrase; add 'pass' for private BIP-39 passphrase modal"
+                        .to_string(),
             },
             ArgItem {
                 display: "spend".to_string(),
@@ -74,6 +79,21 @@ impl SlashCommand for RoutstrCommand {
                 match_text: "rbf".to_string(),
                 insert_text: "rbf ".to_string(),
                 description: "Same-input RBF dry-run (add broadcast to submit)".to_string(),
+            },
+            ArgItem {
+                display: "cpfp".to_string(),
+                match_text: "cpfp".to_string(),
+                insert_text: "cpfp ".to_string(),
+                description:
+                    "CPFP child dry-run (add broadcast to submit; does not replace parent)"
+                        .to_string(),
+            },
+            ArgItem {
+                display: "utxos".to_string(),
+                match_text: "utxos".to_string(),
+                insert_text: "utxos".to_string(),
+                description: "List UTXOs / on-chain balance (stage + unlock; optional --network)"
+                    .to_string(),
             },
             ArgItem {
                 display: "topup".to_string(),
@@ -146,6 +166,8 @@ pub(crate) fn parse_routstr_args(args: &str) -> CommandResult {
     let trimmed = args.trim();
     // unlock consumes the rest of the line as the recovery phrase.
     // Match the first token case-insensitively so `Unlock` / `UNLOCK` work.
+    // Optional leading `pass` requests the private BIP-39 passphrase modal.
+    // Optional `pw:<aead>` (single token) for SeedVault AEAD password.
     let unlock_rest = {
         let mut sp = trimmed.splitn(2, char::is_whitespace);
         let first = sp.next().unwrap_or("");
@@ -155,16 +177,36 @@ pub(crate) fn parse_routstr_args(args: &str) -> CommandResult {
             None
         }
     };
-    if let Some(phrase) = unlock_rest {
-        if phrase.is_empty() {
+    if let Some(rest) = unlock_rest {
+        if rest.is_empty() {
             return CommandResult::Error(
-                "Usage: /routstr unlock <recovery phrase words…>\n\
-                 Optional password-wrapped seed: first token `pw:<password>` then the phrase.\n\
-                 Password must be a single token (no spaces)."
+                "Usage: /routstr unlock [pass] [pw:<password>] <recovery phrase words…>\n\
+                 `pass` opens a private masked BIP-39 passphrase prompt (not chat history).\n\
+                 Optional AEAD password: `pw:<password>` (single token, no spaces).\n\
+                 Env GROK_BITCOIN_BIP39_PASSPHRASE still applies when `pass` is omitted."
                     .into(),
             );
         }
-        let (password, phrase) = if let Some(after) = phrase.strip_prefix("pw:") {
+        let mut rest = rest;
+        let mut request_passphrase_prompt = false;
+        // Leading `pass` flag (case-insensitive). Must be a whole token so a
+        // recovery word that happens to be "pass" still works when not first.
+        {
+            let mut sp = rest.splitn(2, char::is_whitespace);
+            let tok = sp.next().unwrap_or("");
+            if tok.eq_ignore_ascii_case("pass") {
+                request_passphrase_prompt = true;
+                rest = sp.next().unwrap_or("").trim();
+            }
+        }
+        if rest.is_empty() {
+            return CommandResult::Error(
+                "Usage: /routstr unlock pass [pw:<password>] <recovery phrase words…>\n\
+                 Recovery phrase is required after the pass flag."
+                    .into(),
+            );
+        }
+        let (password, phrase) = if let Some(after) = rest.strip_prefix("pw:") {
             // Single-token password only: split once on whitespace so the rest
             // is the recovery phrase. Passwords with spaces are not supported.
             let mut sp = after.splitn(2, char::is_whitespace);
@@ -172,18 +214,19 @@ pub(crate) fn parse_routstr_args(args: &str) -> CommandResult {
             let ph = sp.next().unwrap_or("").trim().to_owned();
             if ph.is_empty() {
                 return CommandResult::Error(
-                    "Usage: /routstr unlock pw:<password> <recovery phrase…>\n\
+                    "Usage: /routstr unlock [pass] pw:<password> <recovery phrase…>\n\
                      Password must be a single token (no spaces)."
                         .into(),
                 );
             }
             (Some(SensitiveString::new(pw)), ph)
         } else {
-            (None, phrase.to_owned())
+            (None, rest.to_owned())
         };
         return CommandResult::Action(Action::RoutstrFundReentry {
             phrase: SensitiveString::new(phrase),
             password,
+            request_passphrase_prompt,
         });
     }
 
@@ -254,6 +297,48 @@ pub(crate) fn parse_routstr_args(args: &str) -> CommandResult {
                 )),
             }
         }
+        "cpfp" => {
+            let rest: Vec<&str> = parts.collect();
+            match grok_bitcoin_wallet::funding_cli::parse_cpfp_tokens(&rest) {
+                Ok(req) => {
+                    // Parse only — no fee HTTP. Explicit fee → Some; omit → None
+                    // (resolve halfHour/default in the cpfp effect worker).
+                    let fee_rate_sat_vb = if req.fee_rate_explicit {
+                        Some(req.fee_rate_sat_vb)
+                    } else {
+                        None
+                    };
+                    let parent_specs: Vec<String> = req
+                        .parents
+                        .iter()
+                        .map(grok_bitcoin_wallet::funding_cli::format_rbf_input_spec_value)
+                        .collect();
+                    let extra_input_specs: Vec<String> = req
+                        .extra_inputs
+                        .iter()
+                        .map(grok_bitcoin_wallet::funding_cli::format_rbf_input_spec_value)
+                        .collect();
+                    CommandResult::Action(Action::RoutstrCpfp {
+                        address: req.payment_address,
+                        amount_sats: req.amount_sats,
+                        parent_fee_sats: req.parent_fee_sats,
+                        parent_vbytes: req.parent_vbytes,
+                        parent_specs,
+                        extra_input_specs,
+                        broadcast: req.broadcast,
+                        fee_rate_sat_vb,
+                    })
+                }
+                Err(e) => CommandResult::Error(format!(
+                    "{e}\nUsage: /routstr cpfp <address> <sats> parent-fee=<n> \
+                     parent-vbytes=<n> parent=<txid:vout:amount:address> [...] \
+                     [extra-input=<txid:vout:amount:address>] [broadcast] [fee=<n>]\n\
+                     CPFP child only (spends wallet-owned parent output; does not replace \
+                     the parent). Dry-run by default. BIP-39 is never part of this command — \
+                     authorize with /routstr unlock after cpfp is staged."
+                )),
+            }
+        }
         "topup" | "top-up" | "top_up" => {
             let sats = parts.next().and_then(|s| s.parse::<u64>().ok());
             CommandResult::Action(Action::RoutstrTopup { sats })
@@ -275,10 +360,72 @@ pub(crate) fn parse_routstr_args(args: &str) -> CommandResult {
             let address = parts.next().map(|s| s.trim().to_owned());
             CommandResult::Action(Action::RoutstrQr { address })
         }
+        "utxos" | "coins" => {
+            let rest: Vec<&str> = parts.collect();
+            match parse_utxos_slash_tokens(&rest) {
+                Ok(network) => CommandResult::Action(Action::RoutstrUtxos { network }),
+                Err(e) => CommandResult::Error(format!(
+                    "{e}\nUsage: /routstr utxos [--network mainnet|signet|testnet|testnet4]\n\
+                     Stage only — authorize with /routstr unlock after utxos is staged.\n\
+                     Observational gap-limit ChainSource sync (no broadcast). \
+                     Omit --network to use GROK_BITCOIN_NETWORK (default mainnet)."
+                )),
+            }
+        }
         other => CommandResult::Error(format!(
-            "Unknown /routstr argument: {other}. Use balance, fund, unlock, spend, rbf, topup, refund, watch, stop, or qr"
+            "Unknown /routstr argument: {other}. Use balance, fund, unlock, spend, rbf, cpfp, utxos, topup, refund, watch, stop, or qr"
         )),
     }
+}
+
+/// Parse `/routstr utxos` optional network tokens (pure; offline-testable).
+///
+/// Accepts `--network <label>`, `--network=<label>`, or `network=<label>`.
+/// Validates via product [`xai_grok_shell::auth::resolve_fees_network`] (same
+/// acceptance set as CLI `--network`).
+fn parse_utxos_slash_tokens(tokens: &[&str]) -> Result<Option<String>, String> {
+    let mut network: Option<String> = None;
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if let Some(v) = t.strip_prefix("--network=") {
+            if network.is_some() {
+                return Err("duplicate --network".into());
+            }
+            if v.trim().is_empty() {
+                return Err("empty --network value".into());
+            }
+            network = Some(v.trim().to_owned());
+        } else if t == "--network" {
+            i += 1;
+            let Some(v) = tokens.get(i) else {
+                return Err("missing value after --network".into());
+            };
+            if v.trim().is_empty() {
+                return Err("empty --network value".into());
+            }
+            if network.is_some() {
+                return Err("duplicate --network".into());
+            }
+            network = Some(v.trim().to_owned());
+        } else if let Some(v) = t.strip_prefix("network=") {
+            if network.is_some() {
+                return Err("duplicate network=".into());
+            }
+            if v.trim().is_empty() {
+                return Err("empty network= value".into());
+            }
+            network = Some(v.trim().to_owned());
+        } else {
+            return Err(format!("unknown utxos argument: {t}"));
+        }
+        i += 1;
+    }
+    if let Some(ref n) = network {
+        // Single product resolver — same labels as CLI (no dual accept sets).
+        xai_grok_shell::auth::resolve_fees_network(Some(n)).map_err(|e| e.to_string())?;
+    }
+    Ok(network)
 }
 
 #[cfg(test)]
@@ -323,6 +470,53 @@ mod tests {
             parse_routstr_args("nope"),
             CommandResult::Error(_)
         ));
+        // utxos: stages unlock re-entry (TUI path; not CLI Error).
+        match parse_routstr_args("utxos") {
+            CommandResult::Action(Action::RoutstrUtxos { network: None }) => {}
+            other => panic!("expected RoutstrUtxos default: {other:?}"),
+        }
+        match parse_routstr_args("utxos --network signet") {
+            CommandResult::Action(Action::RoutstrUtxos { network: Some(n) }) => {
+                assert_eq!(n, "signet")
+            }
+            other => panic!("expected utxos --network signet: {other:?}"),
+        }
+        match parse_routstr_args("utxos --network=testnet4") {
+            CommandResult::Action(Action::RoutstrUtxos { network: Some(n) }) => {
+                assert_eq!(n, "testnet4")
+            }
+            other => panic!("expected utxos --network=testnet4: {other:?}"),
+        }
+        match parse_routstr_args("utxos network=mainnet") {
+            CommandResult::Action(Action::RoutstrUtxos { network: Some(n) }) => {
+                assert_eq!(n, "mainnet")
+            }
+            other => panic!("expected utxos network=mainnet: {other:?}"),
+        }
+        match parse_routstr_args("coins") {
+            CommandResult::Action(Action::RoutstrUtxos { network: None }) => {}
+            other => panic!("coins alias should stage utxos: {other:?}"),
+        }
+        match parse_routstr_args("utxos --network regtest") {
+            CommandResult::Error(msg) => {
+                let lower = msg.to_ascii_lowercase();
+                assert!(
+                    lower.contains("unknown") || lower.contains("network"),
+                    "regtest must be rejected: {msg}"
+                );
+            }
+            other => panic!("expected Error for regtest: {other:?}"),
+        }
+        match parse_routstr_args("utxos broadcast") {
+            CommandResult::Error(msg) => {
+                assert!(
+                    msg.to_ascii_lowercase().contains("unknown")
+                        || msg.to_ascii_lowercase().contains("usage"),
+                    "utxos must not accept broadcast: {msg}"
+                );
+            }
+            other => panic!("expected Error for broadcast: {other:?}"),
+        }
         // bare /routstr → balance
         assert!(matches!(
             parse_routstr_args(""),
@@ -406,6 +600,78 @@ mod tests {
             CommandResult::Error(_)
         ));
         assert!(matches!(parse_routstr_args("rbf"), CommandResult::Error(_)));
+
+        // CPFP slash: offline parse, deferred fee, required parent-fee/vbytes/parents.
+        let parent = format!("{txid}:1:80000:bc1qchange");
+        match parse_routstr_args(&format!(
+            "cpfp bc1qdest 40000 parent-fee=200 parent-vbytes=200 parent={parent}"
+        )) {
+            CommandResult::Action(Action::RoutstrCpfp {
+                address,
+                amount_sats: 40_000,
+                parent_fee_sats: 200,
+                parent_vbytes: 200,
+                parent_specs,
+                extra_input_specs,
+                broadcast: false,
+                fee_rate_sat_vb: None,
+            }) => {
+                assert_eq!(address, "bc1qdest");
+                assert_eq!(parent_specs.len(), 1);
+                assert_eq!(parent_specs[0], parent);
+                assert!(extra_input_specs.is_empty());
+            }
+            other => panic!("expected cpfp dry-run deferred fee: {other:?}"),
+        }
+        let extra = format!("{}:0:50000:bc1qextra", "ef".repeat(32));
+        match parse_routstr_args(&format!(
+            "cpfp bc1qdest 100 parent-fee=500 parent-vbytes=100 parent={parent} \
+             extra-input={extra} broadcast fee=12"
+        )) {
+            CommandResult::Action(Action::RoutstrCpfp {
+                amount_sats: 100,
+                broadcast: true,
+                fee_rate_sat_vb: Some(12),
+                extra_input_specs,
+                ..
+            }) => {
+                assert_eq!(extra_input_specs.len(), 1);
+                assert_eq!(extra_input_specs[0], extra);
+            }
+            other => panic!("expected cpfp broadcast: {other:?}"),
+        }
+        // fee=0 rejected offline.
+        assert!(matches!(
+            parse_routstr_args(&format!(
+                "cpfp bc1qdest 100 parent-fee=50 parent-vbytes=100 parent={parent} fee=0"
+            )),
+            CommandResult::Error(_)
+        ));
+        // Missing parents / zero vbytes / bare cpfp / parent-fee=0 still allowed via tokens.
+        assert!(matches!(
+            parse_routstr_args("cpfp bc1qdest 100 parent-fee=50 parent-vbytes=100"),
+            CommandResult::Error(_)
+        ));
+        assert!(matches!(
+            parse_routstr_args(&format!(
+                "cpfp bc1qdest 100 parent-fee=50 parent-vbytes=0 parent={parent}"
+            )),
+            CommandResult::Error(_)
+        ));
+        assert!(matches!(
+            parse_routstr_args("cpfp"),
+            CommandResult::Error(_)
+        ));
+        match parse_routstr_args(&format!(
+            "cpfp bc1qdest 100 parent-fee=0 parent-vbytes=100 parent={parent} fee=5"
+        )) {
+            CommandResult::Action(Action::RoutstrCpfp {
+                parent_fee_sats: 0,
+                fee_rate_sat_vb: Some(5),
+                ..
+            }) => {}
+            other => panic!("parent-fee=0 with explicit fee should parse: {other:?}"),
+        }
     }
 
     #[test]
@@ -440,6 +706,7 @@ mod tests {
             CommandResult::Action(Action::RoutstrFundReentry {
                 phrase,
                 password: None,
+                request_passphrase_prompt: false,
             }) => {
                 assert_eq!(phrase.as_str(), "abandon abandon abandon");
             }
@@ -449,6 +716,7 @@ mod tests {
             CommandResult::Action(Action::RoutstrFundReentry {
                 phrase,
                 password: Some(pw),
+                request_passphrase_prompt: false,
             }) => {
                 assert_eq!(pw.as_str(), "secret");
                 assert_eq!(phrase.as_str(), "abandon abandon abandon");
@@ -473,6 +741,7 @@ mod tests {
             CommandResult::Action(Action::RoutstrFundReentry {
                 phrase,
                 password: Some(pw),
+                request_passphrase_prompt: false,
             }) => {
                 assert_eq!(pw.as_str(), "has");
                 assert_eq!(phrase.as_str(), "spaces abandon abandon");
@@ -484,12 +753,66 @@ mod tests {
             CommandResult::Action(Action::RoutstrFundReentry {
                 phrase,
                 password: None,
+                request_passphrase_prompt: false,
             }) => assert_eq!(phrase.as_str(), "abandon abandon abandon"),
             other => panic!("expected Unlock mixed-case: {other:?}"),
         }
         match parse_routstr_args("UNLOCK abandon abandon abandon") {
             CommandResult::Action(Action::RoutstrFundReentry { password: None, .. }) => {}
             other => panic!("expected UNLOCK: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_unlock_pass_flag_for_private_passphrase_modal() {
+        match parse_routstr_args("unlock pass abandon abandon abandon") {
+            CommandResult::Action(Action::RoutstrFundReentry {
+                phrase,
+                password: None,
+                request_passphrase_prompt: true,
+            }) => {
+                assert_eq!(phrase.as_str(), "abandon abandon abandon");
+                let dbg = format!("{phrase:?}");
+                assert!(!dbg.contains("abandon"), "Debug leaked phrase: {dbg}");
+            }
+            other => panic!("expected unlock pass: {other:?}"),
+        }
+        match parse_routstr_args("unlock pass pw:aeadsecret word1 word2 word3") {
+            CommandResult::Action(Action::RoutstrFundReentry {
+                phrase,
+                password: Some(pw),
+                request_passphrase_prompt: true,
+            }) => {
+                assert_eq!(pw.as_str(), "aeadsecret");
+                assert_eq!(phrase.as_str(), "word1 word2 word3");
+                let dbg = format!("{phrase:?} {pw:?}");
+                assert!(
+                    !dbg.contains("aeadsecret") && !dbg.contains("word1"),
+                    "{dbg}"
+                );
+            }
+            other => panic!("expected unlock pass + pw: {other:?}"),
+        }
+        // Case-insensitive pass flag.
+        match parse_routstr_args("unlock PASS abandon abandon") {
+            CommandResult::Action(Action::RoutstrFundReentry {
+                request_passphrase_prompt: true,
+                ..
+            }) => {}
+            other => panic!("expected PASS flag: {other:?}"),
+        }
+        // pass without phrase is an error.
+        assert!(matches!(
+            parse_routstr_args("unlock pass"),
+            CommandResult::Error(_)
+        ));
+        // Without pass flag, request is false (env path).
+        match parse_routstr_args("unlock abandon abandon abandon") {
+            CommandResult::Action(Action::RoutstrFundReentry {
+                request_passphrase_prompt: false,
+                ..
+            }) => {}
+            other => panic!("expected no pass flag: {other:?}"),
         }
     }
 }

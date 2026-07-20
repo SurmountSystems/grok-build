@@ -16,6 +16,9 @@ use xai_grok_shell::sampling::types::ReasoningEffort;
 /// Prevents `{action:?}` / `{effect:?}` panic and test dumps from leaking
 /// recovery material. Prefer moving out via [`SensitiveString::into_inner`]
 /// into the blocking fund task so the effect value does not retain a copy.
+///
+/// On drop, zeroes the heap buffer (via [`zeroize`]) so phrase/passphrase
+/// bytes do not linger after cancel/submit/supersede.
 #[derive(Clone)]
 pub struct SensitiveString(String);
 
@@ -28,12 +31,21 @@ impl SensitiveString {
         &self.0
     }
 
-    pub fn into_inner(self) -> String {
-        self.0
+    pub fn into_inner(mut self) -> String {
+        // Take ownership without relying on Drop of an emptied shell only:
+        // caller receives the bytes; this wrapper no longer holds a copy.
+        std::mem::take(&mut self.0)
     }
 
     pub fn is_empty(&self) -> bool {
         self.0.trim().is_empty()
+    }
+}
+
+impl Drop for SensitiveString {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
     }
 }
 
@@ -723,10 +735,31 @@ pub enum Action {
     RoutstrFund,
     /// Complete returning-user fund after re-entry (and optional AEAD password).
     /// Secrets use [`SensitiveString`] so Debug never dumps BIP-39 / password.
+    ///
+    /// When `request_passphrase_prompt` is true (`/routstr unlock pass …`),
+    /// dispatch opens the private BIP-39 passphrase modal instead of completing
+    /// immediately. Env `GROK_BITCOIN_BIP39_PASSPHRASE` still applies when the
+    /// flag is false (no modal).
     RoutstrFundReentry {
         phrase: SensitiveString,
         password: Option<SensitiveString>,
+        request_passphrase_prompt: bool,
     },
+    /// Submit private BIP-39 passphrase modal (phrase + optional AEAD + typed
+    /// passphrase). Passphrase may be empty (= default path for this unlock).
+    /// Secrets use [`SensitiveString`]; never chat history / durable store.
+    ///
+    /// `agent_id` is the agent that opened the modal — unlock completes for
+    /// that agent only (not whatever `active_view` is at submit time).
+    RoutstrBip39PassphraseSubmit {
+        agent_id: AgentId,
+        phrase: SensitiveString,
+        password: Option<SensitiveString>,
+        passphrase: SensitiveString,
+    },
+    /// Cancel private BIP-39 passphrase modal; drop secrets; leave staged
+    /// spend/rbf/cpfp/utxos intact so the user can re-run unlock.
+    RoutstrBip39PassphraseCancel,
     /// Honest top-up next steps (no live mint spend).
     RoutstrTopup {
         sats: Option<u64>,
@@ -766,6 +799,27 @@ pub enum Action {
         input_specs: Vec<String>,
         broadcast: bool,
         fee_rate_sat_vb: Option<u64>,
+    },
+    /// CPFP child (dry-run default). BIP-39 never on this action — stage +
+    /// `/routstr unlock`. `parent_specs` / `extra_input_specs` are
+    /// `txid:vout:amount:address`. Fee resolve only at effect time when
+    /// `fee_rate_sat_vb` is `None`. Does not replace the parent.
+    RoutstrCpfp {
+        address: String,
+        amount_sats: u64,
+        parent_fee_sats: u64,
+        parent_vbytes: u64,
+        parent_specs: Vec<String>,
+        extra_input_specs: Vec<String>,
+        broadcast: bool,
+        fee_rate_sat_vb: Option<u64>,
+    },
+    /// Stage UTXO list / on-chain balance (observational). BIP-39 never on
+    /// this action — stage + `/routstr unlock`. Optional `network` mirrors CLI
+    /// `--network` (validated at slash parse via product resolver).
+    RoutstrUtxos {
+        /// Explicit network label, or `None` → `GROK_BITCOIN_NETWORK` / mainnet.
+        network: Option<String>,
     },
     /// Commit a read-only list of the queued prompts as a system block
     /// (`/queue`). The surface minimal mode uses in place of the `QueuePane`.
@@ -2129,21 +2183,27 @@ pub enum Effect {
     },
     /// Complete returning-user fund re-entry (filesystem + derive address).
     /// Secrets use [`SensitiveString`] so Debug never dumps BIP-39 / password.
+    ///
+    /// `bip39_passphrase`: `Some` from private modal (empty = default path);
+    /// `None` → shell loads env. Never persisted.
     RoutstrFundComplete {
         agent_id: AgentId,
         grok_home: std::path::PathBuf,
         phrase: SensitiveString,
         password: Option<SensitiveString>,
+        bip39_passphrase: Option<SensitiveString>,
     },
     /// Complete pending on-chain spend after unlock re-entry (no BIP-39 in chat).
     ///
     /// `fee_rate_sat_vb`: `Some(n)` explicit; `None` → resolve in the effect
     /// worker (blocking explorer allowed there, not on slash parse).
+    /// `bip39_passphrase`: `Some` from private modal; `None` → env.
     RoutstrSpendComplete {
         agent_id: AgentId,
         grok_home: std::path::PathBuf,
         phrase: SensitiveString,
         password: Option<SensitiveString>,
+        bip39_passphrase: Option<SensitiveString>,
         address: String,
         amount_sats: u64,
         broadcast: bool,
@@ -2152,11 +2212,13 @@ pub enum Effect {
     /// Complete pending same-input RBF after unlock re-entry (no BIP-39 in chat).
     ///
     /// Fee resolve only in the effect worker when `fee_rate_sat_vb` is `None`.
+    /// `bip39_passphrase`: `Some` from private modal; `None` → env.
     RoutstrRbfComplete {
         agent_id: AgentId,
         grok_home: std::path::PathBuf,
         phrase: SensitiveString,
         password: Option<SensitiveString>,
+        bip39_passphrase: Option<SensitiveString>,
         address: String,
         amount_sats: u64,
         original_fee_sats: u64,
@@ -2164,6 +2226,38 @@ pub enum Effect {
         input_specs: Vec<String>,
         broadcast: bool,
         fee_rate_sat_vb: Option<u64>,
+    },
+    /// Complete pending CPFP child after unlock re-entry (no BIP-39 in chat).
+    ///
+    /// Fee resolve only in the effect worker when `fee_rate_sat_vb` is `None`.
+    /// Child only — never claims parent replaced.
+    /// `bip39_passphrase`: `Some` from private modal; `None` → env.
+    RoutstrCpfpComplete {
+        agent_id: AgentId,
+        grok_home: std::path::PathBuf,
+        phrase: SensitiveString,
+        password: Option<SensitiveString>,
+        bip39_passphrase: Option<SensitiveString>,
+        address: String,
+        amount_sats: u64,
+        parent_fee_sats: u64,
+        parent_vbytes: u64,
+        parent_specs: Vec<String>,
+        extra_input_specs: Vec<String>,
+        broadcast: bool,
+        fee_rate_sat_vb: Option<u64>,
+    },
+    /// Complete pending UTXO list after unlock re-entry (observational; no BIP-39).
+    ///
+    /// `network`: explicit slash `--network`, or `None` → env / mainnet.
+    /// `bip39_passphrase`: `Some` from private modal; `None` → env.
+    RoutstrUtxosComplete {
+        agent_id: AgentId,
+        grok_home: std::path::PathBuf,
+        phrase: SensitiveString,
+        password: Option<SensitiveString>,
+        bip39_passphrase: Option<SensitiveString>,
+        network: Option<String>,
     },
     /// Background address watch: rate-limited poll loop until stop or confirmed.
     ///
@@ -2875,6 +2969,16 @@ pub enum TaskResult {
     RoutstrRbfCompleted {
         agent_id: AgentId,
         result: Result<xai_grok_shell::auth::RoutstrRbfSuccess, String>,
+    },
+    /// TUI CPFP child completed or failed (no BIP-39 in payload).
+    RoutstrCpfpCompleted {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::auth::RoutstrCpfpSuccess, String>,
+    },
+    /// TUI UTXO list completed or failed (observational; no BIP-39 in payload).
+    RoutstrUtxosCompleted {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::auth::RoutstrUtxosSuccess, String>,
     },
     /// One address-watch poll snapshot (drop if generation stale).
     RoutstrWatchTick {

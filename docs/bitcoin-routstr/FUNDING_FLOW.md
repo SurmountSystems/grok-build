@@ -117,7 +117,33 @@ keys generated locally in Grok OSS, without manually juggling five wallets.
 - Routstr **enabled** (discoverability).
 - Wallet **not** auto-created until user accepts backup flow.
 - Network: **mainnet** for release builds; `GROK_BITCOIN_NETWORK=signet` for dev.
-- Explorer: mempool.space until user sets local indexer.
+- Explorer / UTXO list (product spend): **mempool.space** by default.
+  Override with `GROK_BITCOIN_CHAIN_SOURCE=mempool|esplora|electrum`
+  (case-insensitive; empty/unset → mempool). When `esplora`, set
+  `GROK_BITCOIN_ESPLORA_URL` (REST base, e.g. `https://blockstream.info/api`).
+  When `electrum`, set `GROK_BITCOIN_ELECTRUM_ADDR` (`host:port` or `[ipv6]:port`,
+  or `ssl://host:port` for TLS). Optional `GROK_BITCOIN_ELECTRUM_TLS=1|true|yes`
+  enables TLS for bare `host:port` (default **plaintext** TCP for local/regtest).
+  TLS uses rustls + WebPKI roots (no skip-verify). Selecting esplora/electrum
+  requires rebuilding the product binary with matching optional features (not
+  default CI): `cargo build -p xai-grok-pager-bin --features esplora` (or
+  `electrum`). Missing feature → **runtime** structured error at open (no hang).
+  `--broadcast` uses the **same** backend as the UTXO list when the matching
+  feature is built (mempool `POST /api/tx`, Esplora `POST /tx`, Electrum
+  `blockchain.transaction.broadcast`). Default remains mempool-only with no
+  feature flip.
+- Product on-chain **spend** UTXO discovery: gap-limit ChainSource sync
+  (`sync_with_gap_extend` via `select_and_prepare_bip84_spend_with_gap_sync`)
+  with BIP44-style default look-ahead 20 and hard `MAX_ADDRESS_GAP` **before**
+  coin select/sign. Recovers deep receive/change indices when activity sits near
+  the look-ahead tip of the current window. Coin select uses the final sync
+  snapshot UTXOs (`select_and_prepare_bip84_spend_from_utxos`) — **no** extra
+  full-window `list_unspent` after sync (N+1 sync lists only; snapshot
+  authoritative as of that final list). On insufficient funds / no UTXOs
+  after a successful extend, structured `GapSyncSpendFailure::AfterSync` still
+  surfaces honest hit-max / extended-window notices (not success-path only).
+  **Not** full `bdk_wallet` auto-sync (no spent-tx history / script scan).
+  RBF/CPFP keep explicit prevouts and do not re-extend.
 
 ## Non-goals for this flow
 

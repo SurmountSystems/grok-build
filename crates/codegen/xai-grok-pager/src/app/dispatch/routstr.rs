@@ -73,21 +73,26 @@ pub(crate) fn with_watch_session_path_for_test<T>(path: PathBuf, f: impl FnOnce(
     }
 }
 
-/// Canonical network wire string for a brand-new watch (`GROK_BITCOIN_NETWORK`).
-fn network_from_env() -> String {
-    use grok_bitcoin_wallet::address_ux::BitcoinNetwork;
-    let raw = std::env::var("GROK_BITCOIN_NETWORK").unwrap_or_else(|_| "mainnet".into());
-    BitcoinNetwork::from_env_str(&raw)
+/// Product-network wire for a brand-new watch (`GROK_BITCOIN_NETWORK`).
+///
+/// Same acceptance as fund/spend/utxos: `mainnet|signet|testnet|testnet4`
+/// (empty/unset → mainnet). Unknown labels (incl. `regtest`) **fail closed** —
+/// never raw env garbage and never silent Mainnet (unlike fees soft-default).
+fn network_from_env() -> Result<String, String> {
+    xai_grok_shell::auth::routstr::resolve_product_entry_network(None)
         .map(|n| n.as_str().to_owned())
-        .unwrap_or_else(|| raw.trim().to_ascii_lowercase())
+        .map_err(|e| e.to_string())
 }
 
-/// Canonicalize a network string; fall back to env/mainnet when unknown.
-fn canonicalize_network(network: &str) -> String {
-    use grok_bitcoin_wallet::address_ux::BitcoinNetwork;
-    BitcoinNetwork::from_env_str(network)
+/// Canonical product-network wire label (fail-closed).
+///
+/// Empty → mainnet. Known labels → `BitcoinNetwork::as_str()`. Unknown /
+/// `regtest` → error (same text shape as shell product complete resolve).
+/// Does **not** fall back to env (resume must honor durable network only).
+fn canonicalize_network(network: &str) -> Result<String, String> {
+    xai_grok_shell::auth::routstr::resolve_product_complete_network(network)
         .map(|n| n.as_str().to_owned())
-        .unwrap_or_else(network_from_env)
+        .map_err(|e| e.to_string())
 }
 
 /// Persist a running watch (address + network only seed-free fields).
@@ -112,7 +117,14 @@ fn persist_routstr_watch_running(address: &str, network: &str, generation: u64) 
     if address.is_empty() {
         return;
     }
-    let net = BitcoinNetwork::from_env_str(network).unwrap_or(BitcoinNetwork::Mainnet);
+    // Fail closed: never silent-Mainnet rewrite of regtest/unknown wire.
+    let Some(net) = BitcoinNetwork::from_env_str(network) else {
+        tracing::warn!(
+            network,
+            "persist routstr watch session skipped: unknown network (not soft-defaulting to mainnet)"
+        );
+        return;
+    };
     let net_wire = net.as_str().to_owned();
     let state = match load_watch_session_state(&path) {
         Ok(Some(prior)) if prior.address.trim() == address => {
@@ -193,7 +205,28 @@ pub(crate) fn try_resume_persisted_routstr_watch_for_agent(
     if address.is_empty() {
         return vec![];
     }
-    let network = canonicalize_network(&state.network);
+    // Durable network must be a product label; regtest/unknown fail closed
+    // (do not invent Mainnet — matches fund/spend acceptance).
+    let network = match canonicalize_network(&state.network) {
+        Ok(n) => n,
+        Err(msg) => {
+            tracing::warn!(
+                network = %state.network,
+                error = %msg,
+                "resume routstr watch failed: durable network not product-accepted"
+            );
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!(
+                    "Cannot resume deposit watch for {address}: {msg}. \
+                     Fix watch_session network or GROK_BITCOIN_NETWORK \
+                     (mainnet|signet|testnet|testnet4) and re-run /routstr watch."
+                ),
+            );
+            return vec![];
+        }
+    };
     push_system_to_agent(
         app,
         agent_id,
@@ -241,6 +274,26 @@ pub(super) fn dispatch_routstr_balance(app: &mut AppView) -> Vec<Effect> {
     effects
 }
 
+/// Drop private BIP-39 passphrase modal secrets if open (no durable write).
+///
+/// Returns `true` when a modal was cleared. Does not touch staged money paths.
+fn clear_routstr_passphrase_modal(app: &mut AppView, reason: &str) -> bool {
+    let Some(mut modal) = app.routstr_passphrase_modal.take() else {
+        return false;
+    };
+    let agent_id = modal.agent_id;
+    modal.clear_secrets();
+    push_system_to_agent(
+        app,
+        agent_id,
+        format!(
+            "Cancelled private BIP-39 passphrase entry ({reason}). \
+             Staged spend/rbf/cpfp/utxos (if any) is unchanged — re-run /routstr unlock to authorize."
+        ),
+    );
+    true
+}
+
 /// Cancel a staged spend if present; notify the staging agent.
 ///
 /// Returns `true` when a pending spend was cleared.
@@ -280,18 +333,62 @@ fn clear_pending_routstr_rbf(app: &mut AppView, reason: &str) -> bool {
     true
 }
 
+/// Cancel a staged CPFP if present; notify the staging agent.
+///
+/// Returns `true` when a pending cpfp was cleared.
+fn clear_pending_routstr_cpfp(app: &mut AppView, reason: &str) -> bool {
+    let Some(pending) = app.pending_routstr_cpfp.take() else {
+        return false;
+    };
+    push_system_to_agent(
+        app,
+        pending.agent_id,
+        format!(
+            "Cancelled staged CPFP ({reason}): {} sats → {} (parent fee {} sats, {} parent(s)).",
+            pending.amount_sats,
+            pending.address,
+            pending.parent_fee_sats,
+            pending.parent_specs.len()
+        ),
+    );
+    true
+}
+
+/// Cancel a staged UTXO list if present; notify the staging agent.
+///
+/// Returns `true` when a pending utxos was cleared.
+fn clear_pending_routstr_utxos(app: &mut AppView, reason: &str) -> bool {
+    let Some(pending) = app.pending_routstr_utxos.take() else {
+        return false;
+    };
+    let net = pending
+        .network
+        .as_deref()
+        .map(|n| format!(" network={n}"))
+        .unwrap_or_default();
+    push_system_to_agent(
+        app,
+        pending.agent_id,
+        format!("Cancelled staged UTXO list ({reason}){net}."),
+    );
+    true
+}
+
 /// `/routstr fund` — probe vault (async); never mint on keyring errors.
 ///
-/// Also cancels any staged `/routstr spend` or `/routstr rbf` so unlock cannot
-/// authorize a stale (possibly broadcast) money path after the user switched
-/// to fund.
+/// Also cancels any staged `/routstr spend`, `/routstr rbf`, `/routstr cpfp`,
+/// or `/routstr utxos` so unlock cannot authorize a stale (possibly broadcast)
+/// money path or a leftover observational stage after the user switched to fund.
 pub(super) fn dispatch_routstr_fund(app: &mut AppView) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         // No agent view: cannot show system block either.
         return vec![];
     };
+    let _ = clear_routstr_passphrase_modal(app, "running /routstr fund");
     let _ = clear_pending_routstr_spend(app, "running /routstr fund");
     let _ = clear_pending_routstr_rbf(app, "running /routstr fund");
+    let _ = clear_pending_routstr_cpfp(app, "running /routstr fund");
+    let _ = clear_pending_routstr_utxos(app, "running /routstr fund");
     push_system_to_agent(
         app,
         id,
@@ -303,19 +400,25 @@ pub(super) fn dispatch_routstr_fund(app: &mut AppView) -> Vec<Effect> {
     }]
 }
 
-/// Complete re-entry after `/routstr unlock <phrase>`.
+/// Complete re-entry after `/routstr unlock <phrase>` (optional `pass` modal).
 ///
-/// If a pending spend or rbf was staged, unlock authorizes that path (not fund).
-/// BIP-39 never enters chat history — only the unlock path carries
-/// [`SensitiveString`] into a blocking task.
+/// If a pending spend, rbf, cpfp, or utxos was staged, unlock authorizes that
+/// path (not fund). BIP-39 never enters chat history — only the unlock path
+/// carries [`SensitiveString`] into a blocking task.
 ///
-/// Money-path completion is bound to the **staging** agent (`pending.agent_id`),
-/// not merely the current active view, so switching agents cannot mis-route
-/// a money path. Spend and rbf are mutually exclusive pending states.
+/// When `request_passphrase_prompt` is true, opens the private masked modal
+/// and leaves staged spend/rbf/cpfp/utxos paths intact until submit/cancel. Env
+/// passphrase is used only when the flag is false (`bip39_passphrase: None` on
+/// effects).
+///
+/// Completion is bound to the **staging** agent (`pending.agent_id`), not merely
+/// the current active view, so switching agents cannot mis-route a staged path.
+/// Spend, rbf, cpfp, and utxos are mutually exclusive pending states.
 pub(super) fn dispatch_routstr_fund_reentry(
     app: &mut AppView,
     phrase: crate::app::actions::SensitiveString,
     password: Option<crate::app::actions::SensitiveString>,
+    request_passphrase_prompt: bool,
 ) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
@@ -324,6 +427,91 @@ pub(super) fn dispatch_routstr_fund_reentry(
         push_system_to_agent(app, id, "Recovery phrase re-entry cancelled.");
         return vec![];
     }
+    // Supersede any prior open passphrase modal (new unlock owns secrets).
+    if app.routstr_passphrase_modal.is_some() {
+        let _ = clear_routstr_passphrase_modal(app, "superseded by a new /routstr unlock");
+    }
+    if request_passphrase_prompt {
+        app.routstr_passphrase_modal = Some(
+            crate::app::app_view::RoutstrPassphraseModalState::new(id, phrase, password),
+        );
+        push_system_to_agent(
+            app,
+            id,
+            "Private BIP-39 passphrase entry open (masked; not stored in chat). \
+             Enter empty for default path, or type your passphrase then Enter. \
+             Esc cancels unlock and keeps any staged spend/rbf/cpfp/utxos. \
+             Env GROK_BITCOIN_BIP39_PASSPHRASE is ignored for this unlock while the modal is used.",
+        );
+        return vec![];
+    }
+    complete_routstr_unlock_with_secrets(app, id, phrase, password, None)
+}
+
+/// Submit typed passphrase from the private modal → complete unlock.
+///
+/// Input layer already took the modal and moved secrets + **originating**
+/// `agent_id` into this action. Unlock completes for that agent only — never
+/// silently follow a different `active_view` if the user (or lifecycle) switched
+/// mid-entry. Residual modal slot is cleared (supersede race).
+pub(super) fn dispatch_routstr_bip39_passphrase_submit(
+    app: &mut AppView,
+    agent_id: AgentId,
+    phrase: crate::app::actions::SensitiveString,
+    password: Option<crate::app::actions::SensitiveString>,
+    passphrase: crate::app::actions::SensitiveString,
+) -> Vec<Effect> {
+    // Drop any leftover modal (should already be None after input take).
+    if let Some(mut leftover) = app.routstr_passphrase_modal.take() {
+        leftover.clear_secrets();
+    }
+    // Hard-fail if active view is not the modal-bound agent: secrets are already
+    // off the modal; drop them without completing against the wrong agent/fund path.
+    match app.active_view {
+        ActiveView::Agent(active) if active == agent_id => {}
+        ActiveView::Agent(active) => {
+            push_system_to_agent(
+                app,
+                active,
+                format!(
+                    "Private BIP-39 passphrase submit discarded: unlock was started for \
+                     agent {agent_id:?}, but agent {active:?} is active. Switch back to \
+                     agent {agent_id:?} and re-run /routstr unlock pass."
+                ),
+            );
+            push_system_to_agent(
+                app,
+                agent_id,
+                "Private BIP-39 passphrase submit discarded: active view changed mid-entry. \
+                 Re-run /routstr unlock pass on this agent (staged money path unchanged if still set)."
+                    .to_owned(),
+            );
+            return vec![];
+        }
+        _ => {
+            // No agent view — cannot complete money/fund path safely.
+            return vec![];
+        }
+    }
+    complete_routstr_unlock_with_secrets(app, agent_id, phrase, password, Some(passphrase))
+}
+
+/// Cancel private passphrase modal; leave staged money path for re-unlock.
+pub(super) fn dispatch_routstr_bip39_passphrase_cancel(app: &mut AppView) -> Vec<Effect> {
+    let _ = clear_routstr_passphrase_modal(app, "user cancelled");
+    vec![]
+}
+
+/// Shared unlock completion after phrase is known and optional modal passphrase
+/// resolved. `bip39_passphrase: None` → shell uses env; `Some` (incl. empty) →
+/// explicit modal value for this unlock only.
+fn complete_routstr_unlock_with_secrets(
+    app: &mut AppView,
+    id: AgentId,
+    phrase: crate::app::actions::SensitiveString,
+    password: Option<crate::app::actions::SensitiveString>,
+    bip39_passphrase: Option<crate::app::actions::SensitiveString>,
+) -> Vec<Effect> {
     if let Some(pending) = app.pending_routstr_spend.take() {
         // Bind money path to staging agent; reject if active agent differs so
         // the user cannot authorize agent-A's spend from agent-B by accident.
@@ -360,6 +548,7 @@ pub(super) fn dispatch_routstr_fund_reentry(
             grok_home: grok_home(),
             phrase,
             password,
+            bip39_passphrase,
             address: pending.address,
             amount_sats: pending.amount_sats,
             broadcast: pending.broadcast,
@@ -403,6 +592,7 @@ pub(super) fn dispatch_routstr_fund_reentry(
             grok_home: grok_home(),
             phrase,
             password,
+            bip39_passphrase,
             address: pending.address,
             amount_sats: pending.amount_sats,
             original_fee_sats: pending.original_fee_sats,
@@ -410,6 +600,87 @@ pub(super) fn dispatch_routstr_fund_reentry(
             input_specs: pending.input_specs,
             broadcast: pending.broadcast,
             fee_rate_sat_vb: pending.fee_rate_sat_vb,
+        }];
+    }
+    if let Some(pending) = app.pending_routstr_cpfp.take() {
+        if pending.agent_id != id {
+            let staging = pending.agent_id;
+            app.pending_routstr_cpfp = Some(pending);
+            push_system_to_agent(
+                app,
+                id,
+                format!(
+                    "Staged CPFP belongs to another agent session (agent {staging:?}). \
+                     Switch back to that agent and run /routstr unlock there, or cancel \
+                     with /routstr fund on the staging agent."
+                ),
+            );
+            return vec![];
+        }
+        let mode = if pending.broadcast {
+            "broadcast"
+        } else {
+            "dry-run"
+        };
+        push_system_to_agent(
+            app,
+            pending.agent_id,
+            format!(
+                "Authorizing CPFP child ({mode}): {} sats → {} (parent fee {} sats, {} parent(s)). \
+                 Child only — does not replace the parent. Recovery phrase is not stored in chat.",
+                pending.amount_sats,
+                pending.address,
+                pending.parent_fee_sats,
+                pending.parent_specs.len()
+            ),
+        );
+        return vec![Effect::RoutstrCpfpComplete {
+            agent_id: pending.agent_id,
+            grok_home: grok_home(),
+            phrase,
+            password,
+            bip39_passphrase,
+            address: pending.address,
+            amount_sats: pending.amount_sats,
+            parent_fee_sats: pending.parent_fee_sats,
+            parent_vbytes: pending.parent_vbytes,
+            parent_specs: pending.parent_specs,
+            extra_input_specs: pending.extra_input_specs,
+            broadcast: pending.broadcast,
+            fee_rate_sat_vb: pending.fee_rate_sat_vb,
+        }];
+    }
+    if let Some(pending) = app.pending_routstr_utxos.take() {
+        if pending.agent_id != id {
+            let staging = pending.agent_id;
+            app.pending_routstr_utxos = Some(pending);
+            push_system_to_agent(
+                app,
+                id,
+                format!(
+                    "Staged UTXO list belongs to another agent session (agent {staging:?}). \
+                     Switch back to that agent and run /routstr unlock there, or cancel \
+                     with /routstr fund on the staging agent."
+                ),
+            );
+            return vec![];
+        }
+        let net = pending.network.as_deref().unwrap_or("env/default mainnet");
+        push_system_to_agent(
+            app,
+            pending.agent_id,
+            format!(
+                "Authorizing UTXO list (observational, network={net}). \
+                 Recovery phrase is not stored in chat. No broadcast."
+            ),
+        );
+        return vec![Effect::RoutstrUtxosComplete {
+            agent_id: pending.agent_id,
+            grok_home: grok_home(),
+            phrase,
+            password,
+            bip39_passphrase,
+            network: pending.network,
         }];
     }
     push_system_to_agent(
@@ -422,6 +693,7 @@ pub(super) fn dispatch_routstr_fund_reentry(
         grok_home: grok_home(),
         phrase,
         password,
+        bip39_passphrase,
     }]
 }
 
@@ -430,7 +702,7 @@ pub(super) fn dispatch_routstr_fund_reentry(
 /// `fee_rate_sat_vb`: `Some(n)` is an explicit user rate; `None` is resolved
 /// later in the spend effect (explorer halfHour or default 5) — not here.
 ///
-/// Staging spend cancels any pending rbf (and supersedes a prior spend).
+/// Staging spend cancels any pending rbf/cpfp/utxos (and supersedes a prior spend).
 pub(super) fn dispatch_routstr_spend(
     app: &mut AppView,
     address: String,
@@ -441,11 +713,20 @@ pub(super) fn dispatch_routstr_spend(
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
+    if app.routstr_passphrase_modal.is_some() {
+        let _ = clear_routstr_passphrase_modal(app, "superseded by /routstr spend");
+    }
     if app.pending_routstr_spend.is_some() {
         let _ = clear_pending_routstr_spend(app, "superseded by a new /routstr spend");
     }
     if app.pending_routstr_rbf.is_some() {
         let _ = clear_pending_routstr_rbf(app, "superseded by /routstr spend");
+    }
+    if app.pending_routstr_cpfp.is_some() {
+        let _ = clear_pending_routstr_cpfp(app, "superseded by /routstr spend");
+    }
+    if app.pending_routstr_utxos.is_some() {
+        let _ = clear_pending_routstr_utxos(app, "superseded by /routstr spend");
     }
     app.pending_routstr_spend = Some(crate::app::app_view::PendingRoutstrSpend {
         agent_id: id,
@@ -471,8 +752,10 @@ pub(super) fn dispatch_routstr_spend(
         format!(
             "Staged on-chain spend ({mode}): {amount_sats} sats → {address} (fee rate {fee_line}).\n\
              Authorize with: /routstr unlock <recovery phrase words…>\n\
-             Optional AEAD password: /routstr unlock pw:<password> <phrase…>\n\
-             Recovery words are never stored in chat history. Cancel by staging a different spend/rbf or running /routstr fund \
+             Optional private BIP-39 passphrase: /routstr unlock pass <phrase…>\n\
+             Optional AEAD password: /routstr unlock [pass] pw:<password> <phrase…>\n\
+             Env GROK_BITCOIN_BIP39_PASSPHRASE still applies without the pass flag.\n\
+             Recovery words are never stored in chat history. Cancel by staging a different spend/rbf/cpfp/utxos or running /routstr fund \
              (fund cancels any staged money path so unlock cannot broadcast a stale one)."
         ),
     );
@@ -483,7 +766,11 @@ pub(super) fn dispatch_routstr_spend(
 ///
 /// Same-input BIP-125 only: `input_specs` are `txid:vout:amount:address` from
 /// prior spend dry-run meta. Fee resolve only at authorize when not explicit.
-/// Staging rbf cancels any pending spend (and supersedes a prior rbf).
+/// Staging rbf cancels any pending spend/cpfp/utxos (and supersedes a prior rbf).
+///
+/// Argument count mirrors [`crate::app::actions::Action::RoutstrRbf`] fields
+/// plus `app` (same pattern as spend dispatch; keep flat for router matching).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_routstr_rbf(
     app: &mut AppView,
     address: String,
@@ -497,11 +784,20 @@ pub(super) fn dispatch_routstr_rbf(
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
+    if app.routstr_passphrase_modal.is_some() {
+        let _ = clear_routstr_passphrase_modal(app, "superseded by /routstr rbf");
+    }
     if app.pending_routstr_rbf.is_some() {
         let _ = clear_pending_routstr_rbf(app, "superseded by a new /routstr rbf");
     }
     if app.pending_routstr_spend.is_some() {
         let _ = clear_pending_routstr_spend(app, "superseded by /routstr rbf");
+    }
+    if app.pending_routstr_cpfp.is_some() {
+        let _ = clear_pending_routstr_cpfp(app, "superseded by /routstr rbf");
+    }
+    if app.pending_routstr_utxos.is_some() {
+        let _ = clear_pending_routstr_utxos(app, "superseded by /routstr rbf");
     }
     let n_inputs = input_specs.len();
     app.pending_routstr_rbf = Some(crate::app::app_view::PendingRoutstrRbf {
@@ -533,9 +829,144 @@ pub(super) fn dispatch_routstr_rbf(
              Original fee {original_fee_sats} sats / {original_vbytes} vB; {n_inputs} input(s); \
              target fee rate {fee_line}.\n\
              Authorize with: /routstr unlock <recovery phrase words…>\n\
-             Optional AEAD password: /routstr unlock pw:<password> <phrase…>\n\
-             Recovery words are never stored in chat history. Cancel by staging a different rbf/spend or running /routstr fund \
+             Optional private BIP-39 passphrase: /routstr unlock pass <phrase…>\n\
+             Optional AEAD password: /routstr unlock [pass] pw:<password> <phrase…>\n\
+             Env GROK_BITCOIN_BIP39_PASSPHRASE still applies without the pass flag.\n\
+             Recovery words are never stored in chat history. Cancel by staging a different rbf/spend/cpfp/utxos or running /routstr fund \
              (fund cancels any staged money path so unlock cannot broadcast a stale one)."
+        ),
+    );
+    vec![]
+}
+
+/// Stage `/routstr cpfp` then require unlock re-entry (no BIP-39 on this action).
+///
+/// CPFP **child** only: `parent_specs` (and optional `extra_input_specs`) are
+/// `txid:vout:amount:address`. Fee resolve only at authorize when not explicit.
+/// Staging cpfp cancels any pending spend/rbf/utxos (and supersedes a prior cpfp).
+/// Never claims the parent was replaced.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_routstr_cpfp(
+    app: &mut AppView,
+    address: String,
+    amount_sats: u64,
+    parent_fee_sats: u64,
+    parent_vbytes: u64,
+    parent_specs: Vec<String>,
+    extra_input_specs: Vec<String>,
+    broadcast: bool,
+    fee_rate_sat_vb: Option<u64>,
+) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    if app.routstr_passphrase_modal.is_some() {
+        let _ = clear_routstr_passphrase_modal(app, "superseded by /routstr cpfp");
+    }
+    if app.pending_routstr_cpfp.is_some() {
+        let _ = clear_pending_routstr_cpfp(app, "superseded by a new /routstr cpfp");
+    }
+    if app.pending_routstr_spend.is_some() {
+        let _ = clear_pending_routstr_spend(app, "superseded by /routstr cpfp");
+    }
+    if app.pending_routstr_rbf.is_some() {
+        let _ = clear_pending_routstr_rbf(app, "superseded by /routstr cpfp");
+    }
+    if app.pending_routstr_utxos.is_some() {
+        let _ = clear_pending_routstr_utxos(app, "superseded by /routstr cpfp");
+    }
+    let n_parents = parent_specs.len();
+    let n_extras = extra_input_specs.len();
+    app.pending_routstr_cpfp = Some(crate::app::app_view::PendingRoutstrCpfp {
+        agent_id: id,
+        address: address.clone(),
+        amount_sats,
+        parent_fee_sats,
+        parent_vbytes,
+        parent_specs,
+        extra_input_specs,
+        broadcast,
+        fee_rate_sat_vb,
+    });
+    let mode = if broadcast {
+        "with network broadcast"
+    } else {
+        "dry-run only (not broadcast)"
+    };
+    let fee_line = match fee_rate_sat_vb {
+        Some(n) => format!("{n} sat/vB package target"),
+        None => {
+            "explorer halfHour when available, else 5 sat/vB (resolved at authorize)".to_owned()
+        }
+    };
+    push_system_to_agent(
+        app,
+        id,
+        format!(
+            "Staged CPFP child ({mode}): {amount_sats} sats → {address}\n\
+             Parent fee {parent_fee_sats} sats / {parent_vbytes} vB; {n_parents} parent outpoint(s)\
+             {}; package target fee rate {fee_line}.\n\
+             Child only — does **not** replace the parent.\n\
+             Authorize with: /routstr unlock <recovery phrase words…>\n\
+             Optional private BIP-39 passphrase: /routstr unlock pass <phrase…>\n\
+             Optional AEAD password: /routstr unlock [pass] pw:<password> <phrase…>\n\
+             Env GROK_BITCOIN_BIP39_PASSPHRASE still applies without the pass flag.\n\
+             Recovery words are never stored in chat history. Cancel by staging a different cpfp/spend/rbf/utxos or running /routstr fund \
+             (fund cancels any staged money path so unlock cannot broadcast a stale one).",
+            if n_extras > 0 {
+                format!(", {n_extras} extra input(s)")
+            } else {
+                String::new()
+            }
+        ),
+    );
+    vec![]
+}
+
+/// Stage `/routstr utxos` then require unlock re-entry (no BIP-39 on this action).
+///
+/// Observational only — gap-limit ChainSource UTXO list / on-chain balance.
+/// Optional `network` mirrors CLI `--network` (already validated at slash parse
+/// via the product resolver). Staging utxos cancels any pending spend/rbf/cpfp
+/// (and supersedes a prior utxos). Never broadcasts.
+pub(super) fn dispatch_routstr_utxos(app: &mut AppView, network: Option<String>) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    if app.routstr_passphrase_modal.is_some() {
+        let _ = clear_routstr_passphrase_modal(app, "superseded by /routstr utxos");
+    }
+    if app.pending_routstr_utxos.is_some() {
+        let _ = clear_pending_routstr_utxos(app, "superseded by a new /routstr utxos");
+    }
+    if app.pending_routstr_spend.is_some() {
+        let _ = clear_pending_routstr_spend(app, "superseded by /routstr utxos");
+    }
+    if app.pending_routstr_rbf.is_some() {
+        let _ = clear_pending_routstr_rbf(app, "superseded by /routstr utxos");
+    }
+    if app.pending_routstr_cpfp.is_some() {
+        let _ = clear_pending_routstr_cpfp(app, "superseded by /routstr utxos");
+    }
+    app.pending_routstr_utxos = Some(crate::app::app_view::PendingRoutstrUtxos {
+        agent_id: id,
+        network: network.clone(),
+    });
+    let net_line = match network.as_deref() {
+        Some(n) => n.to_owned(),
+        None => "GROK_BITCOIN_NETWORK or mainnet (resolved at authorize)".to_owned(),
+    };
+    push_system_to_agent(
+        app,
+        id,
+        format!(
+            "Staged UTXO list (observational, gap-limit ChainSource sync; network={net_line}).\n\
+             Authorize with: /routstr unlock <recovery phrase words…>\n\
+             Optional private BIP-39 passphrase: /routstr unlock pass <phrase…>\n\
+             Optional AEAD password: /routstr unlock [pass] pw:<password> <phrase…>\n\
+             Env GROK_BITCOIN_BIP39_PASSPHRASE still applies without the pass flag.\n\
+             Recovery words are never stored in chat history. No broadcast. Cancel by staging \
+             spend/rbf/cpfp/utxos or running /routstr fund."
         ),
     );
     vec![]
@@ -569,8 +1000,8 @@ pub(super) fn handle_routstr_spend_completed(
 
 /// Handle RBF task result (system block only; no secrets).
 ///
-/// Same non-clear rule as spend: do not drop a newer staged rbf/spend that may
-/// have been created while this task was in flight.
+/// Same non-clear rule as spend: do not drop a newer staged rbf/spend/cpfp that
+/// may have been created while this task was in flight.
 pub(super) fn handle_routstr_rbf_completed(
     app: &mut AppView,
     agent_id: AgentId,
@@ -593,9 +1024,82 @@ pub(super) fn handle_routstr_rbf_completed(
     vec![]
 }
 
+/// Handle CPFP task result (system block only; no secrets).
+///
+/// Same non-clear rule as spend/rbf: do not drop a newer staged money path that
+/// may have been created while this task was in flight.
+pub(super) fn handle_routstr_cpfp_completed(
+    app: &mut AppView,
+    agent_id: AgentId,
+    result: Result<xai_grok_shell::auth::RoutstrCpfpSuccess, String>,
+) -> Vec<Effect> {
+    match result {
+        Ok(success) => {
+            push_system_to_agent(app, agent_id, success.lines.join("\n"));
+        }
+        Err(message) => {
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!(
+                    "CPFP child failed (not broadcast unless explorer accepted; parent not replaced):\n{message}"
+                ),
+            );
+        }
+    }
+    vec![]
+}
+
+/// Handle UTXO list task result (system block only; no secrets).
+///
+/// Same non-clear rule as spend: do not drop a newer staged utxos/spend path
+/// that may have been created while this task was in flight.
+pub(super) fn handle_routstr_utxos_completed(
+    app: &mut AppView,
+    agent_id: AgentId,
+    result: Result<xai_grok_shell::auth::RoutstrUtxosSuccess, String>,
+) -> Vec<Effect> {
+    match result {
+        Ok(success) => {
+            push_system_to_agent(app, agent_id, success.lines.join("\n"));
+        }
+        Err(message) => {
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!("UTXO list failed (observational; nothing broadcast):\n{message}"),
+            );
+        }
+    }
+    vec![]
+}
+
 /// Honest top-up stub (shared copy with CLI).
 pub(super) fn dispatch_routstr_topup(app: &mut AppView, sats: Option<u64>) -> Vec<Effect> {
-    let lines = grok_bitcoin_wallet::funding_cli::topup_next_steps_lines(sats);
+    // TUI: try live create without long poll (user can `/routstr topup` again or CLI --status).
+    let lines = match xai_grok_shell::auth::create_routstr_lightning_invoice(
+        grok_bitcoin_wallet::routstr_invoice::resolve_topup_amount_sats(sats).unwrap_or(
+            grok_bitcoin_wallet::routstr_invoice::ROUTSTR_INVOICE_DEFAULT_SATS,
+        ),
+    ) {
+        Ok(created) => {
+            let mut lines =
+                grok_bitcoin_wallet::routstr_invoice::live_invoice_display_lines(&created, true);
+            lines.push(format!(
+                "After paying, run CLI: grok routstr topup --status {}",
+                created.invoice_id
+            ));
+            lines
+        }
+        Err(e) => {
+            let mut lines = vec![
+                format!("Routstr live invoice create failed: {e}"),
+                "Falling back to residual next-steps (no fabricated invoice).".to_owned(),
+            ];
+            lines.extend(grok_bitcoin_wallet::funding_cli::topup_next_steps_lines(sats));
+            lines
+        }
+    };
     push_system_lines_active(app, &lines);
     vec![]
 }
@@ -620,8 +1124,9 @@ pub(super) fn dispatch_routstr_watch(app: &mut AppView, address: String) -> Vec<
 /// Does **not** consult `app.active_view`. First poll is immediate when
 /// `immediate` is true; subsequent re-arms sleep between polls.
 ///
-/// Network comes from `GROK_BITCOIN_NETWORK` (brand-new watch). Resume paths
-/// must call [`start_routstr_watch_for_agent_on_network`] with durable network.
+/// Network comes from product resolve of `GROK_BITCOIN_NETWORK` (brand-new
+/// watch; fail-closed). Resume paths must call
+/// [`start_routstr_watch_for_agent_on_network`] with durable network.
 ///
 /// **Singleton watch (intentional):** process-wide generation/address on
 /// `AppView`, not per-agent concurrent watches. Tick *messages* still target
@@ -641,7 +1146,11 @@ pub(super) fn start_routstr_watch_for_agent(
 ///
 /// `network_override: Some` is used when resuming durable state so signet /
 /// testnet watches are not rewritten to the env default. `None` reads env for
-/// a brand-new watch (slash `/routstr watch`, fund complete).
+/// a brand-new watch (slash `/routstr watch`). Fund complete passes the
+/// already-resolved product network label.
+///
+/// Unknown / `regtest` (env or override) **fail closed**: no generation bump,
+/// no in-memory watch fields, no persist, no [`Effect::RoutstrWatchLoop`].
 pub(super) fn start_routstr_watch_for_agent_on_network(
     app: &mut AppView,
     agent_id: AgentId,
@@ -657,6 +1166,27 @@ pub(super) fn start_routstr_watch_for_agent_on_network(
     if !app.agents.contains_key(&agent_id) {
         return vec![];
     }
+    // Resolve product network **before** arming (fail closed: no start / persist).
+    let network = match network_override {
+        Some(n) if !n.trim().is_empty() => canonicalize_network(&n),
+        _ => network_from_env(),
+    };
+    let network = match network {
+        Ok(n) => n,
+        Err(msg) => {
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!(
+                    "Cannot start address watch: {msg}. \
+                     Set GROK_BITCOIN_NETWORK to mainnet|signet|testnet|testnet4 \
+                     (or leave unset for mainnet)."
+                ),
+            );
+            app.routstr_watch_status = Some(format!("Watch not started: {msg}"));
+            return vec![];
+        }
+    };
     // Supersede note when another agent held the singleton watch.
     if let Some(prev_agent) = app.routstr_watch_agent_id
         && prev_agent != agent_id
@@ -677,10 +1207,6 @@ pub(super) fn start_routstr_watch_for_agent_on_network(
     app.routstr_watch_generation = app.routstr_watch_generation.saturating_add(1);
     let generation = app.routstr_watch_generation;
     app.routstr_watch_address = Some(address.clone());
-    let network = match network_override {
-        Some(n) if !n.trim().is_empty() => canonicalize_network(&n),
-        _ => network_from_env(),
-    };
     app.routstr_watch_network = Some(network.clone());
     app.routstr_watch_agent_id = Some(agent_id);
     app.routstr_watch_status = Some(format!("Watching {address}: starting"));
@@ -797,7 +1323,14 @@ pub(super) fn handle_routstr_fund_completed(
         Ok(success) => {
             present_receive_address(app, agent_id, &success.address, Some(&success.lines));
             // Bind watch to the task's agent, not active_view (multi-session safe).
-            start_routstr_watch_for_agent(app, agent_id, success.address, /*immediate*/ true)
+            // Reuse fund's product-resolved network label (canonical as_str).
+            start_routstr_watch_for_agent_on_network(
+                app,
+                agent_id,
+                success.address,
+                Some(success.network_label),
+                /*immediate*/ true,
+            )
         }
         Err(e) => {
             push_system_to_agent(app, agent_id, format!("Fund failed: {e}"));
@@ -935,12 +1468,20 @@ pub(super) fn handle_routstr_watch_tick(
     }
     // Re-arm poll loop while generation is current (stop bumps generation).
     // Subsequent polls sleep first for rate-limit honesty.
-    // Reuse in-memory / durable network — never re-read env (would rewrite
-    // signet watches to mainnet when GROK_BITCOIN_NETWORK is unset).
-    let network = app
-        .routstr_watch_network
-        .clone()
-        .unwrap_or_else(network_from_env);
+    // Reuse in-memory network — never re-read env (would rewrite signet
+    // watches when GROK_BITCOIN_NETWORK is unset). Missing in-memory network
+    // falls back to product entry resolve (fail-closed; no silent Mainnet).
+    let network = match app.routstr_watch_network.clone() {
+        Some(n) => n,
+        None => match network_from_env() {
+            Ok(n) => n,
+            Err(msg) => {
+                push_system_to_agent(app, agent_id, format!("Watch re-arm aborted: {msg}"));
+                app.routstr_watch_status = Some(format!("Watch re-arm aborted: {msg}"));
+                return vec![];
+            }
+        },
+    };
     vec![Effect::RoutstrWatchLoop {
         agent_id,
         address,
@@ -967,11 +1508,18 @@ mod tests {
             .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
             .collect();
         let lower = text.to_ascii_lowercase();
+        // Live create may succeed (invoice ready) or fail to residual (not wired).
+        // Never claim a completed payment without status poll + api_key store.
         assert!(
-            lower.contains("not wired") || lower.contains("not available"),
-            "expected honest stub wording: {text}"
+            lower.contains("not wired")
+                || lower.contains("not available")
+                || lower.contains("invoice ready")
+                || lower.contains("bolt11")
+                || lower.contains("live invoice create failed"),
+            "expected topup residual or live invoice wording: {text}"
         );
-        assert!(!lower.contains("invoice created"));
+        assert!(!lower.contains("payment sent"));
+        assert!(!lower.contains("refund completed"));
     }
 
     #[test]
@@ -982,6 +1530,256 @@ mod tests {
             matches!(effects.first(), Some(Effect::RoutstrFundProbe { .. })),
             "expected probe effect: {effects:?}"
         );
+    }
+
+    #[test]
+    fn utxos_stages_pending_and_unlock_routes_to_utxos() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let effects = dispatch(
+            Action::RoutstrUtxos {
+                network: Some("signet".into()),
+            },
+            &mut app,
+        );
+        assert!(effects.is_empty());
+        let pending = app.pending_routstr_utxos.as_ref().expect("pending utxos");
+        assert_eq!(pending.network.as_deref(), Some("signet"));
+        assert_eq!(pending.agent_id, AgentId(0));
+        assert!(app.pending_routstr_spend.is_none());
+
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::RoutstrUtxosComplete {
+                    agent_id: AgentId(0),
+                    network: Some(n),
+                    ..
+                }) if n == "signet"
+            ),
+            "unlock with pending utxos must complete utxos, not fund: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_utxos.is_none(),
+            "pending consumed into effect"
+        );
+        let dbg = format!("{:?}", effects.first());
+        assert!(!dbg.contains("abandon"), "Debug leaked phrase: {dbg}");
+    }
+
+    #[test]
+    fn utxos_clears_pending_spend_and_fund_clears_utxos() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qstale".into(),
+                amount_sats: 99_000,
+                broadcast: true,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_spend.is_some());
+
+        let _ = dispatch(Action::RoutstrUtxos { network: None }, &mut app);
+        assert!(
+            app.pending_routstr_spend.is_none(),
+            "staging utxos must cancel spend"
+        );
+        assert!(app.pending_routstr_utxos.is_some());
+
+        let effects = dispatch(Action::RoutstrFund, &mut app);
+        assert!(
+            matches!(effects.first(), Some(Effect::RoutstrFundProbe { .. })),
+            "expected fund probe: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_utxos.is_none(),
+            "fund must cancel staged utxos"
+        );
+
+        // Unlock without pending → fund complete, not utxos.
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("word word word"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(effects.first(), Some(Effect::RoutstrFundComplete { .. })),
+            "no pending money/utxos → fund: {effects:?}"
+        );
+        assert!(!matches!(
+            effects.first(),
+            Some(Effect::RoutstrUtxosComplete { .. })
+        ));
+    }
+
+    #[test]
+    fn handle_utxos_completed_prints_lines_or_error() {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let _ = handle_routstr_utxos_completed(
+            &mut app,
+            id,
+            Ok(xai_grok_shell::auth::RoutstrUtxosSuccess {
+                network_label: "signet".into(),
+                lines: vec!["confirmed: 0 sats".into(), "UTXOs: none".into()],
+            }),
+        );
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        assert!(
+            text.contains("confirmed") || text.contains("0 sats"),
+            "expected success lines: {text}"
+        );
+
+        let _ = handle_routstr_utxos_completed(
+            &mut app,
+            id,
+            Err("recovery phrase re-entry cancelled; not listing UTXOs".into()),
+        );
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("utxo list failed") || lower.contains("cancelled"),
+            "expected failure notice: {text}"
+        );
+        assert!(
+            lower.contains("observational") || lower.contains("nothing broadcast"),
+            "failure must stay observational: {text}"
+        );
+    }
+
+    #[test]
+    fn unlock_rejects_utxos_when_active_agent_differs_from_staging() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        crate::app::dispatch::tests::insert_placeholder_agent(&mut app, AgentId(1));
+        let _ = dispatch(
+            Action::RoutstrUtxos {
+                network: Some("signet".into()),
+            },
+            &mut app,
+        );
+        assert_eq!(
+            app.pending_routstr_utxos.as_ref().map(|p| p.agent_id),
+            Some(AgentId(0))
+        );
+        app.active_view = ActiveView::Agent(AgentId(1));
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            effects.is_empty(),
+            "cross-agent unlock must not authorize utxos: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_utxos.is_some(),
+            "pending must remain for the staging agent"
+        );
+        assert_eq!(
+            app.pending_routstr_utxos.as_ref().map(|p| p.agent_id),
+            Some(AgentId(0))
+        );
+        assert_eq!(
+            app.pending_routstr_utxos
+                .as_ref()
+                .and_then(|p| p.network.as_deref()),
+            Some("signet")
+        );
+        // Staging agent still sees the mismatch notice on the active agent.
+        let agent1 = app.agents.get(&AgentId(1)).expect("agent 1");
+        let text: String = (0..agent1.scrollback.len())
+            .filter_map(|i| agent1.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("another agent") || lower.contains("staged utxo"),
+            "expected cross-agent notice: {text}"
+        );
+    }
+
+    #[test]
+    fn utxos_task_complete_does_not_drop_newer_staged_utxos() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::RoutstrUtxos {
+                network: Some("mainnet".into()),
+            },
+            &mut app,
+        );
+        let unlock_effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                unlock_effects.first(),
+                Some(Effect::RoutstrUtxosComplete {
+                    network: Some(n),
+                    ..
+                }) if n == "mainnet"
+            ),
+            "stage A unlock: {unlock_effects:?}"
+        );
+        assert!(app.pending_routstr_utxos.is_none());
+
+        // Re-stage B while A is still "in flight".
+        let _ = dispatch(
+            Action::RoutstrUtxos {
+                network: Some("signet".into()),
+            },
+            &mut app,
+        );
+        let pending_b = app
+            .pending_routstr_utxos
+            .as_ref()
+            .expect("stage B must be pending");
+        assert_eq!(pending_b.network.as_deref(), Some("signet"));
+        assert_eq!(pending_b.agent_id, AgentId(0));
+
+        // Completion of A must not wipe B.
+        let _ = handle_routstr_utxos_completed(
+            &mut app,
+            AgentId(0),
+            Ok(xai_grok_shell::auth::RoutstrUtxosSuccess {
+                network_label: "mainnet".into(),
+                lines: vec!["confirmed: 0 sats (stage A complete)".into()],
+            }),
+        );
+        let pending_after = app
+            .pending_routstr_utxos
+            .as_ref()
+            .expect("newer staged utxos must survive task complete");
+        assert_eq!(pending_after.network.as_deref(), Some("signet"));
+        assert_eq!(pending_after.agent_id, AgentId(0));
     }
 
     #[test]
@@ -1008,6 +1806,7 @@ mod tests {
             Action::RoutstrFundReentry {
                 phrase: SensitiveString::new("abandon abandon abandon"),
                 password: None,
+                request_passphrase_prompt: false,
             },
             &mut app,
         );
@@ -1069,6 +1868,7 @@ mod tests {
             Action::RoutstrFundReentry {
                 phrase: SensitiveString::new("abandon abandon abandon"),
                 password: None,
+                request_passphrase_prompt: false,
             },
             &mut app,
         );
@@ -1119,6 +1919,7 @@ mod tests {
             Action::RoutstrFundReentry {
                 phrase: SensitiveString::new("abandon abandon abandon"),
                 password: None,
+                request_passphrase_prompt: false,
             },
             &mut app,
         );
@@ -1191,6 +1992,7 @@ mod tests {
             Action::RoutstrFundReentry {
                 phrase: SensitiveString::new("abandon abandon abandon"),
                 password: None,
+                request_passphrase_prompt: false,
             },
             &mut app,
         );
@@ -1264,6 +2066,393 @@ mod tests {
         );
     }
 
+    fn sample_cpfp_parent_spec() -> String {
+        format!("{}:1:80000:bc1qchange", "cd".repeat(32))
+    }
+
+    #[test]
+    fn cpfp_stages_pending_without_bip39_and_unlock_routes_to_cpfp() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let parent = sample_cpfp_parent_spec();
+        let effects = dispatch(
+            Action::RoutstrCpfp {
+                address: "bc1qdest".into(),
+                amount_sats: 40_000,
+                parent_fee_sats: 200,
+                parent_vbytes: 200,
+                parent_specs: vec![parent.clone()],
+                extra_input_specs: vec![],
+                broadcast: false,
+                fee_rate_sat_vb: Some(10),
+            },
+            &mut app,
+        );
+        assert!(effects.is_empty());
+        let pending = app.pending_routstr_cpfp.as_ref().expect("pending cpfp");
+        assert_eq!(pending.address, "bc1qdest");
+        assert_eq!(pending.amount_sats, 40_000);
+        assert_eq!(pending.parent_fee_sats, 200);
+        assert_eq!(pending.parent_vbytes, 200);
+        assert_eq!(pending.parent_specs, vec![parent.clone()]);
+        assert!(pending.extra_input_specs.is_empty());
+        assert!(!pending.broadcast);
+        assert_eq!(pending.fee_rate_sat_vb, Some(10));
+        assert_eq!(pending.agent_id, AgentId(0));
+        assert!(app.pending_routstr_spend.is_none());
+        assert!(app.pending_routstr_rbf.is_none());
+
+        // Staging copy must stress child-only / not replace parent.
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("child")
+                && (lower.contains("does not replace")
+                    || lower.contains("not replace")
+                    || lower.contains("does **not** replace")
+                    || (lower.contains("replace") && lower.contains("not"))),
+            "expected child-only product copy: {text}"
+        );
+
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::RoutstrCpfpComplete {
+                    amount_sats: 40_000,
+                    parent_fee_sats: 200,
+                    parent_vbytes: 200,
+                    broadcast: false,
+                    agent_id: AgentId(0),
+                    ..
+                })
+            ),
+            "unlock with pending cpfp must complete cpfp, not fund: {effects:?}"
+        );
+        match effects.first() {
+            Some(Effect::RoutstrCpfpComplete {
+                parent_specs,
+                extra_input_specs,
+                ..
+            }) => {
+                assert_eq!(parent_specs, &vec![parent]);
+                assert!(extra_input_specs.is_empty());
+            }
+            other => panic!("expected cpfp complete: {other:?}"),
+        }
+        assert!(
+            app.pending_routstr_cpfp.is_none(),
+            "pending consumed into effect"
+        );
+        let dbg = format!("{:?}", effects.first());
+        assert!(!dbg.contains("abandon"), "Debug leaked phrase: {dbg}");
+    }
+
+    #[test]
+    fn fund_clears_pending_cpfp_so_unlock_routes_to_fund() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::RoutstrCpfp {
+                address: "bc1qstale".into(),
+                amount_sats: 99_000,
+                parent_fee_sats: 500,
+                parent_vbytes: 141,
+                parent_specs: vec![sample_cpfp_parent_spec()],
+                extra_input_specs: vec![],
+                broadcast: true,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_cpfp.is_some());
+
+        let effects = dispatch(Action::RoutstrFund, &mut app);
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::RoutstrFundProbe { .. })
+        ));
+        assert!(
+            app.pending_routstr_cpfp.is_none(),
+            "fund must cancel staged cpfp"
+        );
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        assert!(
+            text.to_ascii_lowercase().contains("cancelled staged cpfp"),
+            "expected cpfp cancel notice: {text}"
+        );
+
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(effects.first(), Some(Effect::RoutstrFundComplete { .. })),
+            "after fund cancel, unlock must fund not cpfp: {effects:?}"
+        );
+        assert!(
+            !matches!(effects.first(), Some(Effect::RoutstrCpfpComplete { .. })),
+            "must not complete stale cpfp: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn spend_rbf_cpfp_supersede_each_other() {
+        let mut app = test_app_with_agent();
+        // Stage spend.
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qspend".into(),
+                amount_sats: 1000,
+                broadcast: false,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_spend.is_some());
+        // Stage cpfp → cancels spend.
+        let _ = dispatch(
+            Action::RoutstrCpfp {
+                address: "bc1qcpfp".into(),
+                amount_sats: 2000,
+                parent_fee_sats: 100,
+                parent_vbytes: 141,
+                parent_specs: vec![sample_cpfp_parent_spec()],
+                extra_input_specs: vec![],
+                broadcast: false,
+                fee_rate_sat_vb: None,
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_spend.is_none());
+        assert_eq!(
+            app.pending_routstr_cpfp
+                .as_ref()
+                .map(|p| p.address.as_str()),
+            Some("bc1qcpfp")
+        );
+        // Stage rbf → cancels cpfp.
+        let _ = dispatch(
+            Action::RoutstrRbf {
+                address: "bc1qrbf".into(),
+                amount_sats: 3000,
+                original_fee_sats: 200,
+                original_vbytes: 150,
+                input_specs: vec![sample_rbf_input_spec()],
+                broadcast: false,
+                fee_rate_sat_vb: Some(8),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_cpfp.is_none());
+        assert_eq!(
+            app.pending_routstr_rbf.as_ref().map(|p| p.address.as_str()),
+            Some("bc1qrbf")
+        );
+        // Stage cpfp again → cancels rbf.
+        let _ = dispatch(
+            Action::RoutstrCpfp {
+                address: "bc1qcpfp2".into(),
+                amount_sats: 4000,
+                parent_fee_sats: 50,
+                parent_vbytes: 100,
+                parent_specs: vec![sample_cpfp_parent_spec()],
+                extra_input_specs: vec![],
+                broadcast: true,
+                fee_rate_sat_vb: Some(12),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_rbf.is_none());
+        assert_eq!(
+            app.pending_routstr_cpfp
+                .as_ref()
+                .map(|p| p.address.as_str()),
+            Some("bc1qcpfp2")
+        );
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("cancelled staged spend")
+                && lower.contains("cancelled staged cpfp")
+                && lower.contains("cancelled staged rbf"),
+            "expected spend/rbf/cpfp cancel notices: {text}"
+        );
+    }
+
+    #[test]
+    fn unlock_rejects_cpfp_when_active_agent_differs_from_staging() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        crate::app::dispatch::tests::insert_placeholder_agent(&mut app, AgentId(1));
+        let _ = dispatch(
+            Action::RoutstrCpfp {
+                address: "bc1qagent0".into(),
+                amount_sats: 500,
+                parent_fee_sats: 50,
+                parent_vbytes: 100,
+                parent_specs: vec![sample_cpfp_parent_spec()],
+                extra_input_specs: vec![],
+                broadcast: true,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        assert_eq!(
+            app.pending_routstr_cpfp.as_ref().map(|p| p.agent_id),
+            Some(AgentId(0))
+        );
+        app.active_view = ActiveView::Agent(AgentId(1));
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            effects.is_empty(),
+            "cross-agent unlock must not authorize cpfp: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_cpfp.is_some(),
+            "pending must remain for the staging agent"
+        );
+        assert_eq!(
+            app.pending_routstr_cpfp.as_ref().map(|p| p.agent_id),
+            Some(AgentId(0))
+        );
+    }
+
+    #[test]
+    fn cpfp_task_complete_does_not_drop_newer_staged_cpfp() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let parent = sample_cpfp_parent_spec();
+        let _ = dispatch(
+            Action::RoutstrCpfp {
+                address: "bc1qstage-a".into(),
+                amount_sats: 1000,
+                parent_fee_sats: 100,
+                parent_vbytes: 141,
+                parent_specs: vec![parent.clone()],
+                extra_input_specs: vec![],
+                broadcast: false,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        let unlock_effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                unlock_effects.first(),
+                Some(Effect::RoutstrCpfpComplete {
+                    amount_sats: 1000,
+                    ..
+                })
+            ),
+            "stage A unlock: {unlock_effects:?}"
+        );
+        assert!(app.pending_routstr_cpfp.is_none());
+
+        // Re-stage B while A is still "in flight".
+        let _ = dispatch(
+            Action::RoutstrCpfp {
+                address: "bc1qstage-b".into(),
+                amount_sats: 2500,
+                parent_fee_sats: 200,
+                parent_vbytes: 150,
+                parent_specs: vec![parent],
+                extra_input_specs: vec![],
+                broadcast: true,
+                fee_rate_sat_vb: Some(8),
+            },
+            &mut app,
+        );
+        let pending_b = app
+            .pending_routstr_cpfp
+            .as_ref()
+            .expect("stage B must be pending");
+        assert_eq!(pending_b.address, "bc1qstage-b");
+        assert_eq!(pending_b.amount_sats, 2500);
+        assert!(pending_b.broadcast);
+
+        // Completion of A must not wipe B.
+        let _ = handle_routstr_cpfp_completed(
+            &mut app,
+            AgentId(0),
+            Ok(xai_grok_shell::auth::RoutstrCpfpSuccess {
+                payment_address: "bc1qstage-a".into(),
+                payment_sats: 1000,
+                parent_fee_sats: 100,
+                fee_sats: 250,
+                change_sats: 0,
+                txid: "a".repeat(64),
+                raw_hex: "ab".repeat(20),
+                broadcast_txid: None,
+                network_label: "mainnet".into(),
+                fee_rate_sat_vb: 5,
+                lines: vec!["prepared stage A cpfp child (simulated)".into()],
+            }),
+        );
+        let still = app
+            .pending_routstr_cpfp
+            .as_ref()
+            .expect("stage B must survive completion of A");
+        assert_eq!(still.address, "bc1qstage-b");
+        assert_eq!(still.amount_sats, 2500);
+        assert!(still.broadcast);
+        assert_eq!(still.fee_rate_sat_vb, Some(8));
+
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::RoutstrCpfpComplete {
+                    amount_sats: 2500,
+                    broadcast: true,
+                    ..
+                })
+            ),
+            "unlock after A complete must still cpfp B: {effects:?}"
+        );
+    }
+
     #[test]
     fn unlock_rejects_rbf_when_active_agent_differs_from_staging() {
         use crate::app::actions::SensitiveString;
@@ -1290,6 +2479,7 @@ mod tests {
             Action::RoutstrFundReentry {
                 phrase: SensitiveString::new("abandon abandon abandon"),
                 password: None,
+                request_passphrase_prompt: false,
             },
             &mut app,
         );
@@ -1328,6 +2518,7 @@ mod tests {
             Action::RoutstrFundReentry {
                 phrase: SensitiveString::new("abandon abandon abandon"),
                 password: None,
+                request_passphrase_prompt: false,
             },
             &mut app,
         );
@@ -1395,6 +2586,7 @@ mod tests {
             Action::RoutstrFundReentry {
                 phrase: SensitiveString::new("abandon abandon abandon"),
                 password: None,
+                request_passphrase_prompt: false,
             },
             &mut app,
         );
@@ -1436,6 +2628,7 @@ mod tests {
             Action::RoutstrFundReentry {
                 phrase: SensitiveString::new("abandon abandon abandon"),
                 password: None,
+                request_passphrase_prompt: false,
             },
             &mut app,
         );
@@ -1471,6 +2664,7 @@ mod tests {
             Action::RoutstrFundReentry {
                 phrase: SensitiveString::new("abandon abandon abandon"),
                 password: None,
+                request_passphrase_prompt: false,
             },
             &mut app,
         );
@@ -1534,6 +2728,7 @@ mod tests {
             Action::RoutstrFundReentry {
                 phrase: SensitiveString::new("abandon abandon abandon"),
                 password: None,
+                request_passphrase_prompt: false,
             },
             &mut app,
         );
@@ -1548,6 +2743,522 @@ mod tests {
             ),
             "unlock after A complete must still spend B: {effects:?}"
         );
+    }
+
+    #[test]
+    fn unlock_pass_opens_modal_without_effect_and_debug_redacts_secrets() {
+        use crate::app::actions::SensitiveString;
+        use crate::app::app_view::RoutstrPassphraseModalOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qdest".into(),
+                amount_sats: 1000,
+                broadcast: false,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_spend.is_some());
+
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: true,
+            },
+            &mut app,
+        );
+        assert!(
+            effects.is_empty(),
+            "pass flag must open modal, not complete yet: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_spend.is_some(),
+            "pending spend must stay until passphrase submit"
+        );
+        let modal = app
+            .routstr_passphrase_modal
+            .as_ref()
+            .expect("passphrase modal open");
+        let dbg = format!("{modal:?}");
+        assert!(
+            !dbg.contains("abandon"),
+            "AppView modal Debug leaked phrase: {dbg}"
+        );
+        assert!(
+            dbg.contains("***") || dbg.contains("REDACTED") || dbg.contains("SensitiveString"),
+            "expected redacted phrase field: {dbg}"
+        );
+        // Type a secret into the draft; Debug must never show it.
+        let modal = app.routstr_passphrase_modal.as_mut().unwrap();
+        for c in "my-secret-bip39-pass".chars() {
+            assert_eq!(
+                modal.handle_key(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+                RoutstrPassphraseModalOutcome::Changed
+            );
+        }
+        // Bracketed paste also lands in the draft (not chat); control chars skipped.
+        assert!(modal.push_paste(" +pasted\n\t"));
+        assert_eq!(
+            modal.draft_char_len(),
+            "my-secret-bip39-pass +pasted".chars().count()
+        );
+        let dbg = format!("{:?}", app.routstr_passphrase_modal);
+        assert!(
+            !dbg.contains("my-secret-bip39-pass"),
+            "Debug leaked typed passphrase: {dbg}"
+        );
+        assert!(
+            !dbg.contains("+pasted"),
+            "Debug leaked pasted passphrase: {dbg}"
+        );
+        assert!(
+            !dbg.contains("abandon"),
+            "Debug leaked phrase after type: {dbg}"
+        );
+        // Pending spend params still contain no secrets.
+        let pend_dbg = format!("{:?}", app.pending_routstr_spend);
+        assert!(!pend_dbg.contains("my-secret"));
+        assert!(!pend_dbg.contains("abandon"));
+    }
+
+    #[test]
+    fn passphrase_modal_cancel_clears_secrets_keeps_pending_spend() {
+        use crate::app::actions::SensitiveString;
+
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qkeep".into(),
+                amount_sats: 42,
+                broadcast: true,
+                fee_rate_sat_vb: Some(3),
+            },
+            &mut app,
+        );
+        let _ = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: Some(SensitiveString::new("aead-pw")),
+                request_passphrase_prompt: true,
+            },
+            &mut app,
+        );
+        assert!(app.routstr_passphrase_modal.is_some());
+        let effects = dispatch(Action::RoutstrBip39PassphraseCancel, &mut app);
+        assert!(effects.is_empty());
+        assert!(
+            app.routstr_passphrase_modal.is_none(),
+            "cancel must drop modal"
+        );
+        let pending = app
+            .pending_routstr_spend
+            .as_ref()
+            .expect("cancel must leave staged spend");
+        assert_eq!(pending.address, "bc1qkeep");
+        assert_eq!(pending.amount_sats, 42);
+        assert!(pending.broadcast);
+        // System notice mentions cancel (non-secret).
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        assert!(
+            text.to_ascii_lowercase().contains("cancelled private")
+                || text.to_ascii_lowercase().contains("passphrase entry"),
+            "expected cancel notice: {text}"
+        );
+        assert!(!text.contains("aead-pw"));
+        assert!(!text.contains("abandon"));
+    }
+
+    #[test]
+    fn passphrase_modal_submit_completes_spend_with_explicit_passphrase() {
+        use crate::app::actions::SensitiveString;
+
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qdest".into(),
+                amount_sats: 1000,
+                broadcast: false,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        let _ = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: true,
+            },
+            &mut app,
+        );
+        assert!(app.routstr_passphrase_modal.is_some());
+        let modal_agent = app.routstr_passphrase_modal.as_ref().unwrap().agent_id;
+        // Input layer would take modal into the submit action; dispatch accepts
+        // secrets + agent_id directly (modal already cleared by input).
+        app.routstr_passphrase_modal = None;
+        let effects = dispatch(
+            Action::RoutstrBip39PassphraseSubmit {
+                agent_id: modal_agent,
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                passphrase: SensitiveString::new("modal-pass-not-for-prod"),
+            },
+            &mut app,
+        );
+        match effects.first() {
+            Some(Effect::RoutstrSpendComplete {
+                amount_sats: 1000,
+                bip39_passphrase: Some(pp),
+                ..
+            }) => {
+                assert_eq!(pp.as_str(), "modal-pass-not-for-prod");
+                let dbg = format!("{:?}", effects.first());
+                assert!(
+                    !dbg.contains("modal-pass-not-for-prod"),
+                    "effect Debug leaked passphrase: {dbg}"
+                );
+                assert!(
+                    !dbg.contains("abandon"),
+                    "effect Debug leaked phrase: {dbg}"
+                );
+            }
+            other => panic!("expected spend complete with explicit passphrase: {other:?}"),
+        }
+        assert!(app.pending_routstr_spend.is_none());
+        assert!(app.routstr_passphrase_modal.is_none());
+    }
+
+    #[test]
+    fn passphrase_modal_submit_empty_is_explicit_default_path() {
+        use crate::app::actions::SensitiveString;
+
+        let mut app = test_app_with_agent();
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: true,
+            },
+            &mut app,
+        );
+        assert!(effects.is_empty());
+        let modal_agent = app.routstr_passphrase_modal.as_ref().unwrap().agent_id;
+        app.routstr_passphrase_modal = None;
+        let effects = dispatch(
+            Action::RoutstrBip39PassphraseSubmit {
+                agent_id: modal_agent,
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                passphrase: SensitiveString::new(""),
+            },
+            &mut app,
+        );
+        match effects.first() {
+            Some(Effect::RoutstrFundComplete {
+                bip39_passphrase: Some(pp),
+                ..
+            }) => {
+                assert!(pp.is_empty(), "empty modal submit is explicit default path");
+            }
+            other => panic!("expected fund complete with Some(\"\"): {other:?}"),
+        }
+    }
+
+    #[test]
+    fn passphrase_modal_submit_wrong_agent_drops_secrets_no_effect() {
+        use crate::app::actions::SensitiveString;
+
+        let mut app = test_app_with_agent();
+        crate::app::dispatch::tests::insert_placeholder_agent(&mut app, AgentId(1));
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qdest".into(),
+                amount_sats: 1000,
+                broadcast: false,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        let _ = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: true,
+            },
+            &mut app,
+        );
+        let modal_agent = app.routstr_passphrase_modal.as_ref().unwrap().agent_id;
+        assert_eq!(modal_agent, AgentId(0));
+        app.routstr_passphrase_modal = None;
+        // Simulate active view switched after modal open (non-input path).
+        app.active_view = crate::app::app_view::ActiveView::Agent(AgentId(1));
+        let effects = dispatch(
+            Action::RoutstrBip39PassphraseSubmit {
+                agent_id: modal_agent,
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                passphrase: SensitiveString::new("must-not-complete"),
+            },
+            &mut app,
+        );
+        assert!(
+            effects.is_empty(),
+            "must not complete unlock for wrong active agent: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_spend.is_some(),
+            "staged spend must remain for correct agent re-unlock"
+        );
+        // System text must not leak secrets.
+        for agent in app.agents.values() {
+            let text: String = (0..agent.scrollback.len())
+                .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+                .collect();
+            assert!(!text.contains("must-not-complete"));
+            assert!(!text.contains("abandon"));
+        }
+    }
+
+    #[test]
+    fn fund_and_restage_supersede_passphrase_modal() {
+        use crate::app::actions::SensitiveString;
+
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qold".into(),
+                amount_sats: 1,
+                broadcast: false,
+                fee_rate_sat_vb: Some(1),
+            },
+            &mut app,
+        );
+        let _ = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: true,
+            },
+            &mut app,
+        );
+        assert!(app.routstr_passphrase_modal.is_some());
+
+        // Re-staging spend cancels modal (secrets dropped) and supersedes pending.
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qnew".into(),
+                amount_sats: 2,
+                broadcast: false,
+                fee_rate_sat_vb: Some(2),
+            },
+            &mut app,
+        );
+        assert!(
+            app.routstr_passphrase_modal.is_none(),
+            "restage must clear passphrase modal"
+        );
+        assert_eq!(
+            app.pending_routstr_spend.as_ref().unwrap().address,
+            "bc1qnew"
+        );
+
+        // Open modal again, then fund cancels both.
+        let _ = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: true,
+            },
+            &mut app,
+        );
+        assert!(app.routstr_passphrase_modal.is_some());
+        let _ = dispatch(Action::RoutstrFund, &mut app);
+        assert!(app.routstr_passphrase_modal.is_none());
+        assert!(app.pending_routstr_spend.is_none());
+    }
+
+    #[test]
+    fn rbf_restage_supersedes_passphrase_modal() {
+        use crate::app::actions::SensitiveString;
+
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::RoutstrRbf {
+                address: "bc1qoldrbf".into(),
+                amount_sats: 1000,
+                original_fee_sats: 200,
+                original_vbytes: 140,
+                input_specs: vec![
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0:2000:bc1qin"
+                        .into(),
+                ],
+                broadcast: false,
+                fee_rate_sat_vb: Some(10),
+            },
+            &mut app,
+        );
+        let _ = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: true,
+            },
+            &mut app,
+        );
+        assert!(app.routstr_passphrase_modal.is_some());
+        // Type a secret into the draft so supersede must drop process-memory secret.
+        if let Some(modal) = app.routstr_passphrase_modal.as_mut() {
+            for c in "rbf-modal-secret".chars() {
+                modal.push_char(c);
+            }
+        }
+
+        let _ = dispatch(
+            Action::RoutstrRbf {
+                address: "bc1qnewrbf".into(),
+                amount_sats: 1100,
+                original_fee_sats: 250,
+                original_vbytes: 150,
+                input_specs: vec![
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:1:3000:bc1qin2"
+                        .into(),
+                ],
+                broadcast: false,
+                fee_rate_sat_vb: Some(12),
+            },
+            &mut app,
+        );
+        assert!(
+            app.routstr_passphrase_modal.is_none(),
+            "rbf restage must clear passphrase modal"
+        );
+        let pending = app.pending_routstr_rbf.as_ref().expect("new rbf pending");
+        assert_eq!(pending.address, "bc1qnewrbf");
+        assert_eq!(pending.amount_sats, 1100);
+        assert_eq!(pending.original_fee_sats, 250);
+        // System / pending debug must not leak the typed secret or phrase.
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        assert!(!text.contains("rbf-modal-secret"));
+        assert!(!text.contains("abandon"));
+        let pend_dbg = format!("{:?}", app.pending_routstr_rbf);
+        assert!(!pend_dbg.contains("rbf-modal-secret"));
+        assert!(!pend_dbg.contains("abandon"));
+    }
+
+    #[test]
+    fn cpfp_restage_supersedes_passphrase_modal() {
+        use crate::app::actions::SensitiveString;
+
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::RoutstrCpfp {
+                address: "bc1qoldcpfp".into(),
+                amount_sats: 500,
+                parent_fee_sats: 100,
+                parent_vbytes: 140,
+                parent_specs: vec![
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc:0:1500:bc1qpar"
+                        .into(),
+                ],
+                extra_input_specs: vec![],
+                broadcast: false,
+                fee_rate_sat_vb: Some(8),
+            },
+            &mut app,
+        );
+        let _ = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: true,
+            },
+            &mut app,
+        );
+        assert!(app.routstr_passphrase_modal.is_some());
+        if let Some(modal) = app.routstr_passphrase_modal.as_mut() {
+            for c in "cpfp-modal-secret".chars() {
+                modal.push_char(c);
+            }
+        }
+
+        let _ = dispatch(
+            Action::RoutstrCpfp {
+                address: "bc1qnewcpfp".into(),
+                amount_sats: 600,
+                parent_fee_sats: 120,
+                parent_vbytes: 160,
+                parent_specs: vec![
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd:2:2000:bc1qpar2"
+                        .into(),
+                ],
+                extra_input_specs: vec![],
+                broadcast: false,
+                fee_rate_sat_vb: Some(9),
+            },
+            &mut app,
+        );
+        assert!(
+            app.routstr_passphrase_modal.is_none(),
+            "cpfp restage must clear passphrase modal"
+        );
+        let pending = app.pending_routstr_cpfp.as_ref().expect("new cpfp pending");
+        assert_eq!(pending.address, "bc1qnewcpfp");
+        assert_eq!(pending.amount_sats, 600);
+        assert_eq!(pending.parent_fee_sats, 120);
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        assert!(!text.contains("cpfp-modal-secret"));
+        assert!(!text.contains("abandon"));
+        let pend_dbg = format!("{:?}", app.pending_routstr_cpfp);
+        assert!(!pend_dbg.contains("cpfp-modal-secret"));
+        assert!(!pend_dbg.contains("abandon"));
+    }
+
+    #[test]
+    fn unlock_without_pass_still_completes_immediately_env_path() {
+        use crate::app::actions::SensitiveString;
+
+        // Regression: default unlock (no pass flag) must not require the modal.
+        let mut app = test_app_with_agent();
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qdest".into(),
+                amount_sats: 1000,
+                broadcast: false,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::RoutstrSpendComplete {
+                    bip39_passphrase: None,
+                    ..
+                })
+            ),
+            "no-pass unlock uses env path (None): {effects:?}"
+        );
+        assert!(app.routstr_passphrase_modal.is_none());
     }
 
     #[test]
@@ -1969,5 +3680,212 @@ mod tests {
         assert!(!watch_persistence_enabled());
         let mut app = test_app_with_agent();
         assert!(try_resume_persisted_routstr_watch_for_agent(&mut app, AgentId(0)).is_empty());
+    }
+
+    /// Scrollback dump helper for fail-closed watch messaging.
+    fn agent_scrollback_text(app: &AppView, id: AgentId) -> String {
+        let agent = app.agents.get(&id).unwrap();
+        (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect()
+    }
+
+    /// Brand-new watch with `GROK_BITCOIN_NETWORK=regtest` must not emit the
+    /// watch loop and must surface a product unknown-network error (parity
+    /// with fund/spend; no silent Mainnet / raw "regtest" wire).
+    #[test]
+    #[serial_test::serial(GROK_BITCOIN_NETWORK)]
+    fn watch_start_regtest_env_fail_closed_no_loop() {
+        let _env = xai_grok_test_support::EnvGuard::set("GROK_BITCOIN_NETWORK", "regtest");
+        let mut app = test_app_with_agent();
+        let gen_before = app.routstr_watch_generation;
+        let effects = start_routstr_watch_for_agent(
+            &mut app,
+            AgentId(0),
+            "bc1qregtestfailclosed0000000000000".into(),
+            true,
+        );
+        assert!(
+            effects.is_empty(),
+            "regtest must not emit RoutstrWatchLoop: {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::RoutstrWatchLoop { .. })),
+            "{effects:?}"
+        );
+        assert!(app.routstr_watch_address.is_none());
+        assert!(app.routstr_watch_network.is_none());
+        assert_eq!(
+            app.routstr_watch_generation, gen_before,
+            "fail-closed must not bump generation"
+        );
+        let text = agent_scrollback_text(&app, AgentId(0)).to_ascii_lowercase();
+        assert!(
+            text.contains("unknown") && text.contains("regtest"),
+            "user-visible product network error expected: {text}"
+        );
+        assert!(
+            app.routstr_watch_status
+                .as_deref()
+                .is_some_and(|s| s.to_ascii_lowercase().contains("unknown")),
+            "status should note failure: {:?}",
+            app.routstr_watch_status
+        );
+    }
+
+    /// Unknown env typo fails closed like regtest (no loop / no soft-Mainnet).
+    #[test]
+    #[serial_test::serial(GROK_BITCOIN_NETWORK)]
+    fn watch_start_typo_env_fail_closed_no_loop() {
+        let _env = xai_grok_test_support::EnvGuard::set("GROK_BITCOIN_NETWORK", "mainet");
+        let mut app = test_app_with_agent();
+        let effects = start_routstr_watch_for_agent(
+            &mut app,
+            AgentId(0),
+            "bc1qtypofailclosed000000000000000".into(),
+            true,
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(app.routstr_watch_address.is_none());
+        let text = agent_scrollback_text(&app, AgentId(0)).to_ascii_lowercase();
+        assert!(
+            text.contains("unknown") && text.contains("mainet"),
+            "typo must surface in error: {text}"
+        );
+    }
+
+    /// Valid product labels start with canonical wire (not raw env aliases).
+    #[test]
+    #[serial_test::serial(GROK_BITCOIN_NETWORK)]
+    fn watch_start_signet_and_testnet4_canonical_wire() {
+        for (env, wire) in [
+            ("signet", "signet"),
+            ("testnet4", "testnet4"),
+            ("Testnet4", "testnet4"),
+        ] {
+            let _env = xai_grok_test_support::EnvGuard::set("GROK_BITCOIN_NETWORK", env);
+            let mut app = test_app_with_agent();
+            let effects = start_routstr_watch_for_agent(
+                &mut app,
+                AgentId(0),
+                format!("tb1q{wire}canonical000000000000000"),
+                true,
+            );
+            assert!(
+                matches!(
+                    effects.first(),
+                    Some(Effect::RoutstrWatchLoop { network, .. }) if network == wire
+                ),
+                "env {env:?} must wire as {wire:?}: {effects:?}"
+            );
+            assert_eq!(app.routstr_watch_network.as_deref(), Some(wire));
+        }
+    }
+
+    /// Empty / unset env → mainnet start (product default).
+    #[test]
+    #[serial_test::serial(GROK_BITCOIN_NETWORK)]
+    fn watch_start_empty_or_unset_env_mainnet() {
+        {
+            let _env = xai_grok_test_support::EnvGuard::unset("GROK_BITCOIN_NETWORK");
+            let mut app = test_app_with_agent();
+            let effects = start_routstr_watch_for_agent(
+                &mut app,
+                AgentId(0),
+                "bc1qunsetmainnet00000000000000000".into(),
+                true,
+            );
+            assert!(
+                matches!(
+                    effects.first(),
+                    Some(Effect::RoutstrWatchLoop { network, .. }) if network == "mainnet"
+                ),
+                "unset → mainnet: {effects:?}"
+            );
+        }
+        {
+            let _env = xai_grok_test_support::EnvGuard::set("GROK_BITCOIN_NETWORK", "   ");
+            let mut app = test_app_with_agent();
+            let effects = start_routstr_watch_for_agent(
+                &mut app,
+                AgentId(0),
+                "bc1qemptymainnet00000000000000000".into(),
+                true,
+            );
+            assert!(
+                matches!(
+                    effects.first(),
+                    Some(Effect::RoutstrWatchLoop { network, .. }) if network == "mainnet"
+                ),
+                "empty env → mainnet: {effects:?}"
+            );
+        }
+    }
+
+    /// Explicit override regtest/unknown fails closed (resume-shaped path).
+    #[test]
+    fn watch_start_override_regtest_fail_closed() {
+        let mut app = test_app_with_agent();
+        let effects = start_routstr_watch_for_agent_on_network(
+            &mut app,
+            AgentId(0),
+            "bc1qoverrideregtest00000000000000".into(),
+            Some("regtest".into()),
+            true,
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(app.routstr_watch_address.is_none());
+        let text = agent_scrollback_text(&app, AgentId(0)).to_ascii_lowercase();
+        assert!(
+            text.contains("unknown") && text.contains("regtest"),
+            "{text}"
+        );
+    }
+
+    /// Persist must skip (not soft-Mainnet) when wire network is unknown.
+    #[test]
+    fn persist_skips_unknown_network_no_soft_mainnet() {
+        use grok_bitcoin_wallet::watcher::load_watch_session_state;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch_session.json");
+        with_watch_session_path_for_test(path.clone(), || {
+            persist_routstr_watch_running("bc1qunknownnetpersist00000000000", "regtest", 1);
+            assert!(
+                !path.exists(),
+                "unknown network must not write durable session"
+            );
+            assert!(load_watch_session_state(&path).unwrap().is_none());
+
+            // Canonical product label still persists.
+            persist_routstr_watch_running("bc1qsignetpersist000000000000000", "signet", 2);
+            let loaded = load_watch_session_state(&path).unwrap().expect("persisted");
+            assert_eq!(loaded.network, "signet");
+            assert_eq!(loaded.address, "bc1qsignetpersist000000000000000");
+        });
+    }
+
+    /// Pure helpers: product acceptance parity with shell resolve.
+    #[test]
+    #[serial_test::serial(GROK_BITCOIN_NETWORK)]
+    fn watch_network_helpers_fail_closed_parity() {
+        let _env = xai_grok_test_support::EnvGuard::unset("GROK_BITCOIN_NETWORK");
+        assert_eq!(network_from_env().unwrap(), "mainnet");
+        assert_eq!(canonicalize_network("signet").unwrap(), "signet");
+        assert_eq!(canonicalize_network("testnet4").unwrap(), "testnet4");
+        assert_eq!(canonicalize_network("").unwrap(), "mainnet");
+        assert_eq!(canonicalize_network("bitcoin").unwrap(), "mainnet"); // alias → canonical
+        for bad in ["regtest", "mainet", "bogus"] {
+            let err = canonicalize_network(bad).unwrap_err().to_ascii_lowercase();
+            assert!(
+                err.contains("unknown") && err.contains(bad),
+                "canonicalize must fail-closed on {bad:?}: {err}"
+            );
+        }
+        let _env = xai_grok_test_support::EnvGuard::set("GROK_BITCOIN_NETWORK", "regtest");
+        let err = network_from_env().unwrap_err().to_ascii_lowercase();
+        assert!(err.contains("unknown") && err.contains("regtest"), "{err}");
     }
 }

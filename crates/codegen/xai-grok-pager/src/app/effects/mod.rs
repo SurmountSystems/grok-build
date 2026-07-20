@@ -4057,16 +4057,19 @@ pub(crate) fn execute(
             grok_home,
             phrase,
             password,
+            bip39_passphrase,
         } => {
             // Move secrets into the blocking task; drop SensitiveString wrappers here.
             let phrase = phrase.into_inner();
             let password = password.map(|p| p.into_inner());
+            let bip39_passphrase = bip39_passphrase.map(|p| p.into_inner());
             tasks.spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     xai_grok_shell::auth::complete_routstr_fund_reentry_for_tui(
                         &grok_home,
                         &phrase,
                         password.as_deref(),
+                        bip39_passphrase.as_deref(),
                     )
                     .map_err(|e| e.to_string())
                 })
@@ -4080,6 +4083,7 @@ pub(crate) fn execute(
             grok_home,
             phrase,
             password,
+            bip39_passphrase,
             address,
             amount_sats,
             broadcast,
@@ -4087,6 +4091,7 @@ pub(crate) fn execute(
         } => {
             let phrase = phrase.into_inner();
             let password = password.map(|p| p.into_inner());
+            let bip39_passphrase = bip39_passphrase.map(|p| p.into_inner());
             tasks.spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     // Explicit user rate, or live halfHour / default — blocking
@@ -4110,6 +4115,7 @@ pub(crate) fn execute(
                         amount_sats,
                         broadcast,
                         fee_rate,
+                        bip39_passphrase.as_deref(),
                     )
                     .map_err(|e| e.to_string())
                 })
@@ -4123,6 +4129,7 @@ pub(crate) fn execute(
             grok_home,
             phrase,
             password,
+            bip39_passphrase,
             address,
             amount_sats,
             original_fee_sats,
@@ -4133,6 +4140,7 @@ pub(crate) fn execute(
         } => {
             let phrase = phrase.into_inner();
             let password = password.map(|p| p.into_inner());
+            let bip39_passphrase = bip39_passphrase.map(|p| p.into_inner());
             tasks.spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     let fee_rate = match fee_rate_sat_vb {
@@ -4167,12 +4175,108 @@ pub(crate) fn execute(
                         &inputs,
                         broadcast,
                         fee_rate,
+                        bip39_passphrase.as_deref(),
                     )
                     .map_err(|e| e.to_string())
                 })
                 .await
                 .unwrap_or_else(|e| Err(format!("rbf complete task failed: {e}")));
                 TaskResult::RoutstrRbfCompleted { agent_id, result }
+            });
+        }
+        Effect::RoutstrUtxosComplete {
+            agent_id,
+            grok_home,
+            phrase,
+            password,
+            bip39_passphrase,
+            network,
+        } => {
+            let phrase = phrase.into_inner();
+            let password = password.map(|p| p.into_inner());
+            let bip39_passphrase = bip39_passphrase.map(|p| p.into_inner());
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    xai_grok_shell::auth::complete_routstr_utxos_reentry_for_tui(
+                        &grok_home,
+                        &phrase,
+                        password.as_deref(),
+                        network.as_deref(),
+                        bip39_passphrase.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("utxos complete task failed: {e}")));
+                TaskResult::RoutstrUtxosCompleted { agent_id, result }
+            });
+        }
+        Effect::RoutstrCpfpComplete {
+            agent_id,
+            grok_home,
+            phrase,
+            password,
+            bip39_passphrase,
+            address,
+            amount_sats,
+            parent_fee_sats,
+            parent_vbytes,
+            parent_specs,
+            extra_input_specs,
+            broadcast,
+            fee_rate_sat_vb,
+        } => {
+            let phrase = phrase.into_inner();
+            let password = password.map(|p| p.into_inner());
+            let bip39_passphrase = bip39_passphrase.map(|p| p.into_inner());
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let fee_rate = match fee_rate_sat_vb {
+                        Some(n) if n > 0 => n,
+                        Some(_) => {
+                            return Err("fee rate must be > 0 sat/vB".to_owned());
+                        }
+                        None => {
+                            xai_grok_shell::auth::resolve_spend_fee_rate_for_product(None)
+                        }
+                    };
+                    // Re-parse parent/extra specs in the worker (staged as wire strings).
+                    let mut parents = Vec::with_capacity(parent_specs.len());
+                    for raw in &parent_specs {
+                        let spec = grok_bitcoin_wallet::funding_cli::parse_cpfp_input_spec(raw)
+                            .map_err(|e| e.to_string())?;
+                        parents.push(spec);
+                    }
+                    if parents.is_empty() {
+                        return Err(
+                            "CPFP requires at least one parent=txid:vout:amount:address".to_owned(),
+                        );
+                    }
+                    let mut extras = Vec::with_capacity(extra_input_specs.len());
+                    for raw in &extra_input_specs {
+                        let spec = grok_bitcoin_wallet::funding_cli::parse_cpfp_input_spec(raw)
+                            .map_err(|e| e.to_string())?;
+                        extras.push(spec);
+                    }
+                    xai_grok_shell::auth::complete_routstr_cpfp_reentry_for_tui(
+                        &grok_home,
+                        &phrase,
+                        password.as_deref(),
+                        &address,
+                        amount_sats,
+                        parent_fee_sats,
+                        parent_vbytes,
+                        &parents,
+                        &extras,
+                        broadcast,
+                        fee_rate,
+                        bip39_passphrase.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("cpfp complete task failed: {e}")));
+                TaskResult::RoutstrCpfpCompleted { agent_id, result }
             });
         }
         Effect::RoutstrWatchLoop {
@@ -4457,7 +4561,11 @@ fn routstr_watch_poll_once(
         WatchSession, load_watch_session_state, poll_with_http_client,
     };
 
-    let net = BitcoinNetwork::from_env_str(network).unwrap_or(BitcoinNetwork::Mainnet);
+    // Fail closed: never silent-Mainnet on unknown/regtest wire (product
+    // acceptance = mainnet|signet|testnet|testnet4; same as fund/spend).
+    let net = BitcoinNetwork::from_env_str(network).ok_or_else(|| {
+        format!("unknown network '{network}' (use mainnet|signet|testnet|testnet4)")
+    })?;
     // Prefer the effect's network (set from durable state on resume). When
     // durable progress exists for the same address, resume that session so
     // txid/confs survive; if durable network differs from effect, prefer
@@ -4474,6 +4582,7 @@ fn routstr_watch_poll_once(
                 if state.should_resume() && state.address.trim() == address.trim() =>
             {
                 // Prefer durable network over effect/env when resuming progress.
+                // resume_from_state already rejects unknown durable network.
                 WatchSession::resume_from_state(&state).unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "resume watch session failed; starting fresh");
                     WatchSession::start(address, net, 3)

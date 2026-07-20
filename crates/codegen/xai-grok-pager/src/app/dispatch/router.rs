@@ -55,9 +55,11 @@ use super::rewind::{
     dispatch_rewind_show_picker,
 };
 use super::routstr::{
-    dispatch_routstr_balance, dispatch_routstr_fund, dispatch_routstr_fund_reentry,
-    dispatch_routstr_qr, dispatch_routstr_rbf, dispatch_routstr_refund, dispatch_routstr_spend,
-    dispatch_routstr_topup, dispatch_routstr_watch, dispatch_routstr_watch_stop,
+    dispatch_routstr_balance, dispatch_routstr_bip39_passphrase_cancel,
+    dispatch_routstr_bip39_passphrase_submit, dispatch_routstr_cpfp, dispatch_routstr_fund,
+    dispatch_routstr_fund_reentry, dispatch_routstr_qr, dispatch_routstr_rbf,
+    dispatch_routstr_refund, dispatch_routstr_spend, dispatch_routstr_topup,
+    dispatch_routstr_utxos, dispatch_routstr_watch, dispatch_routstr_watch_stop,
 };
 use super::session::foreign::dispatch_fetch_session_list;
 use super::session::fork::{
@@ -911,9 +913,18 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ShowUsage => dispatch_show_usage(app),
         Action::RoutstrBalance => dispatch_routstr_balance(app),
         Action::RoutstrFund => dispatch_routstr_fund(app),
-        Action::RoutstrFundReentry { phrase, password } => {
-            dispatch_routstr_fund_reentry(app, phrase, password)
-        }
+        Action::RoutstrFundReentry {
+            phrase,
+            password,
+            request_passphrase_prompt,
+        } => dispatch_routstr_fund_reentry(app, phrase, password, request_passphrase_prompt),
+        Action::RoutstrBip39PassphraseSubmit {
+            agent_id,
+            phrase,
+            password,
+            passphrase,
+        } => dispatch_routstr_bip39_passphrase_submit(app, agent_id, phrase, password, passphrase),
+        Action::RoutstrBip39PassphraseCancel => dispatch_routstr_bip39_passphrase_cancel(app),
         Action::RoutstrSpend {
             address,
             amount_sats,
@@ -938,6 +949,27 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             broadcast,
             fee_rate_sat_vb,
         ),
+        Action::RoutstrCpfp {
+            address,
+            amount_sats,
+            parent_fee_sats,
+            parent_vbytes,
+            parent_specs,
+            extra_input_specs,
+            broadcast,
+            fee_rate_sat_vb,
+        } => dispatch_routstr_cpfp(
+            app,
+            address,
+            amount_sats,
+            parent_fee_sats,
+            parent_vbytes,
+            parent_specs,
+            extra_input_specs,
+            broadcast,
+            fee_rate_sat_vb,
+        ),
+        Action::RoutstrUtxos { network } => dispatch_routstr_utxos(app, network),
         Action::RoutstrTopup { sats } => dispatch_routstr_topup(app, sats),
         Action::RoutstrRefund => dispatch_routstr_refund(app),
         Action::RoutstrWatch { address } => dispatch_routstr_watch(app, address),

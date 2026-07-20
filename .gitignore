@@ -9,3 +9,7 @@ result
 
 # Free-GHA just ci outer-loop marker (touched mid-recipe; never commit)
 .ci-started
+
+# Local scratch (invoice QR, bolt11 dumps — never commit)
+/tmp/
+/images/routstr-*.png

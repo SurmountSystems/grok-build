@@ -1852,6 +1852,53 @@ grok-oss logout --routstr
 (default **on**). Local wallet/seed work lives in crate `grok-bitcoin-wallet`
 (see `docs/bitcoin-routstr/` and repo `RESIDUAL.md`).
 
+**On-chain network** (`GROK_BITCOIN_NETWORK` / `--network` where supported):
+`mainnet` (default; empty → mainnet) \| `signet` \| `testnet` \| `testnet4`.
+Product **fund**/utxos/spend/rbf/cpfp **entry** resolves via
+`resolve_product_entry_network` (before unlock / seed touch) and complete
+paths re-check with `resolve_product_complete_network` — unknown labels
+(incl. `regtest`) **fail closed** (no silent mainnet; fund will not mint a
+regtest address while spend refuses regtest). Pager **`/routstr watch`**
+(and fund auto-watch / durable resume) uses the same product acceptance —
+unknown env or durable wire fails closed (no loop / no silent mainnet).
+Fees observational path may soft-default unknown env labels; product
+fund/spend/watch surfaces do not. `testnet4` shares descriptor/chain
+mapping with testnet (`bitcoin_network_to_network`).
+
+**On-chain spend UTXO backend** (default mempool.space via `explorer-http`):
+
+| Env | Values |
+|-----|--------|
+| `GROK_BITCOIN_CHAIN_SOURCE` | `mempool` (default) \| `esplora` \| `electrum` |
+| `GROK_BITCOIN_ESPLORA_URL` | required when `esplora` (REST base URL) |
+| `GROK_BITCOIN_ELECTRUM_ADDR` | required when `electrum` (`host:port` or `ssl://host:port`) |
+| `GROK_BITCOIN_ELECTRUM_TLS` | optional when `electrum` (`1`/`true`/`yes` → TLS for bare `host:port`; default plaintext; `ssl://` always TLS) |
+
+Optional Cargo features on this crate (and passthrough on `xai-grok-pager` /
+`xai-grok-pager-bin`): `esplora`, `electrum` (forward to wallet; **not** default CI).
+
+```bash
+# Product binary with alternate UTXO backend (example: Esplora):
+cargo build -p xai-grok-pager-bin --features esplora
+export GROK_BITCOIN_CHAIN_SOURCE=esplora
+export GROK_BITCOIN_ESPLORA_URL=https://blockstream.info/api
+```
+
+Selecting a backend whose feature was not compiled in yields a **runtime** structured
+error at open (`feature … not compiled into this build`), not a network hang and not a
+compile-time failure. `--broadcast` uses the **same** backend as the UTXO list
+(mempool `POST /api/tx`, Esplora `POST /tx`, Electrum `blockchain.transaction.broadcast`)
+when the matching optional feature is compiled in; default product path stays
+mempool-only.
+
+**UTXO list / on-chain balance** (observational gap-limit sync; same SeedVault +
+recovery-phrase re-entry as spend/fund):
+
+```bash
+grok routstr utxos [--network mainnet|signet|testnet|testnet4]
+# TUI: /routstr utxos [--network …]  then  /routstr unlock <phrase>
+```
+
 ```bash
 cargo test -p xai-grok-shell --lib routstr
 cargo test -p grok-bitcoin-wallet

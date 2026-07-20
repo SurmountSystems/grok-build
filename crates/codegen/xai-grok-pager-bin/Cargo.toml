@@ -95,6 +95,17 @@ default-bazel = [
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "dep:tikv-jemalloc-ctl"]
 sandbox-enforce = ["xai-grok-pager/sandbox-enforce"]
 release-dist = ["xai-grok-pager/release-dist"]
+# Optional alternate UTXO list backends for `grok routstr spend` / TUI (not default CI).
+# Forwards to shell → wallet live transports. Default product is mempool only.
+#   cargo build -p xai-grok-pager-bin --features esplora
+#   GROK_BITCOIN_CHAIN_SOURCE=esplora GROK_BITCOIN_ESPLORA_URL=https://blockstream.info/api
+#   cargo build -p xai-grok-pager-bin --features electrum
+#   GROK_BITCOIN_CHAIN_SOURCE=electrum GROK_BITCOIN_ELECTRUM_ADDR=127.0.0.1:50001
+#   # TLS: GROK_BITCOIN_ELECTRUM_TLS=1 or ssl://host:port (rustls + WebPKI; default plaintext)
+# Selecting env without the feature → runtime structured error (not a network hang).
+# UTXO list + broadcast share GROK_BITCOIN_CHAIN_SOURCE when the feature is built.
+esplora = ["xai-grok-shell/esplora", "xai-grok-pager/esplora"]
+electrum = ["xai-grok-shell/electrum", "xai-grok-pager/electrum"]
 
 [lints]
 workspace = true

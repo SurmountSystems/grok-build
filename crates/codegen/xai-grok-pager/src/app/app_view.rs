@@ -23,6 +23,163 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use xai_acp_lib::AcpAgentTx;
+/// Private BIP-39 passphrase re-entry while `/routstr unlock pass` is open.
+///
+/// Holds recovery phrase (+ optional AEAD password) only for the lifetime of
+/// the modal. The typed passphrase draft is process-memory only, masked on
+/// render, redacted on Debug, and cleared on cancel/submit/supersede.
+///
+/// **Never** written to CredentialsStore, `watch_session.json`, SeedVault AEAD,
+/// pending spend/rbf/cpfp/utxos, or chat/scrollback.
+pub struct RoutstrPassphraseModalState {
+    pub agent_id: crate::app::agent::AgentId,
+    phrase: crate::app::actions::SensitiveString,
+    aead_password: Option<crate::app::actions::SensitiveString>,
+    /// Typed passphrase draft (never Debug/Display the content).
+    draft: String,
+}
+
+impl std::fmt::Debug for RoutstrPassphraseModalState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoutstrPassphraseModalState")
+            .field("agent_id", &self.agent_id)
+            .field("phrase", &self.phrase)
+            .field("aead_password", &self.aead_password)
+            .field("draft", &"***")
+            .finish()
+    }
+}
+
+impl Drop for RoutstrPassphraseModalState {
+    fn drop(&mut self) {
+        self.clear_secrets();
+    }
+}
+
+impl RoutstrPassphraseModalState {
+    pub fn new(
+        agent_id: crate::app::agent::AgentId,
+        phrase: crate::app::actions::SensitiveString,
+        aead_password: Option<crate::app::actions::SensitiveString>,
+    ) -> Self {
+        Self {
+            agent_id,
+            phrase,
+            aead_password,
+            draft: String::new(),
+        }
+    }
+
+    /// Grapheme-ish char count for masked render (not the secret itself).
+    pub fn draft_char_len(&self) -> usize {
+        self.draft.chars().count()
+    }
+
+    pub fn push_char(&mut self, c: char) {
+        // Cap length so a stuck paste cannot grow unbounded in process memory.
+        if c.is_control() {
+            return;
+        }
+        if self.draft.chars().count() < 256 {
+            self.draft.push(c);
+        }
+    }
+
+    /// Append bracketed-paste text into the masked draft (printable chars only).
+    ///
+    /// Respects the 256-char cap. Control characters are skipped. Returns whether
+    /// the draft changed (so input can report `Changed` vs `Unchanged`).
+    pub fn push_paste(&mut self, text: &str) -> bool {
+        let before = self.draft.chars().count();
+        for c in text.chars() {
+            self.push_char(c);
+        }
+        self.draft.chars().count() > before
+    }
+
+    pub fn pop_char(&mut self) -> bool {
+        self.draft.pop().is_some()
+    }
+
+    /// Take agent binding + phrase / AEAD password / typed passphrase.
+    ///
+    /// Empties self secrets so Drop does not re-zeroize moved values.
+    pub fn into_submit(
+        mut self,
+    ) -> (
+        crate::app::agent::AgentId,
+        crate::app::actions::SensitiveString,
+        Option<crate::app::actions::SensitiveString>,
+        crate::app::actions::SensitiveString,
+    ) {
+        let agent_id = self.agent_id;
+        let phrase = std::mem::replace(
+            &mut self.phrase,
+            crate::app::actions::SensitiveString::new(String::new()),
+        );
+        let aead = self.aead_password.take();
+        let pass = crate::app::actions::SensitiveString::new(std::mem::take(&mut self.draft));
+        (agent_id, phrase, aead, pass)
+    }
+
+    /// Clear typed draft and drop secrets without completing unlock.
+    pub fn clear_secrets(&mut self) {
+        use zeroize::Zeroize;
+        self.draft.zeroize();
+        // Replace so prior SensitiveString values Drop/zeroize.
+        self.phrase = crate::app::actions::SensitiveString::new(String::new());
+        self.aead_password = None;
+    }
+
+    pub fn handle_key(
+        &mut self,
+        key: &crossterm::event::KeyEvent,
+    ) -> RoutstrPassphraseModalOutcome {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !crate::input::key::is_altgr(key.modifiers)
+        {
+            return match key.code {
+                KeyCode::Char('c' | 'd' | 'q') => RoutstrPassphraseModalOutcome::Cancelled,
+                _ => RoutstrPassphraseModalOutcome::Unchanged,
+            };
+        }
+        match key.code {
+            KeyCode::Enter => RoutstrPassphraseModalOutcome::Submitted,
+            KeyCode::Esc => RoutstrPassphraseModalOutcome::Cancelled,
+            KeyCode::Backspace => {
+                if self.pop_char() {
+                    RoutstrPassphraseModalOutcome::Changed
+                } else {
+                    RoutstrPassphraseModalOutcome::Unchanged
+                }
+            }
+            KeyCode::Char(c) => {
+                // Ignore control characters; accept printable (spaces allowed —
+                // BIP-39 passphrases may contain spaces).
+                if !c.is_control() {
+                    self.push_char(c);
+                    RoutstrPassphraseModalOutcome::Changed
+                } else {
+                    RoutstrPassphraseModalOutcome::Unchanged
+                }
+            }
+            _ => RoutstrPassphraseModalOutcome::Unchanged,
+        }
+    }
+}
+
+/// Outcome of a key in the private passphrase modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutstrPassphraseModalOutcome {
+    /// Enter — complete unlock with typed passphrase (may be empty).
+    Submitted,
+    /// Esc / Ctrl-C — drop secrets; leave staged money path intact.
+    Cancelled,
+    Changed,
+    Unchanged,
+}
+
 /// Pending `/routstr spend` parameters awaiting `/routstr unlock` re-entry.
 ///
 /// Holds only payment parameters — never BIP-39 or passwords.
@@ -41,8 +198,8 @@ pub struct PendingRoutstrSpend {
 /// Pending `/routstr rbf` parameters awaiting `/routstr unlock` re-entry.
 ///
 /// Same-input BIP-125 replacement only: original fee/vbytes + prevout specs.
-/// Never BIP-39. Mutually exclusive with [`PendingRoutstrSpend`] (staging one
-/// cancels the other).
+/// Never BIP-39. Mutually exclusive with [`PendingRoutstrSpend`] /
+/// [`PendingRoutstrCpfp`] (staging one cancels the others).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRoutstrRbf {
     pub agent_id: crate::app::agent::AgentId,
@@ -55,6 +212,38 @@ pub struct PendingRoutstrRbf {
     pub broadcast: bool,
     /// Explicit user rate, or `None` to resolve at authorize (halfHour/default).
     pub fee_rate_sat_vb: Option<u64>,
+}
+
+/// Pending `/routstr cpfp` parameters awaiting `/routstr unlock` re-entry.
+///
+/// CPFP **child** only: parent fee/vbytes + parent (and optional extra) outpoints.
+/// Never BIP-39. Never claims parent replaced. Mutually exclusive with spend/rbf
+/// / utxos (staging one cancels the others).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRoutstrCpfp {
+    pub agent_id: crate::app::agent::AgentId,
+    pub address: String,
+    pub amount_sats: u64,
+    pub parent_fee_sats: u64,
+    pub parent_vbytes: u64,
+    /// Wire form `txid:vout:amount:address` (parsed again at authorize).
+    pub parent_specs: Vec<String>,
+    pub extra_input_specs: Vec<String>,
+    pub broadcast: bool,
+    /// Explicit user rate, or `None` to resolve at authorize (halfHour/default).
+    pub fee_rate_sat_vb: Option<u64>,
+}
+
+/// Pending `/routstr utxos` parameters awaiting `/routstr unlock` re-entry.
+///
+/// Observational only (gap-limit UTXO list / balance). Never BIP-39. Mutually
+/// exclusive with [`PendingRoutstrSpend`] / [`PendingRoutstrRbf`] /
+/// [`PendingRoutstrCpfp`] (staging one cancels the others).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRoutstrUtxos {
+    pub agent_id: crate::app::agent::AgentId,
+    /// Explicit network from slash `--network`, or `None` → env / mainnet.
+    pub network: Option<String>,
 }
 
 /// State for the "New Worktree" popup dialog on the welcome screen.
@@ -730,20 +919,42 @@ pub struct AppView {
     /// Pending on-chain spend waiting for `/routstr unlock` re-entry.
     ///
     /// Set by `/routstr spend`; cleared on cancel (`/routstr fund`), supersede
-    /// (re-stage spend or stage rbf), or unlock re-entry consumption into the
-    /// spend effect.
+    /// (re-stage spend or stage rbf/cpfp/utxos), or unlock re-entry consumption
+    /// into the spend effect.
     /// **Not** cleared when an in-flight spend task completes — that would
     /// silently drop a newer stage started while the prior task was running.
     /// Never stores BIP-39 — only payment parameters (+ staging agent_id).
-    /// Mutually exclusive with [`Self::pending_routstr_rbf`].
+    /// Mutually exclusive with [`Self::pending_routstr_rbf`] /
+    /// [`Self::pending_routstr_cpfp`] / [`Self::pending_routstr_utxos`].
     pub pending_routstr_spend: Option<PendingRoutstrSpend>,
     /// Pending same-input RBF waiting for `/routstr unlock` re-entry.
     ///
     /// Set by `/routstr rbf`; cleared on cancel (`/routstr fund`), supersede
-    /// (re-stage rbf or stage spend), or unlock consumption into the rbf effect.
+    /// (re-stage rbf or stage spend/cpfp/utxos), or unlock consumption into the
+    /// rbf effect.
     /// **Not** cleared when an in-flight rbf task completes (same as spend).
-    /// Never stores BIP-39. Mutually exclusive with [`Self::pending_routstr_spend`].
+    /// Never stores BIP-39. Mutually exclusive with spend/cpfp/utxos pendings.
     pub pending_routstr_rbf: Option<PendingRoutstrRbf>,
+    /// Pending CPFP child waiting for `/routstr unlock` re-entry.
+    ///
+    /// Set by `/routstr cpfp`; cleared on cancel (`/routstr fund`), supersede
+    /// (re-stage cpfp or stage spend/rbf/utxos), or unlock consumption into the
+    /// cpfp effect. **Not** cleared when an in-flight cpfp task completes.
+    /// Never stores BIP-39. Mutually exclusive with spend/rbf/utxos pendings.
+    pub pending_routstr_cpfp: Option<PendingRoutstrCpfp>,
+    /// Pending UTXO list waiting for `/routstr unlock` re-entry.
+    ///
+    /// Set by `/routstr utxos`; cleared on cancel (`/routstr fund`), supersede
+    /// (re-stage utxos or stage spend/rbf/cpfp), or unlock consumption into the
+    /// utxos effect. **Not** cleared when an in-flight utxos task completes.
+    /// Never stores BIP-39. Mutually exclusive with spend/rbf/cpfp pendings.
+    pub pending_routstr_utxos: Option<PendingRoutstrUtxos>,
+    /// Open private BIP-39 passphrase modal (`/routstr unlock pass …`).
+    ///
+    /// Holds phrase (+ optional AEAD password) only while open. Debug redacts
+    /// secrets. Cancel / fund / re-stage money paths clear this without writing
+    /// passphrase anywhere durable. Never CredentialsStore / watch_session.
+    pub routstr_passphrase_modal: Option<RoutstrPassphraseModalState>,
     /// Periodic billing poll requested (credits >= 99%).
     pub billing_poll_wanted: bool,
     /// Leader-mode session roster (FleetView dashboard). Populated from
@@ -1444,6 +1655,9 @@ impl AppView {
             routstr_watch_error_streak: 0,
             pending_routstr_spend: None,
             pending_routstr_rbf: None,
+            pending_routstr_cpfp: None,
+            pending_routstr_utxos: None,
+            routstr_passphrase_modal: None,
             billing_poll_wanted: false,
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),
@@ -2201,6 +2415,61 @@ impl AppView {
                 return InputOutcome::Action(action);
             }
             self.pending_action = None;
+        }
+        // Private BIP-39 passphrase modal blocks all other input while open.
+        // Secrets never enter the composer / chat history.
+        if self.routstr_passphrase_modal.is_some() {
+            if let Event::Key(key) = ev {
+                if key.kind == KeyEventKind::Release {
+                    return InputOutcome::Unchanged;
+                }
+                // Mutably borrow only for key handling, then take on terminal outcomes.
+                let outcome = self
+                    .routstr_passphrase_modal
+                    .as_mut()
+                    .expect("checked is_some")
+                    .handle_key(key);
+                match outcome {
+                    RoutstrPassphraseModalOutcome::Submitted => {
+                        let modal = self
+                            .routstr_passphrase_modal
+                            .take()
+                            .expect("modal present on submit");
+                        let (agent_id, phrase, password, passphrase) = modal.into_submit();
+                        return InputOutcome::Action(Action::RoutstrBip39PassphraseSubmit {
+                            agent_id,
+                            phrase,
+                            password,
+                            passphrase,
+                        });
+                    }
+                    RoutstrPassphraseModalOutcome::Cancelled => {
+                        // Leave modal for dispatch to clear + emit cancel notice
+                        // (secrets dropped in clear_routstr_passphrase_modal).
+                        return InputOutcome::Action(Action::RoutstrBip39PassphraseCancel);
+                    }
+                    RoutstrPassphraseModalOutcome::Changed => return InputOutcome::Changed,
+                    RoutstrPassphraseModalOutcome::Unchanged => return InputOutcome::Unchanged,
+                }
+            }
+            if matches!(ev, Event::Resize(_, _)) {
+                return InputOutcome::Changed;
+            }
+            // Bracketed paste lands in the masked draft only (never composer/chat).
+            if let Event::Paste(text) = ev {
+                let changed = self
+                    .routstr_passphrase_modal
+                    .as_mut()
+                    .expect("checked is_some")
+                    .push_paste(text);
+                return if changed {
+                    InputOutcome::Changed
+                } else {
+                    InputOutcome::Unchanged
+                };
+            }
+            // Swallow mouse / other events while modal is open.
+            return InputOutcome::Unchanged;
         }
         let modal_open = self.is_scroll_blocking_modal_open();
         if let Event::Mouse(mouse) = ev
@@ -4255,6 +4524,13 @@ impl AppView {
                                     compact,
                                 );
                             }
+                            if let Some(dialog) = self.routstr_passphrase_modal.as_ref() {
+                                crate::views::routstr_passphrase_modal::render_routstr_passphrase_modal(
+                                    view_area,
+                                    f.buffer_mut(),
+                                    dialog,
+                                );
+                            }
                             if let Some(fps) = &fps_overlay {
                                 fps.render(full_area, f.buffer_mut());
                             }
@@ -4263,10 +4539,17 @@ impl AppView {
                             }
                             let (cursor_pos, post_flush) = result;
                             let has_cloud = false;
-                            if has_cloud || self.import_claude_modal.is_some() {
+                            if has_cloud
+                                || self.import_claude_modal.is_some()
+                                || self.routstr_passphrase_modal.is_some()
+                            {
                                 link_spans.clear();
                             }
-                            let cursor = if has_cloud { None } else { cursor_pos };
+                            let cursor = if has_cloud || self.routstr_passphrase_modal.is_some() {
+                                None
+                            } else {
+                                cursor_pos
+                            };
                             return (cursor, Self::merge_escapes(notif_escapes, post_flush));
                         }
                     }
@@ -4499,6 +4782,7 @@ impl AppView {
             .is_some_and(| a | a.extensions_modal.is_some() || a.active_modal.is_some())
         ) || self.import_claude_modal.is_some()
             || self.new_worktree_dialog.is_some()
+            || self.routstr_passphrase_modal.is_some()
             || self.welcome_doc_viewer.is_some()
             || matches!(
                 self.active_view, ActiveView::AgentDashboard if self.dashboard.as_ref()
@@ -5418,6 +5702,9 @@ pub(crate) mod tests {
             routstr_watch_error_streak: 0,
             pending_routstr_spend: None,
             pending_routstr_rbf: None,
+            pending_routstr_cpfp: None,
+            pending_routstr_utxos: None,
+            routstr_passphrase_modal: None,
             billing_poll_wanted: false,
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),

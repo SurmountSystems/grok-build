@@ -73,10 +73,23 @@ automated. First docs mention: “Cashu (Chaumian eCash).”
 grok login --routstr          # paste sk- or cashuA
 grok logout --routstr
 grok routstr balance          # requires key; fetches /v1/balance/info
-grok routstr topup --sats N   # guidance until CDK/LN pay path
+grok routstr topup --sats N   # live POST /lightning/invoice (default N=1000; min 1 max 1e6)
+grok routstr topup --status ID  # after pay: store sk- when status returns api_key
+grok routstr topup --no-poll  # print BOLT11+QR only (no wait)
 grok routstr refund           # guidance until CDK refund path
-grok routstr fund             # backup gate + unlock → BIP84 receive address
+grok routstr fund             # backup gate + unlock → BIP84 receive address (BIP21 QR)
 ```
+
+### Mainnet top-up amounts (live OpenAPI 2026-07-19)
+
+| Bound | Sats | Notes |
+|-------|------|--------|
+| API minimum | **1** | `amount_sats` exclusiveMinimum 0; live API rejects 0 |
+| API maximum | **1_000_000** | OpenAPI maximum |
+| Product default / smoke | **1000** | docs.routstr.com example; good LN routing |
+| Grok 4.5 pricing (approx) | ~0.002 sats/prompt token, 0.001/request | 1000 sats is enough for smoke completions |
+
+**Lightning vs BIP21:** Routstr node float is funded with a **BOLT11** Lightning invoice (QR encodes `lnbc…`). BIP21 (`bitcoin:<addr>?amount=…`) is for **on-chain** `grok routstr fund` only — not for Routstr prepaid.
 
 ## References
 

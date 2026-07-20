@@ -8,6 +8,15 @@ edition.workspace = true
 default = []
 unstable = []
 default-bazel = []
+# Optional live UTXO backends for `grok routstr spend` (forwarded to wallet).
+# Default CI stays offline-safe (mempool via explorer-http only).
+# Env: GROK_BITCOIN_CHAIN_SOURCE=esplora|electrum + GROK_BITCOIN_ESPLORA_URL /
+# GROK_BITCOIN_ELECTRUM_ADDR (`host:port` or `ssl://host:port` for TLS).
+# Optional GROK_BITCOIN_ELECTRUM_TLS=1|true|yes enables TLS for bare host:port
+# (default plaintext TCP for local/regtest; ssl:// always TLS; rustls + WebPKI).
+# Selecting without the feature → structured error (not a network hang).
+esplora = ["grok-bitcoin-wallet/esplora"]
+electrum = ["grok-bitcoin-wallet/electrum"]
 
 [dependencies]
 dunce = { workspace = true }
@@ -151,7 +160,9 @@ xai-grok-auth = { workspace = true, features = ["middleware"] }
 xai-grok-telemetry = { workspace = true }
 xai-grok-http = { workspace = true }
 # Bitcoin SeedVault + funding CLI for Routstr (never CredentialsStore for BIP-39).
-# explorer-http: live UTXO fetch + mempool.space broadcast for `grok routstr spend`.
+# explorer-http: default live UTXO (mempool) + mempool.space broadcast for spend.
+# Optional package features `esplora` / `electrum` forward for alternate ChainSource
+# (electrum: TCP + TLS; TLS via GROK_BITCOIN_ELECTRUM_TLS or ssl://host:port).
 grok-bitcoin-wallet = { workspace = true, features = ["explorer-http"] }
 xai-grok-models = { workspace = true }
 prod-mc-cli-chat-proxy-types = { path = "../../../prod/mc/cli-chat-proxy-types" }

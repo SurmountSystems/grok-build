@@ -1944,9 +1944,18 @@ async fn async_main() -> Result<()> {
                             .await
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
-                    RoutstrCommand::Topup { sats } => {
-                        xai_grok_shell::auth::run_routstr_topup(sats)
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    RoutstrCommand::Topup {
+                        sats,
+                        status,
+                        no_poll,
+                    } => {
+                        if let Some(id) = status {
+                            xai_grok_shell::auth::run_routstr_topup_status(&id)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        } else {
+                            xai_grok_shell::auth::run_routstr_topup_with_options(sats, !no_poll)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        }
                     }
                     RoutstrCommand::Refund => {
                         xai_grok_shell::auth::run_routstr_refund()
@@ -1990,6 +1999,39 @@ async fn async_main() -> Result<()> {
                             fee_rate,
                         )
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                    RoutstrCommand::Cpfp {
+                        address,
+                        sats,
+                        parent_fee,
+                        parent_vbytes,
+                        parents,
+                        extra_inputs,
+                        broadcast,
+                        fee_rate,
+                    } => {
+                        let grok_home = xai_grok_shell::util::grok_home::grok_home();
+                        xai_grok_shell::auth::run_routstr_cpfp(
+                            &grok_home,
+                            &address,
+                            sats,
+                            parent_fee,
+                            parent_vbytes,
+                            &parents,
+                            &extra_inputs,
+                            broadcast,
+                            fee_rate,
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                    RoutstrCommand::Fees { network } => {
+                        xai_grok_shell::auth::run_routstr_fees(network.as_deref())
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                    RoutstrCommand::Utxos { network } => {
+                        let grok_home = xai_grok_shell::util::grok_home::grok_home();
+                        xai_grok_shell::auth::run_routstr_utxos(&grok_home, network.as_deref())
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
                 }
                 xai_grok_shell::instrumentation::finalize_and_exit(0);

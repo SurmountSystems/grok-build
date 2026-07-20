@@ -4921,11 +4921,13 @@ dependencies = [
  "nostr",
  "qrcode",
  "reqwest 0.12.24",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "webpki-roots 0.26.11",
  "zeroize",
 ]
 
@@ -13836,6 +13838,7 @@ dependencies = [
  "xai-ratatui-textarea",
  "xai-token-estimation",
  "xai-tty-utils",
+ "zeroize",
 ]
 
 [[package]]

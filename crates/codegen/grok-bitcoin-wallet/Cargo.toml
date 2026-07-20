@@ -23,6 +23,16 @@ qr = ["dep:qrcode"]
 # Real HTTP client for mempool.space (reqwest blocking). Off by default so CI
 # stays offline-safe; enable for local integration / ignored network tests.
 explorer-http = ["dep:reqwest"]
+# Esplora REST ChainSource + TxBroadcaster live HTTP (`HttpEsploraTransport` /
+# POST /tx via reqwest). Offline: pure parsers + `MockEsploraTransport` always
+# available with `onchain-address`. Do **not** enable in default CI (no forced network).
+esplora = ["dep:reqwest"]
+# Electrum JSON-RPC ChainSource + TxBroadcaster live TCP + TLS
+# (`TcpElectrumTransport` / `TlsElectrumTransport` + blockchain.transaction.broadcast).
+# Offline: pure scripthash/listunspent/broadcast parse + `MockElectrumTransport`
+# always available with `onchain-address`. TLS uses pure-Rust rustls + WebPKI
+# roots (no dangerous skip-verify). Do **not** enable in default CI (no forced network).
+electrum = ["dep:rustls", "dep:webpki-roots"]
 # Reserved feature names for future CDK / LDK deps (RESIDUAL.md P3/P4).
 # Empty today: enabling the flag does **not** wire a backend or flip live
 # capability flags. `default_*_backend()` still returns stubs. Do not enable
@@ -47,6 +57,15 @@ nostr = { workspace = true, optional = true }
 bitcoin = { workspace = true, optional = true }
 qrcode = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true, features = ["blocking", "rustls-tls"], default-features = false }
+# Electrum TLS (feature `electrum`): pure-Rust rustls + Mozilla WebPKI roots.
+# Aligns with reqwest's rustls-tls choice; not enabled by default.
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "ring",
+    "logging",
+    "std",
+    "tls12",
+] }
+webpki-roots = { version = "0.26", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

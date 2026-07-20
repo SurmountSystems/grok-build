@@ -305,18 +305,33 @@ pub fn fund_path_decision_from_load<T>(
 ///
 /// `saved` is true only after a durable store in this run (new wallet). Returning-user
 /// unlock already has a vault entry, so use `saved: false` ("Backup confirmed. Receive…").
+///
+/// When `bip39_passphrase_active` is true (non-empty resolved BIP-39 passphrase
+/// used for derivation — env and/or private TUI modal), appends a non-secret
+/// notice. Never includes the passphrase value or falsely attributes source.
 pub fn format_fund_success_lines(
     address: &str,
     step_label: &str,
     network_label: &str,
     saved: bool,
 ) -> Vec<String> {
+    format_fund_success_lines_with_passphrase_flag(address, step_label, network_label, saved, false)
+}
+
+/// Same as [`format_fund_success_lines`] with optional BIP-39 passphrase-active notice.
+pub fn format_fund_success_lines_with_passphrase_flag(
+    address: &str,
+    step_label: &str,
+    network_label: &str,
+    saved: bool,
+    bip39_passphrase_active: bool,
+) -> Vec<String> {
     let head = if saved {
         format!("Backup confirmed. Wallet saved. Receive address ({network_label}):")
     } else {
         format!("Backup confirmed. Receive address ({network_label}):")
     };
-    vec![
+    let mut lines = vec![
         head,
         address.to_owned(),
         format!("Funding status: {step_label}"),
@@ -324,7 +339,54 @@ pub fn format_fund_success_lines(
          watching uses the rate-limited mempool.space client."
             .to_owned(),
         "BOLT12 offers are not supported in this build.".to_owned(),
-    ]
+    ];
+    if bip39_passphrase_active {
+        lines.extend(bip39_passphrase_active_notice_lines());
+    }
+    lines
+}
+
+/// Where a non-empty BIP-39 passphrase was resolved from (product notice only).
+///
+/// Never includes the secret. Used so success copy does not claim env when the
+/// TUI private modal supplied the value (or vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bip39PassphraseNoticeSource {
+    /// Resolved from [`crate::mnemonic::BIP39_PASSPHRASE_ENV`].
+    ProcessEnv,
+    /// Resolved from private TUI modal re-entry for this unlock only.
+    PrivateModal,
+    /// Non-empty resolved passphrase without attributing a single source
+    /// (preferred when callers cannot distinguish env vs modal).
+    Active,
+}
+
+/// Non-secret product notice when a BIP-39 passphrase was used for derive/sign.
+///
+/// Never includes the passphrase value. Defaults to [`Bip39PassphraseNoticeSource::Active`]
+/// (neutral wording — does not claim env when the modal may have supplied the value).
+/// Used on fund address reveal and spend/RBF/CPFP prepare summaries.
+pub fn bip39_passphrase_active_notice_lines() -> Vec<String> {
+    bip39_passphrase_active_notice_lines_for(Bip39PassphraseNoticeSource::Active)
+}
+
+/// Same as [`bip39_passphrase_active_notice_lines`] with an explicit source label.
+pub fn bip39_passphrase_active_notice_lines_for(
+    source: Bip39PassphraseNoticeSource,
+) -> Vec<String> {
+    let source_clause = match source {
+        Bip39PassphraseNoticeSource::ProcessEnv => {
+            format!("from {} ", crate::mnemonic::BIP39_PASSPHRASE_ENV)
+        }
+        Bip39PassphraseNoticeSource::PrivateModal => "from private modal re-entry ".to_owned(),
+        Bip39PassphraseNoticeSource::Active => String::new(),
+    };
+    vec![format!(
+        "BIP-39 passphrase {source_clause}is active (value not shown; never stored; \
+         re-supply at unlock via {} or `/routstr unlock pass`). \
+         Lose the passphrase ⇒ lose access even with the recovery phrase.",
+        crate::mnemonic::BIP39_PASSPHRASE_ENV
+    )]
 }
 
 /// Next-steps copy for top up while CDK/LN pay is residual (honest stubs).
@@ -520,44 +582,40 @@ pub fn refund_next_steps_for_backend(cashu: &dyn crate::cashu::CashuBackend) -> 
 ///
 /// Does **not** claim the clipboard was updated — callers (CLI vs TUI) own
 /// copy UX; the shared text only hints the user can copy the address/BIP21.
+///
+/// When `amount_sats` is `Some`, the QR encodes a BIP21 URI with `amount=`
+/// (on-chain only — not a Lightning invoice).
 pub fn receive_address_display_lines(address: &str, include_qr: bool) -> Vec<String> {
-    let display =
-        crate::address_ux::onchain_payment_display(address, None, Some("Grok OSS Routstr"));
-    let mut lines = vec![
-        "Receive address (Bitcoin):".to_owned(),
-        display.text.clone(),
-        format!("BIP21: {}", display.qr_payload),
-        "QR encodes the BIP21 URI. Copy the address or BIP21 URI from the lines above \
-         (the TUI also attempts a clipboard copy with a toast)."
+    receive_address_display_lines_with_amount(address, None, include_qr)
+}
+
+/// Like [`receive_address_display_lines`] with optional BIP21 amount (sats).
+pub fn receive_address_display_lines_with_amount(
+    address: &str,
+    amount_sats: Option<u64>,
+    include_qr: bool,
+) -> Vec<String> {
+    let mut lines =
+        crate::routstr_invoice::bip21_receive_display_lines(address, amount_sats, include_qr);
+    lines.push(
+        "Copy the address or BIP21 URI from the lines above (the TUI also attempts a \
+         clipboard copy with a toast)."
             .to_owned(),
-    ];
-    if include_qr {
-        #[cfg(feature = "qr")]
-        {
-            match crate::address_ux::qr_matrix_lines(&display.qr_payload) {
-                Ok(matrix) => {
-                    lines.push(String::new());
-                    lines.push("QR (scan with a Bitcoin wallet):".to_owned());
-                    lines.extend(matrix);
-                }
-                Err(e) => {
-                    lines.push(format!("QR unavailable: {e}"));
-                }
-            }
-        }
-        #[cfg(not(feature = "qr"))]
-        {
-            lines.push(
-                "QR feature not enabled in this build; copy the address or BIP21 URI.".to_owned(),
-            );
-        }
-    }
+    );
     lines
 }
 
-/// Clipboard payload for an on-chain receive address (address only, no amount).
+/// Clipboard payload for an on-chain receive address.
+///
+/// When `amount_sats` is set, clipboard prefers the BIP21 URI (amount locked).
 pub fn receive_address_clipboard(address: &str) -> String {
-    crate::address_ux::onchain_payment_display(address, None, None).clipboard
+    receive_address_clipboard_with_amount(address, None)
+}
+
+/// Clipboard payload with optional BIP21 amount.
+pub fn receive_address_clipboard_with_amount(address: &str, amount_sats: Option<u64>) -> String {
+    crate::address_ux::onchain_payment_display(address, amount_sats, Some("Grok OSS Routstr"))
+        .clipboard
 }
 
 // ── On-chain PSBT spend (CLI / TUI pure helpers) ─────────────────────────────
@@ -771,7 +829,10 @@ pub fn format_spend_fee_meta_lines(
         ),
         "Inputs signal RBF (BIP-125). To bump a stuck spend, use `grok routstr rbf` or \
          `/routstr rbf` with original-fee / original-vbytes from this meta and each input \
-         line below (same prevouts). Dry-run fee+vB alone is not enough for a true replace-by-fee."
+         line below (same prevouts). Dry-run fee+vB alone is not enough for a true replace-by-fee. \
+         To fee-bump via a child (without replacing the parent), use `grok routstr cpfp` or \
+         `/routstr cpfp` with parent-fee / parent-vbytes and a wallet-owned parent output as \
+         --parent / parent=."
             .to_owned(),
     ]
 }
@@ -807,6 +868,104 @@ pub fn format_rbf_input_cli_flag(utxo: &crate::descriptor_wallet::WalletUtxo) ->
         "  --input {}:{}:{}:{}",
         utxo.outpoint.txid, utxo.outpoint.vout, utxo.amount_sats, utxo.address
     )
+}
+
+/// Short clap `about` for `grok routstr utxos` (gap-sync UTXO list / balance).
+pub const UTXOS_CLI_ABOUT: &str =
+    "List local wallet UTXOs and on-chain balance (gap-limit ChainSource sync)";
+
+/// Longer honesty blurb for `grok routstr utxos`.
+pub const UTXOS_CLI_LONG_ABOUT: &str = "\
+List confirmed/unconfirmed on-chain balance and each UTXO for the local SeedVault wallet \
+after gap-limit ChainSource sync (BIP44-style look-ahead; not full bdk_wallet auto-sync). \
+Requires SeedVault unlock + recovery-phrase re-entry (same gate as spend/fund). \
+Chain backend via GROK_BITCOIN_CHAIN_SOURCE (default mempool). \
+Never invents UTXOs; empty wallet prints zero balance. \
+Per-UTXO lines are RBF-friendly `--input` flags for copy into `grok routstr rbf`.";
+
+/// Usage blurb for `grok routstr utxos`.
+pub fn utxos_usage_lines() -> Vec<String> {
+    vec![
+        "Usage:".to_owned(),
+        "  grok routstr utxos [--network mainnet|signet|testnet|testnet4]".to_owned(),
+        UTXOS_CLI_ABOUT.to_owned(),
+        "Gap-limit ChainSource sync only — not full bdk_wallet auto-sync. Requires \
+         SeedVault unlock + recovery-phrase re-entry."
+            .to_owned(),
+        "Omit --network to use GROK_BITCOIN_NETWORK (default mainnet). Chain source via \
+         GROK_BITCOIN_CHAIN_SOURCE (default mempool)."
+            .to_owned(),
+    ]
+}
+
+/// Pure balance lines from a [`crate::descriptor_wallet::WalletBalance`].
+///
+/// Never invents amounts — only formats the provided snapshot fields.
+#[cfg(feature = "onchain-address")]
+pub fn format_utxos_balance_lines(
+    balance: &crate::descriptor_wallet::WalletBalance,
+    network_label: &str,
+) -> Vec<String> {
+    let net = network_label.trim();
+    let net = if net.is_empty() { "mainnet" } else { net };
+    vec![
+        format!("On-chain balance ({net}):"),
+        format!("  confirmed:   {} sats", balance.confirmed_sats),
+        format!("  unconfirmed: {} sats", balance.unconfirmed_sats),
+        format!("  total:       {} sats", balance.total_sats()),
+    ]
+}
+
+/// Pure per-UTXO lines (RBF-friendly `--input` flags when non-empty).
+///
+/// Empty slice → one honest empty-state line (does not invent coins).
+#[cfg(feature = "onchain-address")]
+pub fn format_utxos_list_lines(utxos: &[crate::descriptor_wallet::WalletUtxo]) -> Vec<String> {
+    if utxos.is_empty() {
+        return vec![
+            "UTXOs: (none in watched gap window — fund a receive address, or extend may \
+             have hit max gap)."
+                .to_owned(),
+        ];
+    }
+    let mut lines = vec![format!(
+        "UTXOs ({}): RBF-friendly --input lines for `grok routstr rbf`:",
+        utxos.len()
+    )];
+    for u in utxos {
+        let conf = if u.confirmations == 0 {
+            "unconfirmed".to_owned()
+        } else {
+            format!("{} conf", u.confirmations)
+        };
+        let chain = if u.is_change { "change" } else { "receive" };
+        lines.push(format!(
+            "{}  # {} sats, {conf}, {chain}",
+            format_rbf_input_cli_flag(u),
+            u.amount_sats
+        ));
+    }
+    lines
+}
+
+/// Pure product CLI lines for a gap-sync UTXO snapshot (offline-testable).
+///
+/// Balance + per-UTXO + shared gap notices ([`crate::descriptor_wallet::gap_sync_spend_notice_lines`]).
+/// Never invents balance/UTXO counts — only formats `snap`.
+#[cfg(feature = "onchain-address")]
+pub fn format_gap_sync_utxos_cli_lines(
+    snap: &crate::descriptor_wallet::WalletSyncSnapshot,
+    network_label: &str,
+) -> Vec<String> {
+    let mut lines = format_utxos_balance_lines(&snap.balance, network_label);
+    lines.extend(format_utxos_list_lines(&snap.utxos));
+    lines.extend(crate::descriptor_wallet::gap_sync_spend_notice_lines(snap));
+    lines.push(
+        "Gap-limit ChainSource sync only — not full bdk_wallet auto-sync. \
+         Snapshot authoritative as of final sync list (no extra list)."
+            .to_owned(),
+    );
+    lines
 }
 
 /// Format one input as the value part of `--input` (no flag prefix).
@@ -867,9 +1026,22 @@ pub fn format_rbf_fee_plan_lines_inner(
 }
 
 /// Human lines for an [`crate::descriptor_wallet::CpfpFeePlan`].
+///
+/// When `include_rebuild_hint` is false (already inside a CPFP prepare/broadcast
+/// flow), omits the trailing “Build with grok routstr cpfp / Does not broadcast”
+/// sentence that would contradict an in-progress `--broadcast` request.
 #[cfg(feature = "onchain-address")]
 pub fn format_cpfp_fee_plan_lines(plan: &crate::descriptor_wallet::CpfpFeePlan) -> Vec<String> {
-    vec![
+    format_cpfp_fee_plan_lines_inner(plan, true)
+}
+
+/// Same as [`format_cpfp_fee_plan_lines`] with optional rebuild/broadcast disclaimer.
+#[cfg(feature = "onchain-address")]
+pub fn format_cpfp_fee_plan_lines_inner(
+    plan: &crate::descriptor_wallet::CpfpFeePlan,
+    include_rebuild_hint: bool,
+) -> Vec<String> {
+    let mut lines = vec![
         format!(
             "CPFP child fee plan (package {} vB = parent {} + child {}):",
             plan.package_vbytes, plan.parent_vbytes, plan.child_vbytes
@@ -886,9 +1058,16 @@ pub fn format_cpfp_fee_plan_lines(plan: &crate::descriptor_wallet::CpfpFeePlan) 
             "  Package after child: {} sats (~{} sat/vB)",
             plan.package_fee_sats, plan.package_fee_rate_sat_vb
         ),
-        "  Child must spend a confirmed-or-unconfirmed parent output you control. Guidance only."
-            .to_owned(),
-    ]
+    ];
+    if include_rebuild_hint {
+        lines.push(
+            "  Child must spend a parent output you control (`--parent` / parent=). Build with \
+             `grok routstr cpfp` or `/routstr cpfp`. Does not replace the parent; does not \
+             broadcast."
+                .to_owned(),
+        );
+    }
+    lines
 }
 
 /// Human lines for mempool-shaped [`crate::explorer::FeeEstimates`].
@@ -903,6 +1082,120 @@ pub fn format_fee_estimates_lines(est: &crate::explorer::FeeEstimates) -> Vec<St
         "Use fee=<n> / --fee-rate <n> to override; product default priority is halfHour when live estimates are available."
             .to_owned(),
     ]
+}
+
+/// Short clap `about` line for `grok routstr fees` (keep in sync with
+/// [`fees_usage_lines`] / pager `RoutstrCommand::Fees` — tested for honesty).
+pub const FEES_CLI_ABOUT: &str =
+    "Print mempool.space recommended fee estimate ladder (sat/vB only)";
+
+/// Longer honesty blurb shared by pure usage lines and clap long_about intent.
+///
+/// Ladder only — not RBF/CPFP rebuild. Never invents rates when unavailable.
+pub const FEES_CLI_LONG_ABOUT: &str = "\
+Print the mempool.space recommended fee estimate ladder (sat/vB).
+Ladder only — does not rebuild transactions. RBF: `grok routstr rbf` / `/routstr rbf`. \
+CPFP: `grok routstr cpfp` / `/routstr cpfp`.
+Omit --network to use GROK_BITCOIN_NETWORK (default mainnet). Never invents rates when \
+the explorer is unavailable (network error, rate-limit, or parse failure).";
+
+/// Usage blurb for `grok routstr fees` (ladder only — not RBF/CPFP rebuild).
+pub fn fees_usage_lines() -> Vec<String> {
+    vec![
+        "Usage:".to_owned(),
+        "  grok routstr fees [--network mainnet|signet|testnet|testnet4]".to_owned(),
+        FEES_CLI_ABOUT.to_owned(),
+        "Ladder only — does not rebuild transactions. RBF: `grok routstr rbf` / \
+         `/routstr rbf`. CPFP: `grok routstr cpfp` / `/routstr cpfp`."
+            .to_owned(),
+        "Omit --network to use GROK_BITCOIN_NETWORK (default mainnet). Never invents \
+         rates when the explorer is unavailable (network error, rate-limit, or parse \
+         failure)."
+            .to_owned(),
+    ]
+}
+
+/// Product lines when live fee estimates could not be fetched.
+///
+/// Covers **any** failure mapped to `None` (HTTP/network error, rate-limit gate,
+/// client build failure, JSON parse reject) — not only offline. Does **not**
+/// invent a ladder. Mentions product default used by spend/rbf/cpfp when
+/// estimates are missing.
+pub fn fees_unavailable_lines(network_label: &str) -> Vec<String> {
+    let net = network_label.trim();
+    let net = if net.is_empty() { "mainnet" } else { net };
+    vec![
+        format!(
+            "Fee estimates unavailable for {net} (explorer fetch failed: network, \
+             rate-limit, or invalid response)."
+        ),
+        "Not inventing rates. Retry later, or pass --fee-rate / fee=<n> on spend, rbf, \
+         or cpfp."
+            .to_owned(),
+        format!(
+            "When estimates are missing, product paths fall back to {DEFAULT_SPEND_FEE_RATE_SAT_VB} sat/vB \
+             (never 0)."
+        ),
+        "RBF rebuild: `grok routstr rbf` / `/routstr rbf`. CPFP child: `grok routstr cpfp` / \
+         `/routstr cpfp`."
+            .to_owned(),
+    ]
+}
+
+/// halfHour rung annotation for product spend/rbf/cpfp default selection.
+///
+/// Product [`crate::explorer::resolve_spend_fee_rate_sat_vb`] only uses a live
+/// halfHour rate when it is **> 0**; a zero rung is ignored and falls through
+/// to [`DEFAULT_SPEND_FEE_RATE_SAT_VB`].
+fn half_hour_ladder_label(half_hour_sat_vb: u64) -> String {
+    if half_hour_sat_vb > 0 {
+        format!("  halfHour: {half_hour_sat_vb} (product default when live)")
+    } else {
+        format!(
+            "  halfHour: {half_hour_sat_vb} (ignored when 0; product falls back to \
+             {DEFAULT_SPEND_FEE_RATE_SAT_VB} sat/vB)"
+        )
+    }
+}
+
+/// Product CLI lines for a successful fee-ladder fetch (pure; no network).
+///
+/// Includes network label and points at RBF/CPFP subcommands without claiming
+/// broadcast or rebuild. halfHour is labeled as product default **only** when
+/// the rung is > 0 (aligned with estimate resolution).
+pub fn format_fees_command_lines(
+    est: &crate::explorer::FeeEstimates,
+    network_label: &str,
+) -> Vec<String> {
+    let net = network_label.trim();
+    let net = if net.is_empty() { "mainnet" } else { net };
+    let mut lines = vec![
+        format!("mempool.space fee estimates ({net}, sat/vB):"),
+        format!("  fastest: {}", est.fastest_sat_vb),
+        half_hour_ladder_label(est.half_hour_sat_vb),
+        format!("  hour: {}", est.hour_sat_vb),
+        format!("  economy: {}", est.economy_sat_vb),
+        format!("  minimum: {}", est.minimum_sat_vb),
+        "Use --fee-rate <n> / fee=<n> on spend, rbf, or cpfp to override (must be > 0).".to_owned(),
+        "This command prints the ladder only. RBF: `grok routstr rbf`. CPFP: `grok routstr cpfp`."
+            .to_owned(),
+    ];
+    // Keep a stable trailing note aligned with format_fee_estimates_lines consumers.
+    lines.push("Source: GET /api/v1/fees/recommended (rate-limited explorer client).".to_owned());
+    lines
+}
+
+/// Pure product result for `grok routstr fees`: ladder lines or honest unavailable.
+///
+/// Offline-testable. Callers inject live estimates (or `None` after failed fetch).
+pub fn fees_cli_result_lines(
+    estimates: Option<&crate::explorer::FeeEstimates>,
+    network_label: &str,
+) -> Vec<String> {
+    match estimates {
+        Some(est) => format_fees_command_lines(est, network_label),
+        None => fees_unavailable_lines(network_label),
+    }
 }
 
 /// Pure RBF guidance from original fee/size + target rate (product / CLI helper).
@@ -992,12 +1285,23 @@ pub fn spend_usage_lines() -> Vec<String> {
         "  grok routstr rbf <address> <sats> --original-fee <sats> --original-vbytes <n> \
          --input <txid:vout:amount:address> [...] [--fee-rate <n>] [--broadcast]"
             .to_owned(),
+        "  grok routstr cpfp <address> <sats> --parent-fee <sats> --parent-vbytes <n> \
+         --parent <txid:vout:amount:address> [...] [--extra-input <…>] [--fee-rate <n>] \
+         [--broadcast]"
+            .to_owned(),
         "  /routstr spend <address> <sats> [broadcast] [fee=<n>]".to_owned(),
         "  /routstr rbf <address> <sats> original-fee=<n> original-vbytes=<n> \
          input=<txid:vout:amount:address> [...] [broadcast] [fee=<n>]"
             .to_owned(),
+        "  /routstr cpfp <address> <sats> parent-fee=<n> parent-vbytes=<n> \
+         parent=<txid:vout:amount:address> [...] [extra-input=<…>] [broadcast] [fee=<n>]"
+            .to_owned(),
         "Default is dry-run (build/sign/extract only). SeedVault unlock + recovery-phrase \
          re-entry required; BIP-39 never goes to chat history or CredentialsStore."
+            .to_owned(),
+        "Optional BIP-39 passphrase: set GROK_BITCOIN_BIP39_PASSPHRASE in the process env \
+         at unlock/sign time only (never stored in SeedVault, CredentialsStore, or \
+         watch_session). Empty/unset = default path. Do not put the passphrase on CLI/TUI lines."
             .to_owned(),
         "Dry-run shows full signed hex in the CLI summary and TUI system block; CLI also \
          writes the hex alone on stdout for piping. Broadcast-requested path does not dump \
@@ -1005,9 +1309,12 @@ pub fn spend_usage_lines() -> Vec<String> {
          external broadcast."
             .to_owned(),
         "Fee: omit --fee-rate / fee= to use explorer halfHour estimates when available, else \
-         default 5 sat/vB. Inputs signal RBF (BIP-125). To replace a stuck spend, use \
-         `grok routstr rbf` or `/routstr rbf` with original-fee/original-vbytes and each \
-         input= from the prior dry-run meta (same prevouts; never invents witnesses)."
+         default 5 sat/vB. Print the full ladder with `grok routstr fees`. Inputs signal \
+         RBF (BIP-125). To replace a stuck spend, use `grok routstr rbf` or `/routstr rbf` \
+         with original-fee/original-vbytes and each input= from the prior dry-run meta \
+         (same prevouts; never invents witnesses). To fee-bump without replacing the \
+         parent, use `grok routstr cpfp` or `/routstr cpfp` (child spends a wallet-owned \
+         parent output)."
             .to_owned(),
     ]
 }
@@ -1361,8 +1668,9 @@ pub fn format_rbf_replacement_prepared_lines(
         );
     } else {
         lines.push(
-            "Dry-run only (not broadcast). Re-run with --broadcast to submit the replacement. \
-             The original stuck tx is not cancelled until a higher-fee replacement is accepted."
+            "Dry-run only (not broadcast). Re-run with --broadcast (CLI) or `broadcast` (TUI) \
+             to submit the replacement. The original stuck tx is not cancelled until a \
+             higher-fee replacement is accepted."
                 .to_owned(),
         );
         lines.extend(format_spend_raw_hex_lines(raw_hex));
@@ -1370,22 +1678,416 @@ pub fn format_rbf_replacement_prepared_lines(
     lines
 }
 
-/// Usage blurb for `grok routstr rbf`.
+/// Usage blurb for `grok routstr rbf` / `/routstr rbf`.
 pub fn rbf_usage_lines() -> Vec<String> {
     vec![
         "Usage:".to_owned(),
         "  grok routstr rbf <address> <sats> --original-fee <sats> --original-vbytes <n> \
          --input <txid:vout:amount:address> [...] [--fee-rate <n>] [--broadcast]"
             .to_owned(),
-        "Rebuilds a BIP-125 same-input RBF replacement (higher absolute fee) that conflicts \
-         with the stuck mempool tx. Take --original-fee, --original-vbytes, and each --input \
-         from a prior `spend` dry-run meta. Dry-run by default; --broadcast only after unlock \
-         + re-entry."
+        "  /routstr rbf <address> <sats> original-fee=<n> original-vbytes=<n> \
+         input=<txid:vout:amount:address> [...] [broadcast] [fee=<n>]"
             .to_owned(),
-        "Omit --fee-rate to use explorer halfHour estimates when available, else default \
+        "Rebuilds a BIP-125 same-input RBF replacement (higher absolute fee) that conflicts \
+         with the stuck mempool tx. Take original-fee, original-vbytes, and each input from a \
+         prior `spend` dry-run meta. Dry-run by default; --broadcast (CLI) or `broadcast` (TUI) \
+         only after unlock + re-entry."
+            .to_owned(),
+        "Omit --fee-rate / fee= to use explorer halfHour estimates when available, else default \
          5 sat/vB; product uses plan recommended absolute fee (not floor-rate re-select). \
          Never claims broadcast without explorer Accepted + parseable txid. BIP-39 never \
-         on CLI lines (SeedVault unlock)."
+         on CLI/TUI lines (SeedVault unlock / `/routstr unlock`). Optional BIP-39 passphrase \
+         via GROK_BITCOIN_BIP39_PASSPHRASE at unlock (never persisted)."
+            .to_owned(),
+    ]
+}
+
+/// Parsed CPFP child request (no secrets).
+///
+/// Wire form for parent/extra matches [`RbfInputSpec`] (`txid:vout:amount:address`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpfpChildRequest {
+    pub payment_address: String,
+    pub amount_sats: u64,
+    /// Absolute fee of the underpaying parent transaction in sats.
+    pub parent_fee_sats: u64,
+    /// Virtual size of the parent transaction.
+    pub parent_vbytes: u64,
+    /// Parent output(s) the child must spend (wallet-owned; at least one).
+    pub parents: Vec<RbfInputSpec>,
+    /// Optional confirmed inputs to fund child fee when parent alone is short.
+    pub extra_inputs: Vec<RbfInputSpec>,
+    /// When false (product default), build/sign/extract only — do not broadcast.
+    pub broadcast: bool,
+    pub fee_rate_sat_vb: u64,
+    /// True when the user supplied `--fee-rate` (not product default / estimates).
+    pub fee_rate_explicit: bool,
+}
+
+/// Pure parse errors for CPFP child args.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CpfpChildParseError {
+    InvalidFeeRate(String),
+    ZeroAmount,
+    ZeroParentVbytes,
+    EmptyAddress,
+    /// No `--parent` specs (child must spend parent output).
+    MissingParents,
+    /// Malformed `--parent` / `--extra-input`.
+    InvalidInput(String),
+    /// TUI/token parse: missing payment address.
+    MissingAddress,
+    /// TUI/token parse: missing amount.
+    MissingAmount,
+    /// TUI/token parse: amount not an integer.
+    InvalidAmount(String),
+    /// TUI/token parse: `parent-fee=` omitted.
+    MissingParentFee,
+    /// TUI/token parse: `parent-vbytes=` omitted.
+    MissingParentVbytes,
+    /// TUI/token parse: unknown token (fail closed).
+    UnknownToken(String),
+}
+
+impl std::fmt::Display for CpfpChildParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidFeeRate(s) => write!(f, "invalid fee rate: {s}"),
+            Self::ZeroAmount => write!(f, "amount must be > 0 sats"),
+            Self::ZeroParentVbytes => write!(f, "--parent-vbytes must be > 0"),
+            Self::EmptyAddress => write!(f, "payment address must not be empty"),
+            Self::MissingParents => write!(
+                f,
+                "CPFP requires at least one --parent txid:vout:amount:address \
+                 (wallet-owned output of the stuck parent)"
+            ),
+            Self::InvalidInput(s) => write!(f, "invalid parent/extra input: {s}"),
+            Self::MissingAddress => write!(f, "missing payment address"),
+            Self::MissingAmount => write!(f, "missing amount in sats"),
+            Self::InvalidAmount(s) => write!(f, "invalid amount {s:?} (expected integer sats)"),
+            Self::MissingParentFee => write!(
+                f,
+                "missing parent-fee=<sats> (absolute fee of the underpaying parent)"
+            ),
+            Self::MissingParentVbytes => write!(
+                f,
+                "missing parent-vbytes=<n> (virtual size of the underpaying parent)"
+            ),
+            Self::UnknownToken(s) => write!(
+                f,
+                "unknown cpfp token {s:?} (use parent-fee=, parent-vbytes=, \
+                 parent=<txid:vout:amount:address>, extra-input=<…>, broadcast, fee=<sat/vB>)"
+            ),
+        }
+    }
+}
+
+/// Parse one CPFP parent/extra value (same wire form as RBF `--input`).
+pub fn parse_cpfp_input_spec(raw: &str) -> std::result::Result<RbfInputSpec, CpfpChildParseError> {
+    parse_rbf_input_spec(raw).map_err(|e| match e {
+        RbfReplaceParseError::InvalidInput(s) => CpfpChildParseError::InvalidInput(s),
+        other => CpfpChildParseError::InvalidInput(other.to_string()),
+    })
+}
+
+/// Parse CPFP child args into a [`CpfpChildRequest`].
+///
+/// `fee_rate_sat_vb: None` → default rate and `fee_rate_explicit = false`.
+/// `Some(n)` with `n > 0` → explicit target package rate. `Some(0)` is rejected.
+/// `parent_fee_sats` may be 0. `parent_vbytes` must be > 0.
+/// `parent_specs` must contain at least one valid `txid:vout:amount:address`.
+pub fn parse_cpfp_child_request(
+    address: &str,
+    amount_sats: u64,
+    parent_fee_sats: u64,
+    parent_vbytes: u64,
+    parent_specs: &[String],
+    extra_specs: &[String],
+    broadcast: bool,
+    fee_rate_sat_vb: Option<u64>,
+) -> std::result::Result<CpfpChildRequest, CpfpChildParseError> {
+    let payment_address = address.trim().to_owned();
+    if payment_address.is_empty() {
+        return Err(CpfpChildParseError::EmptyAddress);
+    }
+    if amount_sats == 0 {
+        return Err(CpfpChildParseError::ZeroAmount);
+    }
+    if parent_vbytes == 0 {
+        return Err(CpfpChildParseError::ZeroParentVbytes);
+    }
+    if parent_specs.is_empty() {
+        return Err(CpfpChildParseError::MissingParents);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut parents = Vec::with_capacity(parent_specs.len());
+    for raw in parent_specs {
+        let spec = parse_cpfp_input_spec(raw)?;
+        let key = (spec.txid.clone(), spec.vout);
+        if !seen.insert(key) {
+            return Err(CpfpChildParseError::InvalidInput(format!(
+                "duplicate input {}:{}",
+                spec.txid, spec.vout
+            )));
+        }
+        parents.push(spec);
+    }
+    let mut extra_inputs = Vec::with_capacity(extra_specs.len());
+    for raw in extra_specs {
+        let spec = parse_cpfp_input_spec(raw)?;
+        let key = (spec.txid.clone(), spec.vout);
+        if !seen.insert(key) {
+            return Err(CpfpChildParseError::InvalidInput(format!(
+                "duplicate input {}:{}",
+                spec.txid, spec.vout
+            )));
+        }
+        extra_inputs.push(spec);
+    }
+    let fee_rate_explicit = fee_rate_sat_vb.is_some();
+    let fee_rate_sat_vb = fee_rate_sat_vb.unwrap_or(DEFAULT_SPEND_FEE_RATE_SAT_VB);
+    if fee_rate_sat_vb == 0 {
+        return Err(CpfpChildParseError::InvalidFeeRate(
+            "fee rate must be > 0 sat/vB".into(),
+        ));
+    }
+    Ok(CpfpChildRequest {
+        payment_address,
+        amount_sats,
+        parent_fee_sats,
+        parent_vbytes,
+        parents,
+        extra_inputs,
+        broadcast,
+        fee_rate_sat_vb,
+        fee_rate_explicit,
+    })
+}
+
+/// Whether product may attempt network broadcast for this CPFP request.
+pub fn cpfp_wants_broadcast(req: &CpfpChildRequest) -> bool {
+    req.broadcast
+}
+
+/// Parse TUI free-form tokens after `cpfp`:
+/// ```text
+/// <address> <sats> parent-fee=<n> parent-vbytes=<n>
+///   parent=<txid:vout:amount:address> [...] [extra-input=<…>] [broadcast] [fee=<n>]
+/// ```
+///
+/// Address is the first token; amount the second; remaining tokens set flags.
+/// Order of optional/required key=value tokens after amount does not matter.
+/// Accepts CLI-style `--parent-fee=`, `--parent=`, etc. Unknown tokens fail
+/// closed. **No network I/O** — pure offline parse (fee estimates resolve later
+/// at authorize, same as spend/rbf).
+pub fn parse_cpfp_tokens(
+    tokens: &[&str],
+) -> std::result::Result<CpfpChildRequest, CpfpChildParseError> {
+    let mut iter = tokens.iter().copied().filter(|t| !t.is_empty());
+    let address = iter.next().ok_or(CpfpChildParseError::MissingAddress)?;
+    let amount_raw = iter.next().ok_or(CpfpChildParseError::MissingAmount)?;
+    let amount_sats: u64 = amount_raw
+        .parse()
+        .map_err(|_| CpfpChildParseError::InvalidAmount(amount_raw.to_owned()))?;
+
+    let mut broadcast = false;
+    let mut fee_rate: Option<u64> = None;
+    let mut parent_fee: Option<u64> = None;
+    let mut parent_vbytes: Option<u64> = None;
+    let mut parent_specs: Vec<String> = Vec::new();
+    let mut extra_specs: Vec<String> = Vec::new();
+
+    for t in iter {
+        let lower = t.to_ascii_lowercase();
+        if lower == "broadcast" || lower == "--broadcast" {
+            broadcast = true;
+            continue;
+        }
+        if let Some(rest) = lower
+            .strip_prefix("fee=")
+            .or_else(|| lower.strip_prefix("fee-rate="))
+            .or_else(|| lower.strip_prefix("--fee-rate="))
+        {
+            let n: u64 = rest.parse().map_err(|_| {
+                CpfpChildParseError::InvalidFeeRate(format!("not an integer: {rest}"))
+            })?;
+            fee_rate = Some(n);
+            continue;
+        }
+        // Case-insensitive key match but preserve the value part from the original
+        // token so bech32 addresses in parent=/extra-input= keep mixed case if present.
+        let (key, value) = if let Some(eq) = t.find('=') {
+            (&t[..eq], &t[eq + 1..])
+        } else {
+            return Err(CpfpChildParseError::UnknownToken(t.to_owned()));
+        };
+        let key_lower = key.to_ascii_lowercase();
+        match key_lower.as_str() {
+            "parent-fee" | "parent_fee" | "--parent-fee" => {
+                let n: u64 = value.trim().parse().map_err(|_| {
+                    CpfpChildParseError::InvalidInput(format!(
+                        "parent-fee must be integer sats, got {value:?}"
+                    ))
+                })?;
+                parent_fee = Some(n);
+            }
+            "parent-vbytes" | "parent_vbytes" | "--parent-vbytes" => {
+                let n: u64 = value.trim().parse().map_err(|_| {
+                    CpfpChildParseError::InvalidInput(format!(
+                        "parent-vbytes must be integer, got {value:?}"
+                    ))
+                })?;
+                parent_vbytes = Some(n);
+            }
+            "parent" | "--parent" => {
+                if value.trim().is_empty() {
+                    return Err(CpfpChildParseError::InvalidInput(
+                        "empty parent= value (expected txid:vout:amount:address)".into(),
+                    ));
+                }
+                parent_specs.push(value.trim().to_owned());
+            }
+            "extra-input" | "extra_input" | "--extra-input" => {
+                if value.trim().is_empty() {
+                    return Err(CpfpChildParseError::InvalidInput(
+                        "empty extra-input= value (expected txid:vout:amount:address)".into(),
+                    ));
+                }
+                extra_specs.push(value.trim().to_owned());
+            }
+            _ => {
+                return Err(CpfpChildParseError::UnknownToken(t.to_owned()));
+            }
+        }
+    }
+
+    let parent_fee_sats = parent_fee.ok_or(CpfpChildParseError::MissingParentFee)?;
+    let parent_vbytes = parent_vbytes.ok_or(CpfpChildParseError::MissingParentVbytes)?;
+    parse_cpfp_child_request(
+        address,
+        amount_sats,
+        parent_fee_sats,
+        parent_vbytes,
+        &parent_specs,
+        &extra_specs,
+        broadcast,
+        fee_rate,
+    )
+}
+
+/// Format one parent as CLI flag form.
+#[cfg(feature = "onchain-address")]
+pub fn format_cpfp_parent_cli_flag(utxo: &crate::descriptor_wallet::WalletUtxo) -> String {
+    format!(
+        "  --parent {}:{}:{}:{}",
+        utxo.outpoint.txid, utxo.outpoint.vout, utxo.amount_sats, utxo.address
+    )
+}
+
+/// CPFP-specific fee meta after a successful child prepare.
+///
+/// Unlike [`format_spend_fee_meta_lines`], this labels **package** target rate vs
+/// **child alone** effective rate (and package effective), so a min-relay child
+/// under an overpaying parent is not misread as underpay.
+///
+/// Does not claim broadcast or parent replacement.
+#[cfg(feature = "onchain-address")]
+pub fn format_cpfp_child_fee_meta_lines(
+    parent_fee_sats: u64,
+    parent_vbytes: u64,
+    child_fee_sats: u64,
+    child_vbytes: u64,
+    package_target_fee_rate_sat_vb: u64,
+) -> Vec<String> {
+    let package_fee = parent_fee_sats.saturating_add(child_fee_sats);
+    let package_vb = parent_vbytes.saturating_add(child_vbytes);
+    let package_eff = crate::descriptor_wallet::effective_fee_rate_sat_vb(package_fee, package_vb);
+    let child_eff =
+        crate::descriptor_wallet::effective_fee_rate_sat_vb(child_fee_sats, child_vbytes);
+    vec![
+        format!(
+            "CPFP package fee rate: target {package_target_fee_rate_sat_vb} sat/vB; \
+             effective ~{package_eff} sat/vB ({package_fee} sats / {package_vb} vB = \
+             parent {parent_fee_sats}/{parent_vbytes} + child {child_fee_sats}/{child_vbytes})."
+        ),
+        format!(
+            "Child alone: ~{child_eff} sat/vB ({child_fee_sats} sats / {child_vbytes} vB). \
+             Child rate may be low when the parent already overpays the package target."
+        ),
+        "CPFP does not replace the parent. Inputs still signal RBF (BIP-125) on the child."
+            .to_owned(),
+    ]
+}
+
+/// Lines after a successful local CPFP child prepare (dry-run default).
+///
+/// Never claims the parent was replaced or cancelled.
+#[cfg(feature = "onchain-address")]
+pub fn format_cpfp_child_prepared_lines(
+    payment_address: &str,
+    payment_sats: u64,
+    parent_fee_sats: u64,
+    child_fee_sats: u64,
+    change_sats: u64,
+    txid: &str,
+    raw_hex: &str,
+    broadcast: bool,
+    plan: &crate::descriptor_wallet::CpfpFeePlan,
+) -> Vec<String> {
+    let package_fee = parent_fee_sats.saturating_add(child_fee_sats);
+    let mut lines = vec![
+        format!("Prepared CPFP child spend: {payment_sats} sats → {payment_address}"),
+        format!(
+            "Parent fee: {parent_fee_sats} sats; child fee: {child_fee_sats} sats; \
+             package fee: {package_fee} sats"
+        ),
+        format!("Change: {change_sats} sats"),
+        format!("Txid (local child): {txid}"),
+        "CPFP child (spends parent output; does NOT replace the parent tx). \
+         Miners may take parent+child as a package when package rate is high enough."
+            .to_owned(),
+    ];
+    lines.extend(format_cpfp_fee_plan_lines_inner(plan, false));
+    if broadcast {
+        lines.push(
+            "Broadcast requested — submitting CPFP child via rate-limited explorer…".to_owned(),
+        );
+    } else {
+        lines.push(
+            "Dry-run only (not broadcast). Re-run with --broadcast (CLI) or `broadcast` (TUI) \
+             to submit the child. The parent remains in the mempool until confirmed or dropped; \
+             this child does not cancel or replace it."
+                .to_owned(),
+        );
+        lines.extend(format_spend_raw_hex_lines(raw_hex));
+    }
+    lines
+}
+
+/// Usage blurb for `grok routstr cpfp` / `/routstr cpfp`.
+pub fn cpfp_usage_lines() -> Vec<String> {
+    vec![
+        "Usage:".to_owned(),
+        "  grok routstr cpfp <address> <sats> --parent-fee <sats> --parent-vbytes <n> \
+         --parent <txid:vout:amount:address> [...] [--extra-input <txid:vout:amount:address>] \
+         [--fee-rate <n>] [--broadcast]"
+            .to_owned(),
+        "  /routstr cpfp <address> <sats> parent-fee=<n> parent-vbytes=<n> \
+         parent=<txid:vout:amount:address> [...] [extra-input=<…>] [broadcast] [fee=<n>]"
+            .to_owned(),
+        "Builds a CPFP **child** that spends a wallet-owned parent output so the parent+child \
+         package meets the target fee rate. Take parent-fee / parent-vbytes from the stuck \
+         parent (or prior prepare meta) and each --parent / parent= from a wallet-owned output \
+         of that parent. Optional --extra-input / extra-input= confirmed UTXOs fund the child \
+         fee when the parent output alone is short. Dry-run by default; --broadcast (CLI) or \
+         `broadcast` (TUI) only after unlock + re-entry."
+            .to_owned(),
+        "Omit --fee-rate / fee= to use explorer halfHour estimates when available, else default \
+         5 sat/vB; product uses plan_cpfp_child_fee minimum absolute child fee (package rate). \
+         Never claims the parent was replaced. Never claims broadcast without explorer \
+         Accepted + parseable txid. BIP-39 never on CLI/TUI lines (SeedVault unlock / \
+         `/routstr unlock`). Optional BIP-39 passphrase via GROK_BITCOIN_BIP39_PASSPHRASE \
+         at unlock (never persisted)."
             .to_owned(),
     ]
 }
@@ -1557,6 +2259,71 @@ mod tests {
 
         let empty = returning_user_reveal_after_reentry(&m, "   ", addr.into());
         assert!(matches!(empty, Err(WalletError::BackupNotConfirmed)));
+    }
+
+    #[test]
+    fn bip39_passphrase_active_notice_never_includes_secret_and_fund_flag() {
+        let notice = bip39_passphrase_active_notice_lines().join("\n");
+        let lower = notice.to_ascii_lowercase();
+        assert!(lower.contains("passphrase"));
+        // Neutral default: re-supply methods may mention the env var, but must
+        // not claim "from GROK_… is active" (modal may have supplied the value).
+        assert!(
+            !lower.contains("from grok_bitcoin_bip39_passphrase is active"),
+            "default notice must not falsely attribute env: {notice}"
+        );
+        assert!(lower.contains("never stored") || lower.contains("not shown"));
+        // Must not look like it embeds a sample secret value.
+        assert!(!notice.contains("correct-horse"));
+        assert!(!notice.contains("secret-value"));
+
+        let env_notice =
+            bip39_passphrase_active_notice_lines_for(Bip39PassphraseNoticeSource::ProcessEnv)
+                .join("\n")
+                .to_ascii_lowercase();
+        assert!(
+            env_notice.contains("from grok_bitcoin_bip39_passphrase"),
+            "ProcessEnv source must name the env var: {env_notice}"
+        );
+        let modal_notice =
+            bip39_passphrase_active_notice_lines_for(Bip39PassphraseNoticeSource::PrivateModal)
+                .join("\n")
+                .to_ascii_lowercase();
+        assert!(
+            modal_notice.contains("private modal"),
+            "PrivateModal source must say modal: {modal_notice}"
+        );
+        assert!(
+            !modal_notice.contains("from grok_bitcoin_bip39_passphrase is active"),
+            "modal notice must not claim env as source: {modal_notice}"
+        );
+
+        let plain =
+            format_fund_success_lines("bc1qtest", "showing receive address", "mainnet", true);
+        let plain_j = plain.join("\n").to_ascii_lowercase();
+        assert!(
+            !plain_j.contains("passphrase"),
+            "default fund lines omit passphrase note"
+        );
+
+        let active = format_fund_success_lines_with_passphrase_flag(
+            "bc1qtest",
+            "showing receive address",
+            "mainnet",
+            true,
+            true,
+        );
+        let active_j = active.join("\n").to_ascii_lowercase();
+        assert!(
+            active_j.contains("passphrase")
+                && (active_j.contains("never stored") || active_j.contains("not shown")),
+            "active fund lines must warn without echoing secret: {active_j}"
+        );
+        assert!(
+            !active_j.contains("from grok_bitcoin_bip39_passphrase is active"),
+            "fund flag notice stays source-neutral: {active_j}"
+        );
+        assert!(active_j.contains("bc1qtest"));
     }
 
     #[test]
@@ -2070,6 +2837,104 @@ mod tests {
         assert!(!joined.to_ascii_lowercase().contains("crypto"));
     }
 
+    #[test]
+    fn fees_cli_result_lines_ladder_or_unavailable() {
+        let est = crate::explorer::FeeEstimates {
+            fastest_sat_vb: 20,
+            half_hour_sat_vb: 15,
+            hour_sat_vb: 10,
+            economy_sat_vb: 5,
+            minimum_sat_vb: 1,
+        };
+        let ok = fees_cli_result_lines(Some(&est), "signet").join("\n");
+        let ok_l = ok.to_ascii_lowercase();
+        assert!(ok.contains("fastest: 20"));
+        assert!(ok.contains("halfHour: 15"));
+        assert!(
+            ok_l.contains("product default when live"),
+            "halfHour > 0 must be labeled product default: {ok}"
+        );
+        assert!(ok_l.contains("signet"));
+        assert!(ok_l.contains("ladder only") || ok_l.contains("rbf"));
+        assert!(ok_l.contains("cpfp"));
+        assert!(!ok_l.contains("crypto"));
+        assert!(!ok_l.contains("broadcast accepted"));
+
+        let miss = fees_cli_result_lines(None, "mainnet").join("\n");
+        let miss_l = miss.to_ascii_lowercase();
+        assert!(miss_l.contains("unavailable") || miss_l.contains("not inventing"));
+        assert!(miss_l.contains("mainnet"));
+        assert!(miss_l.contains(&format!("{DEFAULT_SPEND_FEE_RATE_SAT_VB}")));
+        // Broad failure modes — not only "network unreachable".
+        assert!(
+            miss_l.contains("rate-limit") || miss_l.contains("rate limit"),
+            "unavailable copy must cover rate-limit, not only reachability: {miss}"
+        );
+        assert!(
+            miss_l.contains("retry later") || miss_l.contains("retry"),
+            "unavailable copy should invite retry without implying only offline: {miss}"
+        );
+        // Must not invent a fake ladder of rates when fetch failed.
+        assert!(!miss_l.contains("fastest:"));
+        assert!(!miss_l.contains("crypto"));
+    }
+
+    #[test]
+    fn fees_command_zero_half_hour_not_labeled_product_default() {
+        let est = crate::explorer::FeeEstimates {
+            fastest_sat_vb: 10,
+            half_hour_sat_vb: 0,
+            hour_sat_vb: 5,
+            economy_sat_vb: 2,
+            minimum_sat_vb: 1,
+        };
+        let lines = format_fees_command_lines(&est, "mainnet").join("\n");
+        let lower = lines.to_ascii_lowercase();
+        assert!(lines.contains("halfHour: 0"));
+        assert!(
+            !lower.contains("product default when live"),
+            "zero halfHour must not claim product default: {lines}"
+        );
+        assert!(
+            lower.contains("ignored") && lower.contains("fall"),
+            "zero halfHour must note product fallback: {lines}"
+        );
+        assert!(lower.contains(&format!("{DEFAULT_SPEND_FEE_RATE_SAT_VB}")));
+    }
+
+    #[test]
+    fn fees_usage_mentions_ladder_only_not_rbf_rebuild() {
+        let usage = fees_usage_lines().join("\n").to_ascii_lowercase();
+        assert!(usage.contains("fees"));
+        assert!(usage.contains("ladder") || usage.contains("estimate"));
+        assert!(usage.contains("rbf"));
+        assert!(usage.contains("cpfp"));
+        assert!(usage.contains("network") || usage.contains("mainnet"));
+        assert!(usage.contains("unavailable") || usage.contains("never invents"));
+        assert!(!usage.contains("crypto"));
+        // Fees is not a rebuild/broadcast path.
+        assert!(!usage.contains("--broadcast"));
+        // Shared about constants stay aligned with usage honesty.
+        assert!(FEES_CLI_ABOUT.to_ascii_lowercase().contains("ladder"));
+        assert!(!FEES_CLI_ABOUT.to_ascii_lowercase().contains("broadcast"));
+        let long = FEES_CLI_LONG_ABOUT.to_ascii_lowercase();
+        assert!(long.contains("ladder"));
+        assert!(long.contains("never invents"));
+        assert!(long.contains("rbf") && long.contains("cpfp"));
+        assert!(!long.contains("broadcast"));
+    }
+
+    #[test]
+    fn fees_unavailable_empty_network_defaults_mainnet() {
+        let lines = fees_unavailable_lines("  ").join("\n").to_ascii_lowercase();
+        assert!(lines.contains("mainnet"));
+        assert!(lines.contains("not inventing") || lines.contains("unavailable"));
+        assert!(
+            lines.contains("rate-limit") || lines.contains("rate limit"),
+            "must not imply only network reachability: {lines}"
+        );
+    }
+
     #[cfg(feature = "onchain-address")]
     #[test]
     fn format_spend_fee_meta_and_rbf_cpfp_guidance() {
@@ -2091,7 +2956,11 @@ mod tests {
         let cpfp_j = cpfp.join("\n").to_ascii_lowercase();
         assert!(cpfp_j.contains("cpfp"));
         assert!(cpfp_j.contains("minimum child fee"));
-        assert!(cpfp_j.contains("guidance only"));
+        assert!(
+            cpfp_j.contains("grok routstr cpfp") || cpfp_j.contains("does not replace"),
+            "{cpfp_j}"
+        );
+        assert!(meta_j.contains("cpfp") || meta_j.contains("parent"));
 
         assert!(rbf_fee_bump_guidance_lines(100, 0, 10).is_err());
         assert!(cpfp_fee_guidance_lines(100, 100, 1, 0).is_err());
@@ -2103,6 +2972,12 @@ mod tests {
         assert!(usage.contains("rbf") || usage.contains("bip-125"));
         assert!(usage.contains("fee"));
         assert!(usage.contains("routstr rbf"));
+        assert!(usage.contains("routstr cpfp"));
+        assert!(usage.contains("routstr fees"));
+        assert!(
+            usage.contains("grok_bitcoin_bip39_passphrase"),
+            "usage should document optional passphrase env: {usage}"
+        );
         assert!(!usage.contains("crypto"));
     }
 
@@ -2352,6 +3227,19 @@ mod tests {
         assert!(dry_j.contains("dry-run"));
         assert!(dry_j.contains(hex));
         assert!(!dry_j.contains("broadcast accepted"));
+        // CLI/TUI parity with spend dry-run guidance.
+        assert!(
+            dry_j.contains("--broadcast"),
+            "dry-run must mention CLI --broadcast: {dry_j}"
+        );
+        assert!(
+            dry_j.contains("tui") && dry_j.contains("broadcast"),
+            "dry-run must mention TUI broadcast path: {dry_j}"
+        );
+        assert!(
+            dry_j.contains("cli"),
+            "dry-run must label --broadcast as CLI: {dry_j}"
+        );
         assert!(dry.iter().any(|l| is_spend_raw_hex_output_line(l, hex)));
 
         let live = format_rbf_replacement_prepared_lines(
@@ -2384,6 +3272,23 @@ mod tests {
         assert!(usage.contains("original-vbytes"));
         assert!(usage.contains("--input") || usage.contains("input"));
         assert!(usage.contains("dry-run") || usage.contains("broadcast"));
+        assert!(
+            usage.contains("grok_bitcoin_bip39_passphrase"),
+            "usage should document optional passphrase env: {usage}"
+        );
+        // CLI + TUI surfaces (parity with spend_usage_lines).
+        assert!(
+            usage.contains("grok routstr rbf"),
+            "CLI usage line missing: {usage}"
+        );
+        assert!(
+            usage.contains("/routstr rbf"),
+            "TUI usage line missing: {usage}"
+        );
+        assert!(
+            usage.contains("fee=") || usage.contains("[fee="),
+            "TUI fee= form should appear in usage: {usage}"
+        );
         assert!(!usage.contains("crypto"));
         assert!(!usage.contains("bip-39 on cli") || usage.contains("never"));
     }
@@ -2403,5 +3308,459 @@ mod tests {
         assert!(j.contains("--input"));
         assert!(j.contains(&"ab".repeat(32)));
         assert!(j.contains(":1:50000:bc1qtest"));
+    }
+
+    /// Pure utxos CLI formatter: balance + RBF flags + gap notices (mock snapshot).
+    #[cfg(feature = "onchain-address")]
+    #[test]
+    fn format_gap_sync_utxos_cli_lines_balance_and_inputs() {
+        use crate::descriptor_wallet::{
+            OutPointRef, WalletBalance, WalletSyncSnapshot, WalletUtxo,
+        };
+
+        let utxo = WalletUtxo {
+            outpoint: OutPointRef::new("ab".repeat(32), 2),
+            amount_sats: 21_000,
+            address: "bc1qrecv".into(),
+            confirmations: 6,
+            is_change: false,
+        };
+        let snap = WalletSyncSnapshot {
+            utxos: vec![utxo],
+            balance: WalletBalance {
+                confirmed_sats: 21_000,
+                unconfirmed_sats: 0,
+            },
+            receive_gap: 20,
+            change_gap: 20,
+            highest_used_receive: Some(0),
+            highest_used_change: None,
+            extended_receive_by: 0,
+            extended_change_by: 0,
+            hit_max_gap: false,
+        };
+        let lines = format_gap_sync_utxos_cli_lines(&snap, "signet");
+        let j = lines.join("\n");
+        let lower = j.to_ascii_lowercase();
+        assert!(j.contains("signet"));
+        assert!(
+            j.contains("21000")
+                || j.contains("21_000")
+                || j.contains("21,000")
+                || j.contains("21 000")
+                || j.contains("confirmed")
+        );
+        assert!(j.contains("confirmed:"));
+        assert!(j.contains("unconfirmed:"));
+        assert!(j.contains("total:"));
+        assert!(j.contains("--input"));
+        assert!(j.contains(&"ab".repeat(32)));
+        assert!(j.contains(":2:21000:bc1qrecv") || j.contains("21000"));
+        assert!(lower.contains("gap-limit") || lower.contains("not full"));
+        // Quiet snapshot: no extend / hit-max notices.
+        assert!(!lower.contains("gap extended"));
+        assert!(!lower.contains("stopped at max"));
+        assert!(!lower.contains("crypto"));
+    }
+
+    #[cfg(feature = "onchain-address")]
+    #[test]
+    fn format_gap_sync_utxos_cli_lines_empty_and_notices() {
+        use crate::descriptor_wallet::{WalletBalance, WalletSyncSnapshot};
+
+        let empty = WalletSyncSnapshot {
+            utxos: vec![],
+            balance: WalletBalance::default(),
+            receive_gap: 20,
+            change_gap: 20,
+            highest_used_receive: None,
+            highest_used_change: None,
+            extended_receive_by: 0,
+            extended_change_by: 0,
+            hit_max_gap: false,
+        };
+        let empty_j = format_gap_sync_utxos_cli_lines(&empty, "mainnet").join("\n");
+        let empty_l = empty_j.to_ascii_lowercase();
+        assert!(empty_l.contains("none") || empty_l.contains("0 sats"));
+        assert!(empty_l.contains("confirmed"));
+        assert!(!empty_l.contains("--input"));
+
+        let hit = WalletSyncSnapshot {
+            utxos: vec![],
+            balance: WalletBalance::default(),
+            receive_gap: 200,
+            change_gap: 20,
+            highest_used_receive: Some(199),
+            highest_used_change: None,
+            extended_receive_by: 10,
+            extended_change_by: 0,
+            hit_max_gap: true,
+        };
+        let hit_j = format_gap_sync_utxos_cli_lines(&hit, "mainnet").join("\n");
+        let hit_l = hit_j.to_ascii_lowercase();
+        assert!(hit_l.contains("extended") || hit_l.contains("gap extend"));
+        assert!(hit_l.contains("max"));
+        assert!(!hit_l.contains("crypto"));
+    }
+
+    #[test]
+    fn utxos_usage_is_honest_gap_sync_list() {
+        let usage = utxos_usage_lines().join("\n").to_ascii_lowercase();
+        assert!(usage.contains("utxos"));
+        assert!(usage.contains("network") || usage.contains("mainnet"));
+        assert!(usage.contains("gap") || usage.contains("chain"));
+        assert!(
+            usage.contains("seedvault") || usage.contains("unlock") || usage.contains("recovery")
+        );
+        assert!(!usage.contains("crypto"));
+        assert!(!usage.contains("--broadcast"));
+        assert!(UTXOS_CLI_ABOUT.to_ascii_lowercase().contains("utxo"));
+        let long = UTXOS_CLI_LONG_ABOUT.to_ascii_lowercase();
+        assert!(long.contains("gap") || long.contains("not full"));
+        assert!(long.contains("never invents") || long.contains("empty"));
+    }
+
+    fn sample_cpfp_parent() -> String {
+        format!("{}:1:80000:bc1qchange", "cd".repeat(32))
+    }
+
+    fn sample_cpfp_extra() -> String {
+        format!("{}:0:50000:bc1qextra", "ef".repeat(32))
+    }
+
+    #[test]
+    fn parse_cpfp_child_request_explicit_and_default() {
+        let parents = vec![sample_cpfp_parent()];
+        let req =
+            parse_cpfp_child_request("bc1qdest", 40_000, 200, 200, &parents, &[], false, None)
+                .unwrap();
+        assert_eq!(req.payment_address, "bc1qdest");
+        assert_eq!(req.amount_sats, 40_000);
+        assert_eq!(req.parent_fee_sats, 200);
+        assert_eq!(req.parent_vbytes, 200);
+        assert_eq!(req.parents.len(), 1);
+        assert!(req.extra_inputs.is_empty());
+        assert!(!req.broadcast);
+        assert!(!req.fee_rate_explicit);
+        assert_eq!(req.fee_rate_sat_vb, DEFAULT_SPEND_FEE_RATE_SAT_VB);
+        assert!(!cpfp_wants_broadcast(&req));
+
+        let extras = vec![sample_cpfp_extra()];
+        let req = parse_cpfp_child_request(
+            "bc1qdest",
+            30_000,
+            100,
+            141,
+            &parents,
+            &extras,
+            true,
+            Some(20),
+        )
+        .unwrap();
+        assert!(req.broadcast);
+        assert!(req.fee_rate_explicit);
+        assert_eq!(req.fee_rate_sat_vb, 20);
+        assert_eq!(req.extra_inputs.len(), 1);
+        assert!(cpfp_wants_broadcast(&req));
+    }
+
+    #[test]
+    fn parse_cpfp_child_rejects_zero_and_empty() {
+        let parents = vec![sample_cpfp_parent()];
+        assert_eq!(
+            parse_cpfp_child_request("", 100, 50, 100, &parents, &[], false, None).unwrap_err(),
+            CpfpChildParseError::EmptyAddress
+        );
+        assert_eq!(
+            parse_cpfp_child_request("bc1q", 0, 50, 100, &parents, &[], false, None).unwrap_err(),
+            CpfpChildParseError::ZeroAmount
+        );
+        assert_eq!(
+            parse_cpfp_child_request("bc1q", 100, 50, 0, &parents, &[], false, None).unwrap_err(),
+            CpfpChildParseError::ZeroParentVbytes
+        );
+        assert_eq!(
+            parse_cpfp_child_request("bc1q", 100, 50, 100, &[], &[], false, None).unwrap_err(),
+            CpfpChildParseError::MissingParents
+        );
+        assert!(matches!(
+            parse_cpfp_child_request("bc1q", 100, 50, 100, &parents, &[], false, Some(0))
+                .unwrap_err(),
+            CpfpChildParseError::InvalidFeeRate(_)
+        ));
+        // parent_fee_sats = 0 is allowed.
+        let req =
+            parse_cpfp_child_request("bc1q", 100, 0, 100, &parents, &[], false, Some(5)).unwrap();
+        assert_eq!(req.parent_fee_sats, 0);
+        // duplicate parent
+        let dup = vec![sample_cpfp_parent(), sample_cpfp_parent()];
+        assert!(matches!(
+            parse_cpfp_child_request("bc1q", 100, 50, 100, &dup, &[], false, None).unwrap_err(),
+            CpfpChildParseError::InvalidInput(_)
+        ));
+        // parent/extra collision
+        let same = sample_cpfp_parent();
+        assert!(matches!(
+            parse_cpfp_child_request("bc1q", 100, 50, 100, &[same.clone()], &[same], false, None)
+                .unwrap_err(),
+            CpfpChildParseError::InvalidInput(_)
+        ));
+    }
+
+    #[test]
+    fn parse_cpfp_tokens_dry_run_default_and_broadcast() {
+        let parent = sample_cpfp_parent();
+        let parent_tok = format!("parent={parent}");
+        let req = parse_cpfp_tokens(&[
+            "bc1qdest",
+            "40000",
+            "parent-fee=200",
+            "parent-vbytes=200",
+            &parent_tok,
+        ])
+        .unwrap();
+        assert_eq!(req.payment_address, "bc1qdest");
+        assert_eq!(req.amount_sats, 40_000);
+        assert_eq!(req.parent_fee_sats, 200);
+        assert_eq!(req.parent_vbytes, 200);
+        assert_eq!(req.parents.len(), 1);
+        assert!(req.extra_inputs.is_empty());
+        assert!(!req.broadcast);
+        assert!(!req.fee_rate_explicit);
+        assert_eq!(req.fee_rate_sat_vb, DEFAULT_SPEND_FEE_RATE_SAT_VB);
+
+        let extra = sample_cpfp_extra();
+        let req = parse_cpfp_tokens(&[
+            "bc1qdest",
+            "100",
+            "parent_fee=500",
+            "--parent-vbytes=100",
+            &format!("--parent={parent}"),
+            &format!("extra-input={extra}"),
+            "broadcast",
+            "fee=20",
+        ])
+        .unwrap();
+        assert!(req.broadcast);
+        assert!(req.fee_rate_explicit);
+        assert_eq!(req.fee_rate_sat_vb, 20);
+        assert_eq!(req.parent_fee_sats, 500);
+        assert_eq!(req.parent_vbytes, 100);
+        assert_eq!(req.extra_inputs.len(), 1);
+    }
+
+    #[test]
+    fn parse_cpfp_tokens_rejects_fee_zero_missing_parents_zero_vbytes() {
+        let parent = sample_cpfp_parent();
+        let parent_tok = format!("parent={parent}");
+        // Explicit fee=0 is rejected offline (parity with spend/rbf fee=0).
+        assert!(matches!(
+            parse_cpfp_tokens(&[
+                "bc1qdest",
+                "100",
+                "parent-fee=50",
+                "parent-vbytes=100",
+                &parent_tok,
+                "fee=0",
+            ])
+            .unwrap_err(),
+            CpfpChildParseError::InvalidFeeRate(_)
+        ));
+        // Missing parents.
+        assert_eq!(
+            parse_cpfp_tokens(&["bc1qdest", "100", "parent-fee=50", "parent-vbytes=100",])
+                .unwrap_err(),
+            CpfpChildParseError::MissingParents
+        );
+        // Zero parent-vbytes.
+        assert_eq!(
+            parse_cpfp_tokens(&[
+                "bc1qdest",
+                "100",
+                "parent-fee=50",
+                "parent-vbytes=0",
+                &parent_tok,
+            ])
+            .unwrap_err(),
+            CpfpChildParseError::ZeroParentVbytes
+        );
+        // Missing parent-fee / parent-vbytes.
+        assert_eq!(
+            parse_cpfp_tokens(&["bc1qdest", "100", "parent-vbytes=100", &parent_tok]).unwrap_err(),
+            CpfpChildParseError::MissingParentFee
+        );
+        assert_eq!(
+            parse_cpfp_tokens(&["bc1qdest", "100", "parent-fee=50", &parent_tok]).unwrap_err(),
+            CpfpChildParseError::MissingParentVbytes
+        );
+        // parent_fee=0 allowed when vbytes/parents present.
+        let req = parse_cpfp_tokens(&[
+            "bc1qdest",
+            "100",
+            "parent-fee=0",
+            "parent-vbytes=100",
+            &parent_tok,
+            "fee=5",
+        ])
+        .unwrap();
+        assert_eq!(req.parent_fee_sats, 0);
+        // Unknown token fail closed.
+        assert!(matches!(
+            parse_cpfp_tokens(&[
+                "bc1qdest",
+                "100",
+                "parent-fee=50",
+                "parent-vbytes=100",
+                &parent_tok,
+                "typo-flag",
+            ])
+            .unwrap_err(),
+            CpfpChildParseError::UnknownToken(_)
+        ));
+        // Missing address / amount / zero amount.
+        assert_eq!(
+            parse_cpfp_tokens(&[]).unwrap_err(),
+            CpfpChildParseError::MissingAddress
+        );
+        assert_eq!(
+            parse_cpfp_tokens(&["bc1qdest"]).unwrap_err(),
+            CpfpChildParseError::MissingAmount
+        );
+        assert_eq!(
+            parse_cpfp_tokens(&[
+                "bc1qdest",
+                "0",
+                "parent-fee=50",
+                "parent-vbytes=100",
+                &parent_tok,
+            ])
+            .unwrap_err(),
+            CpfpChildParseError::ZeroAmount
+        );
+        // Empty parent= value.
+        assert!(matches!(
+            parse_cpfp_tokens(&[
+                "bc1qdest",
+                "100",
+                "parent-fee=50",
+                "parent-vbytes=100",
+                "parent=",
+            ])
+            .unwrap_err(),
+            CpfpChildParseError::InvalidInput(_)
+        ));
+    }
+
+    #[cfg(feature = "onchain-address")]
+    #[test]
+    fn format_cpfp_child_fee_meta_labels_package_vs_child() {
+        // Overpaying parent + min-relay child: package target 10, child alone ~1.
+        // Must not reuse spend "requested vs effective" on the child alone.
+        let lines = format_cpfp_child_fee_meta_lines(
+            5_000, // parent fee (overpays package)
+            200,   // parent vb
+            110,   // child fee (min-relay-ish)
+            110,   // child vb
+            10,    // package target sat/vB
+        );
+        let j = lines.join("\n").to_ascii_lowercase();
+        assert!(j.contains("package"), "must label package rate: {j}");
+        assert!(j.contains("target 10"), "must show package target: {j}");
+        assert!(j.contains("child alone") || j.contains("child"), "{j}");
+        assert!(
+            j.contains("does not replace") || j.contains("not replace"),
+            "must stress CPFP does not replace parent: {j}"
+        );
+        // Must not mislead with bare spend-style "requested 10; effective ~1" only.
+        assert!(
+            !j.contains("requested 10") || j.contains("package"),
+            "if mentioning requested rate, package context required: {j}"
+        );
+        // Package effective should be high (parent overpays).
+        assert!(
+            j.contains("effective") && (j.contains("parent") || j.contains("package")),
+            "{j}"
+        );
+    }
+
+    #[cfg(feature = "onchain-address")]
+    #[test]
+    fn format_cpfp_child_prepared_lines_dry_run_and_broadcast() {
+        let plan = crate::descriptor_wallet::plan_cpfp_child_fee(200, 200, 110, 10).unwrap();
+        let hex = "cafebabe";
+        let dry = format_cpfp_child_prepared_lines(
+            "bc1qdest",
+            40_000,
+            200,
+            plan.min_child_fee_sats,
+            30_000,
+            "aa".repeat(32).as_str(),
+            hex,
+            false,
+            &plan,
+        );
+        let dry_j = dry.join("\n").to_ascii_lowercase();
+        assert!(dry_j.contains("cpfp child"));
+        assert!(dry_j.contains("dry-run"));
+        assert!(dry_j.contains(hex));
+        assert!(dry_j.contains("does not") && dry_j.contains("replace"));
+        assert!(!dry_j.contains("broadcast accepted"));
+        assert!(dry_j.contains("--broadcast"));
+        assert!(dry.iter().any(|l| is_spend_raw_hex_output_line(l, hex)));
+
+        let live = format_cpfp_child_prepared_lines(
+            "bc1qdest",
+            40_000,
+            200,
+            plan.min_child_fee_sats,
+            30_000,
+            "bb".repeat(32).as_str(),
+            hex,
+            true,
+            &plan,
+        );
+        let live_j = live.join("\n").to_ascii_lowercase();
+        assert!(live_j.contains("broadcast requested"));
+        assert!(!live.iter().any(|l| l == hex));
+        // Plan rebuild disclaimer must not appear inside prepare (broadcast) flow.
+        assert!(
+            !live_j.contains("does not broadcast"),
+            "rebuild disclaimer should be omitted inside cpfp prepare: {live_j}"
+        );
+        // Never claim parent replaced.
+        assert!(!live_j.contains("parent was replaced") && !live_j.contains("replacement spend"));
+    }
+
+    #[test]
+    fn cpfp_usage_mentions_parent_and_dry_run() {
+        let usage = cpfp_usage_lines().join("\n").to_ascii_lowercase();
+        assert!(usage.contains("parent-fee"));
+        assert!(usage.contains("parent-vbytes"));
+        assert!(usage.contains("--parent"));
+        assert!(usage.contains("extra-input") || usage.contains("--extra-input"));
+        assert!(usage.contains("dry-run") || usage.contains("broadcast"));
+        assert!(
+            usage.contains("grok_bitcoin_bip39_passphrase"),
+            "usage should document optional passphrase env: {usage}"
+        );
+        assert!(
+            usage.contains("grok routstr cpfp"),
+            "CLI usage line missing: {usage}"
+        );
+        assert!(
+            usage.contains("/routstr cpfp"),
+            "TUI usage line missing: {usage}"
+        );
+        assert!(
+            usage.contains("fee=") || usage.contains("[fee="),
+            "TUI fee= form should appear in usage: {usage}"
+        );
+        assert!(
+            usage.contains("never claims the parent was replaced")
+                || (usage.contains("does not")
+                    && (usage.contains("replace") || usage.contains("replaced"))),
+            "must stress CPFP does not replace parent: {usage}"
+        );
+        assert!(!usage.contains("crypto"));
     }
 }
