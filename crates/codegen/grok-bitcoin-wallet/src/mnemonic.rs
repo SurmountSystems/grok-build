@@ -28,6 +28,40 @@ pub const BIP39_PASSPHRASE_ENV: &str = "GROK_BITCOIN_BIP39_PASSPHRASE";
 /// Drop zeroizes the underlying secret string via [`secrecy`].
 pub struct MnemonicSecret(SecretString);
 
+/// BIP-39 entropy bytes (16 for 12-word, 32 for 24-word).
+///
+/// Zeroizes on drop. `Debug` is always redacted (never prints raw entropy).
+pub struct EntropyBytes(zeroize::Zeroizing<Vec<u8>>);
+
+impl EntropyBytes {
+    /// Byte length of the entropy (16 or 32 for product word counts).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the buffer is empty (should not occur for valid product entropy).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Borrow the entropy bytes (do not log or persist outside SeedVault AEAD).
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl AsRef<[u8]> for EntropyBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl fmt::Debug for EntropyBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EntropyBytes([REDACTED])")
+    }
+}
+
 /// Optional BIP-39 passphrase for product derive/sign paths.
 ///
 /// Debug is redacted. Drop zeroizes via [`secrecy`]. Never log [`Self::expose`].
@@ -90,6 +124,41 @@ impl MnemonicSecret {
         let m = Mnemonic::parse_normalized(self.expose())
             .expect("MnemonicSecret always holds a validated phrase");
         m.to_seed(passphrase)
+    }
+
+    /// Export BIP-39 entropy bytes (16 for 12-word, 32 for 24-word).
+    ///
+    /// Returns [`EntropyBytes`] (zeroized on drop; `Debug` redacted). Rejects
+    /// unexpected lengths so SeedVault never writes an unreadable entropy blob.
+    /// Callers must not log or persist outside SeedVault AEAD / unlock paths.
+    pub fn to_entropy(&self) -> Result<EntropyBytes> {
+        let m = Mnemonic::parse_normalized(self.expose())
+            .expect("MnemonicSecret always holds a validated phrase");
+        let ent = m.to_entropy();
+        if ent.len() != 16 && ent.len() != 32 {
+            return Err(WalletError::Entropy(format!(
+                "BIP-39 entropy must be 16 or 32 bytes (12 or 24 words), got {}",
+                ent.len()
+            )));
+        }
+        Ok(EntropyBytes(zeroize::Zeroizing::new(ent)))
+    }
+
+    /// Reconstruct a validated mnemonic from BIP-39 entropy bytes.
+    ///
+    /// Accepts **16** (12 words) or **32** (24 words) only — matches product
+    /// word-count policy. Intermediate phrase is held only inside the returned
+    /// [`MnemonicSecret`].
+    pub fn from_entropy(entropy: &[u8]) -> Result<Self> {
+        if entropy.len() != 16 && entropy.len() != 32 {
+            return Err(WalletError::Entropy(format!(
+                "BIP-39 entropy must be 16 or 32 bytes (12 or 24 words), got {}",
+                entropy.len()
+            )));
+        }
+        let mnemonic = Mnemonic::from_entropy(entropy)
+            .map_err(|e| WalletError::InvalidMnemonic(e.to_string()))?;
+        Ok(Self::from_validated(mnemonic.to_string()))
     }
 
     /// Consume into owned phrase string (caller must zeroize when done).
@@ -255,5 +324,62 @@ mod tests {
             m.expose(),
             "leader monkey parrot ring guide accident before fence cannon height naive bean"
         );
+    }
+
+    #[test]
+    fn entropy_roundtrip_twelve_and_twenty_four() {
+        let m12 = generate_mnemonic().unwrap();
+        let ent12 = m12.to_entropy().unwrap();
+        assert_eq!(ent12.len(), 16);
+        let back12 = MnemonicSecret::from_entropy(ent12.as_ref()).unwrap();
+        assert_eq!(back12.expose(), m12.expose());
+        assert_eq!(back12.word_count(), 12);
+
+        let m24 = generate_mnemonic_with_word_count(24).unwrap();
+        let ent24 = m24.to_entropy().unwrap();
+        assert_eq!(ent24.len(), 32);
+        let back24 = MnemonicSecret::from_entropy(ent24.as_ref()).unwrap();
+        assert_eq!(back24.expose(), m24.expose());
+        assert_eq!(back24.word_count(), 24);
+    }
+
+    #[test]
+    fn from_entropy_rejects_bad_length() {
+        assert!(matches!(
+            MnemonicSecret::from_entropy(&[0u8; 15]),
+            Err(WalletError::Entropy(_))
+        ));
+        assert!(matches!(
+            MnemonicSecret::from_entropy(&[0u8; 20]),
+            Err(WalletError::Entropy(_))
+        ));
+    }
+
+    #[test]
+    fn known_mnemonic_entropy_matches_bip39() {
+        let phrase =
+            "leader monkey parrot ring guide accident before fence cannon height naive bean";
+        let m = import_mnemonic(phrase).unwrap();
+        let ent = m.to_entropy().unwrap();
+        assert_eq!(ent.len(), 16);
+        let rebuilt = MnemonicSecret::from_entropy(ent.as_ref()).unwrap();
+        assert_eq!(rebuilt.expose(), phrase);
+    }
+
+    #[test]
+    fn entropy_bytes_debug_redacts() {
+        let m = generate_mnemonic().unwrap();
+        let ent = m.to_entropy().unwrap();
+        let dbg = format!("{ent:?}");
+        assert!(dbg.contains("REDACTED"));
+        // Must not dump raw entropy hex/debug of the Vec.
+        assert!(!dbg.contains("Zeroizing"));
+        for b in ent.as_slice() {
+            // Debug string must not include decimal byte dumps of the secret.
+            assert!(
+                !dbg.contains(&format!("{b},")),
+                "Debug must not leak entropy bytes"
+            );
+        }
     }
 }

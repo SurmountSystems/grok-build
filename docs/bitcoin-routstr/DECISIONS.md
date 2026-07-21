@@ -19,11 +19,26 @@ them.
 
 ## ADR-002: SeedVault separate from CredentialsStore
 
-**Context:** `CredentialsStore` plaintext-mirrors to JSON.
+**Context:** `CredentialsStore` is the OpenRouter-style hot API-key store:
+OS keyring service `grok-build` **and** a plaintext mirror at
+`$GROK_HOME/provider_credentials.json`. API is UTF-8 strings only. Zed’s
+OpenRouter keys live under a **different** schema (`zed-github-account` /
+platform keychain); Grok only **probes** them read-only via `harness_secrets`
+and never writes Zed.
 
-**Decision:** BIP-39 never uses that mirror. New SeedVault: keyring / AEAD only.
+**Decision:** Wallet seed material (BIP-39 mnemonic, raw entropy, LDK seed)
+**never** uses CredentialsStore or Zed stores. SeedVault uses a **dedicated**
+keyring service plus optional password AEAD file. AEAD path must pass
+`assert_allowed_seed_storage_path` (refuses `provider_credentials.json`,
+`watch_session.json`, `config.toml`). Payload is **seed material only**
+(AEAD v1 = phrase UTF-8; AEAD v2 = raw BIP-39 entropy 16/32 bytes via
+`store_aead_entropy`; keyring stays phrase for OS UX). BIP-39 passphrase is
+unlock env/API only (never SeedVault / watch session / CredentialsStore at
+rest). Entropy encoding is **landed** for AEAD (still never CredentialsStore).
 
-**Consequences:** Two secret APIs; must educate contributors.
+**Consequences:** Two secret APIs; contributors must not “just put seed in
+CredentialsStore because OpenRouter is in the keyring.” See
+[AUTOMATIC_FUNDING.md](./AUTOMATIC_FUNDING.md) secret-stores section.
 
 ---
 
@@ -109,9 +124,28 @@ txid/address deep links; trait for future local node/index backends.
 **Context:** Users already know Grok 4.5; Routstr is the Bitcoin payment path.
 
 **Decision:** Curated catalog row targets Grok 4.5 on Routstr (slug from live
-`/v1/models`). Not product-wide default model.
+`/v1/models`). Not product-wide default model. Select via model picker /
+`/model` / `-m` like OpenRouter and xAI — **no auto-switch** after funding.
 
 **Consequences:** Must verify slug availability; fallback messaging if absent.
+
+---
+
+## ADR-011: Invoice-first automatic funding (no website)
+
+**Context:** Full deposit → channel → CDK is residual (LDK/CDK not live). Users
+should not need docs.routstr.com. Node OpenAPI already supports
+`POST /lightning/invoice` + status `api_key` and Cashu balance create/topup/refund.
+
+**Decision:** v1 product automation is **Routstr node HTTP first**: create/poll
+invoice, store `sk-`, balance chrome, 402/low-balance topup when Routstr model
+is active. Wire remaining balance APIs (Cashu create/topup/refund, recover)
+before requiring LDK. Local LDK pay and CDK mint are later phases. Model stays
+user-selected (ADR-010).
+
+**Consequences:** External LN wallet still pays the in-app BOLT11 until Phase C.
+North-star in FUNDING_FLOW remains long-term; see
+[AUTOMATIC_FUNDING.md](./AUTOMATIC_FUNDING.md) for PR sequence.
 
 ---
 
@@ -120,7 +154,8 @@ txid/address deep links; trait for future local node/index backends.
 | Idea | Why rejected |
 |------|----------------|
 | LN-only, no on-chain address | Fails when channels empty; approval requires address fallback |
-| Seed in CredentialsStore JSON | Plaintext disk |
+| Seed in CredentialsStore / JSON mirror | Plaintext disk + wrong threat domain (hot API keys) |
+| Seed in Zed keyring schema | Wrong owner; Grok must not write Zed stores |
 | BOLT12 required for v1 | Blocks shipping if peer/LDK lack offers |
 | Auto-generate seed on first `grok` launch | No backup consent |
 | Full Nostr social client | Out of scope |

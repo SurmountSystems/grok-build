@@ -134,6 +134,45 @@ pub(crate) fn is_openrouter_credit_error(message: &str) -> bool {
     m.contains("openrouter") || m.contains("can only afford") || m.contains("fewer max_tokens")
 }
 
+/// True when the credit error clearly came from Routstr (not xAI weekly pool).
+#[allow(dead_code)] // Available for prompt/retry routing; model-id path is primary.
+pub(crate) fn is_routstr_credit_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("routstr") || m.contains("api.routstr.com")
+}
+
+/// Routstr prepaid float exhausted: offer in-app topup (no website). Keep Grok
+/// API failover as the automatic escape hatch.
+pub(super) fn open_routstr_credit_upsell(agent: &mut AgentView, grok_usage_pct: Option<f64>) {
+    use crate::scrollback::block::RenderBlock;
+
+    let mut body =
+        "Routstr prepaid float is too low for this request (HTTP 402 / credit block).".to_string();
+    if let Some(pct) = grok_usage_pct {
+        body.push_str(&format!(
+            " Grok API usage is at {pct:.0}%. Failover to the Grok API runs automatically when XAI_API_KEY or a signed-in session is available."
+        ));
+    } else {
+        body.push_str(
+            " Failover to the Grok API runs automatically when XAI_API_KEY or a signed-in session is available.",
+        );
+    }
+    body.push_str(
+        " Top up in-app: /routstr topup (or `grok routstr topup`) — pay the BOLT11 with any Lightning wallet. No website required.",
+    );
+
+    log_event(xai_grok_telemetry::events::CreditLimitUpsellShown {
+        surface: xai_grok_telemetry::events::CreditLimitUpsellSurface::InlineCard,
+        max_tier: false,
+        pay_as_you_go: false,
+        unified_billing: false,
+    });
+    agent.scrollback.push_block(RenderBlock::system(
+        "Routstr credits exhausted. Use /routstr topup to create a Lightning invoice.",
+    ));
+    agent.scrollback.push_block(RenderBlock::system(body));
+}
+
 /// OpenRouter / third-party credit failure: do **not** claim SuperGrok weekly
 /// limit. Point at OpenRouter credits and mention first-party Grok API if
 /// that balance is known.
@@ -619,13 +658,26 @@ pub(super) fn handle_credit_limit_recheck_complete(
             agent.session.enqueue_in_flight_prompt_front(prompt);
         }
     } else if !user_moved_on {
-        let openrouter_model = agent
+        let model_id = agent
             .session
             .models
             .current
             .as_ref()
-            .is_some_and(|id| xai_grok_shell::auth::is_openrouter_catalog_id(id.0.as_ref()));
-        if openrouter_model {
+            .map(|id| id.0.as_ref().to_owned());
+        let openrouter_model = model_id
+            .as_deref()
+            .is_some_and(xai_grok_shell::auth::is_openrouter_catalog_id);
+        let routstr_model = model_id
+            .as_deref()
+            .is_some_and(xai_grok_shell::auth::is_routstr_catalog_id);
+        if routstr_model {
+            let grok_pct = agent
+                .credit_balance
+                .as_ref()
+                .or(app.credit_balance.as_ref())
+                .map(|b| b.usage_pct);
+            open_routstr_credit_upsell(agent, grok_pct);
+        } else if openrouter_model {
             let grok_pct = agent
                 .credit_balance
                 .as_ref()

@@ -1,0 +1,70 @@
+# Maintainer: Hunter Beast <hunter@surmount.systems>
+# Optional out-of-process LDK helper for Grok OSS (Surmount). Not on default monorepo CI.
+# VCS package (-git): tracks main; regenerate .SRCINFO at AUR publish time.
+
+pkgname=grok-bitcoin-ldk-node-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Out-of-process LDK BOLT11 pay/receive helper for grok-bitcoin-wallet (Surmount)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/SurmountSystems/grok-oss'
+license=('Apache-2.0')
+depends=()
+makedepends=('cargo' 'git' 'pkgconf' 'cmake' 'perl')
+provides=('grok-bitcoin-ldk-node')
+conflicts=('grok-bitcoin-ldk-node')
+# Isolated excluded crate — owns ldk-node + rusqlite 0.31; never a monorepo workspace member.
+source=("${pkgname}::git+https://github.com/SurmountSystems/grok-oss.git#branch=main")
+sha256sums=('SKIP')
+options=('!lto') # large Rust graph; match monorepo helper profile
+
+pkgver() {
+  cd "$pkgname"
+  local cargo_ver
+  cargo_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codegen/grok-bitcoin-ldk-node/Cargo.toml | head -1 | tr '-' '.')"
+  local rev count
+  rev="$(git rev-parse --short HEAD)"
+  count="$(git rev-list --count HEAD)"
+  printf "%s.r%s.g%s" "${cargo_ver:-0.1.0}" "$count" "$rev"
+}
+
+prepare() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  # Own Cargo.toml/lock under the excluded crate (not monorepo workspace).
+  cargo fetch --locked --manifest-path crates/codegen/grok-bitcoin-ldk-node/Cargo.toml \
+    --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --release --locked \
+    --manifest-path crates/codegen/grok-bitcoin-ldk-node/Cargo.toml
+}
+
+check() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo test --release --locked \
+    --manifest-path crates/codegen/grok-bitcoin-ldk-node/Cargo.toml
+}
+
+package() {
+  # Install binary name without -git suffix (product env expects this path).
+  install -Dm755 "$srcdir/target/release/grok-bitcoin-ldk-node" \
+    "$pkgdir/usr/bin/grok-bitcoin-ldk-node"
+  install -Dm644 "$pkgname/crates/codegen/grok-bitcoin-ldk-node/README.md" \
+    "$pkgdir/usr/share/doc/$pkgname/README.md"
+  if [[ -f "$pkgname/LICENSE" ]]; then
+    install -Dm644 "$pkgname/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  fi
+}
+
+# After install, product wallet (feature ldk) finds the helper via PATH or:
+#   export GROK_BITCOIN_LDK_NODE_BIN=/usr/bin/grok-bitcoin-ldk-node
+#
+# Also available via Nix: nix build .#grok-bitcoin-ldk-node
+# Do not enable feature ldk on default monorepo CI packages.

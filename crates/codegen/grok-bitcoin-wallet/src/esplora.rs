@@ -8,6 +8,10 @@
 //! (`GET /address/{addr}/utxo`); parsing reuses
 //! [`crate::descriptor_wallet::parse_mempool_address_utxos`].
 //!
+//! Script-history paths used by BDK full_scan (feature `bdk`):
+//! - `GET /address/{addr}/txs` — tx summaries for a script/address
+//! - `GET /tx/{txid}/hex` — raw transaction hex for apply_update
+//!
 //! Broadcast: `POST /tx` with raw transaction hex body (Esplora REST convention;
 //! same shape as mempool.space `POST /api/tx`). Response body is a 64-hex txid.
 
@@ -19,7 +23,8 @@ use crate::error::{Result, WalletError};
 #[cfg(feature = "esplora")]
 use crate::explorer::{BroadcastHttpOutcome, broadcast_outcome_from_http};
 use crate::explorer::{
-    BroadcastResult, TxBroadcaster, parse_broadcast_txid_body, validate_raw_tx_hex,
+    BroadcastResult, TxBroadcaster, is_valid_txid_hex, parse_broadcast_txid_body,
+    validate_raw_tx_hex,
 };
 use crate::watcher::parse_tip_height;
 
@@ -48,6 +53,11 @@ pub trait EsploraTransport {
 ///
 /// Maps exact paths to fixture bodies. Missing paths and scripted failures are
 /// hard errors — never silently invent empty UTXO lists or broadcast success.
+///
+/// **BDK full_scan helpers:** set [`Self::default_empty_address_txs`] so missing
+/// `GET /address/.../txs` paths return `"[]"` (empty history) without pre-seeding
+/// every stop-gap look-ahead address. Explicit `fail_paths` / `fixtures` still
+/// win. Missing tip / tx-hex / utxo paths remain hard errors.
 #[derive(Debug, Default)]
 pub struct MockEsploraTransport {
     /// Exact path → response body (GET).
@@ -62,11 +72,19 @@ pub struct MockEsploraTransport {
     pub post_fail_paths: BTreeMap<String, String>,
     /// Recorded POST `(path, body)` pairs (order preserved).
     pub post_calls: Vec<(String, String)>,
+    /// When true, missing `/address/{addr}/txs` GETs return `"[]"` (BDK full_scan).
+    pub default_empty_address_txs: bool,
 }
 
 impl MockEsploraTransport {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enable empty default for missing address-txs paths (BDK full_scan tests).
+    pub fn with_default_empty_address_txs(mut self) -> Self {
+        self.default_empty_address_txs = true;
+        self
     }
 
     /// Insert a successful GET fixture body for `path`.
@@ -96,9 +114,15 @@ impl EsploraTransport for MockEsploraTransport {
         if let Some(msg) = self.fail_paths.get(path) {
             return Err(WalletError::Explorer(msg.clone()));
         }
-        self.fixtures.get(path).cloned().ok_or_else(|| {
-            WalletError::Explorer(format!("mock esplora: no fixture for path {path}"))
-        })
+        if let Some(body) = self.fixtures.get(path) {
+            return Ok(body.clone());
+        }
+        if self.default_empty_address_txs && is_esplora_address_txs_path(path) {
+            return Ok("[]".to_owned());
+        }
+        Err(WalletError::Explorer(format!(
+            "mock esplora: no fixture for path {path}"
+        )))
     }
 
     fn post_text(&mut self, path: &str, body: &str) -> Result<String> {
@@ -146,6 +170,103 @@ pub fn esplora_address_utxo_path(address: &str) -> Result<String> {
     Ok(format!("/address/{address}/utxo"))
 }
 
+/// Esplora confirmed-history page size (Blockstream / electrs REST convention).
+///
+/// Full address history paginates with [`esplora_address_txs_chain_path`] while
+/// each page returns this many items.
+pub const ESPLORA_TXS_PAGE_SIZE: usize = 25;
+
+/// Hard cap on Esplora history pages per address (first page + chain pages).
+///
+/// ~25 × 40 = 1000 txs. Hitting the cap with a full last page is a hard error
+/// (never silently truncates history).
+pub const ESPLORA_MAX_TX_PAGES: usize = 40;
+
+/// Build Esplora path for address transaction history: `/address/{addr}/txs`.
+///
+/// First page: mempool txs + up to [`ESPLORA_TXS_PAGE_SIZE`] confirmed (newest
+/// first). Same path-segment gate as [`esplora_address_utxo_path`]. Used by BDK
+/// full_scan (feature `bdk`); continue with [`esplora_address_txs_chain_path`].
+pub fn esplora_address_txs_path(address: &str) -> Result<String> {
+    let address = validate_esplora_address_path_segment(address)?;
+    Ok(format!("/address/{address}/txs"))
+}
+
+/// Build Esplora confirmed-history continuation:
+/// `/address/{addr}/txs/chain/{last_txid}`.
+///
+/// `last_txid` is the oldest txid from the previous page (Esplora pagination
+/// cursor). Path-segment gates on address and 64-hex txid.
+pub fn esplora_address_txs_chain_path(address: &str, last_txid: &str) -> Result<String> {
+    let address = validate_esplora_address_path_segment(address)?;
+    let t = last_txid.trim();
+    if !is_valid_txid_hex(t) {
+        return Err(WalletError::Explorer(format!(
+            "esplora address txs chain path: last_txid must be 64 hex chars, got len {} / non-hex",
+            t.len()
+        )));
+    }
+    Ok(format!(
+        "/address/{address}/txs/chain/{}",
+        t.to_ascii_lowercase()
+    ))
+}
+
+/// Build Esplora path for raw transaction hex: `/tx/{txid}/hex`.
+///
+/// `txid` must be 64 ASCII hex chars (path-safe). Rejects injection.
+pub fn esplora_tx_hex_path(txid: &str) -> Result<String> {
+    let t = txid.trim();
+    if !is_valid_txid_hex(t) {
+        return Err(WalletError::Explorer(format!(
+            "esplora tx hex path: txid must be 64 hex chars, got len {} / non-hex",
+            t.len()
+        )));
+    }
+    Ok(format!("/tx/{}/hex", t.to_ascii_lowercase()))
+}
+
+/// True when `path` is an Esplora address history path:
+/// `/address/{seg}/txs` or `/address/{seg}/txs/chain[/{txid}]`.
+///
+/// Used by mock default-empty behavior and offline path classification.
+pub fn is_esplora_address_txs_path(path: &str) -> bool {
+    let p = path.trim();
+    let Some(rest) = p.strip_prefix("/address/") else {
+        return false;
+    };
+    let Some((seg, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    if seg.is_empty() || !seg.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    if tail == "txs" {
+        return true;
+    }
+    // txs/chain or txs/chain/{64hex}
+    let Some(after) = tail.strip_prefix("txs/chain") else {
+        return false;
+    };
+    if after.is_empty() {
+        return true;
+    }
+    let Some(txid) = after.strip_prefix('/') else {
+        return false;
+    };
+    is_valid_txid_hex(txid)
+}
+
+/// One item from Esplora `GET /address/{addr}/txs` (or chain page).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EsploraTxHistoryEntry {
+    pub txid: String,
+    /// Confirmed block height when `status.confirmed` and height present.
+    /// `None` = unconfirmed / mempool (or confirmed without height — treated
+    /// as unconfirmed for confirmation math honesty).
+    pub block_height: Option<u32>,
+}
+
 /// Build Esplora path for chain tip height: `/blocks/tip/height`.
 pub fn esplora_tip_height_path() -> &'static str {
     "/blocks/tip/height"
@@ -157,6 +278,76 @@ pub fn esplora_tip_height_path() -> &'static str {
 /// (same parse as mempool.space `POST /api/tx`).
 pub fn esplora_broadcast_tx_path() -> &'static str {
     "/tx"
+}
+
+/// Parse Esplora / mempool.space address txs JSON into ordered unique entries
+/// (first-seen order), including confirmation height when present.
+///
+/// Item shape: `{"txid":"…", "status":{"confirmed":bool,"block_height":N}, …}`.
+/// Empty array → empty vec (honest "no history"). Malformed JSON / non-array /
+/// missing/invalid txid → hard error (never invents empty Success from garbage).
+pub fn parse_esplora_address_txs_entries(body: &str) -> Result<Vec<EsploraTxHistoryEntry>> {
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|e| WalletError::Explorer(format!("esplora address txs JSON parse: {e}")))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| WalletError::Explorer("esplora address txs: expected JSON array".into()))?;
+    let mut out = Vec::with_capacity(arr.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for item in arr {
+        let txid = item
+            .get("txid")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| WalletError::Explorer("esplora address txs item missing txid".into()))?
+            .trim();
+        if !is_valid_txid_hex(txid) {
+            return Err(WalletError::Explorer(format!(
+                "esplora address txs txid must be 64 hex chars, got len {} / non-hex",
+                txid.len()
+            )));
+        }
+        let lower = txid.to_ascii_lowercase();
+        if !seen.insert(lower.clone()) {
+            continue;
+        }
+        let block_height = parse_esplora_tx_status_block_height(item);
+        out.push(EsploraTxHistoryEntry {
+            txid: lower,
+            block_height,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse Esplora address txs JSON into ordered unique txids (first-seen order).
+///
+/// Convenience over [`parse_esplora_address_txs_entries`] when only ids matter.
+pub fn parse_esplora_address_txs_txids(body: &str) -> Result<Vec<String>> {
+    Ok(parse_esplora_address_txs_entries(body)?
+        .into_iter()
+        .map(|e| e.txid)
+        .collect())
+}
+
+/// Extract confirmed block height from one Esplora address-txs item.
+///
+/// Requires `status.confirmed == true` **and** a present `block_height`.
+/// Otherwise returns `None` (mempool / unconfirmed / incomplete status).
+fn parse_esplora_tx_status_block_height(item: &serde_json::Value) -> Option<u32> {
+    let status = item.get("status")?;
+    let confirmed = status.get("confirmed").and_then(|c| c.as_bool())?;
+    if !confirmed {
+        return None;
+    }
+    let h = status.get("block_height")?;
+    let n = h
+        .as_u64()
+        .or_else(|| h.as_i64().and_then(|i| u64::try_from(i).ok()))
+        .or_else(|| h.as_str()?.parse().ok())?;
+    if n == 0 {
+        return None;
+    }
+    u32::try_from(n).ok()
 }
 
 /// Join `base_url` (no trailing slash required) with an absolute `path`
@@ -460,6 +651,18 @@ mod tests {
             esplora_address_utxo_path("bc1qtest").unwrap(),
             "/address/bc1qtest/utxo"
         );
+        assert_eq!(
+            esplora_address_txs_path("bc1qtest").unwrap(),
+            "/address/bc1qtest/txs"
+        );
+        assert_eq!(
+            esplora_address_txs_chain_path("bc1qtest", TXID_A).unwrap(),
+            format!("/address/bc1qtest/txs/chain/{TXID_A}")
+        );
+        assert_eq!(
+            esplora_tx_hex_path(TXID_A).unwrap(),
+            format!("/tx/{TXID_A}/hex")
+        );
         assert_eq!(esplora_tip_height_path(), "/blocks/tip/height");
         assert_eq!(esplora_broadcast_tx_path(), "/tx");
         // Join broadcast path under a fixed base (no path injection).
@@ -467,6 +670,52 @@ mod tests {
             esplora_join_url("https://blockstream.info/api", esplora_broadcast_tx_path()),
             "https://blockstream.info/api/tx"
         );
+        assert!(is_esplora_address_txs_path("/address/bc1qtest/txs"));
+        assert!(is_esplora_address_txs_path(&format!(
+            "/address/bc1qtest/txs/chain/{TXID_A}"
+        )));
+        assert!(!is_esplora_address_txs_path("/address/bc1qtest/utxo"));
+        assert!(!is_esplora_address_txs_path("/tx/abc/hex"));
+        assert!(esplora_address_txs_chain_path("bc1qtest", "short").is_err());
+    }
+
+    #[test]
+    fn parse_address_txs_txids_and_tx_hex_path_gates() {
+        let body = format!(
+            r#"[{{"txid":"{TXID_A}","status":{{"confirmed":true,"block_height":100}}}},{{"txid":"{TXID_B}","status":{{"confirmed":false}}}}]"#
+        );
+        let ids = parse_esplora_address_txs_txids(&body).unwrap();
+        assert_eq!(ids, vec![TXID_A.to_owned(), TXID_B.to_owned()]);
+        let entries = parse_esplora_address_txs_entries(&body).unwrap();
+        assert_eq!(entries[0].block_height, Some(100));
+        assert_eq!(entries[1].block_height, None);
+        assert!(parse_esplora_address_txs_txids("[]").unwrap().is_empty());
+        assert!(parse_esplora_address_txs_txids("not-json").is_err());
+        assert!(parse_esplora_address_txs_txids(r#"{"txid":"x"}"#).is_err());
+        assert!(parse_esplora_address_txs_txids(r#"[{"txid":"zz"}]"#).is_err());
+        // Uppercase txid path normalizes.
+        let upper = TXID_A.to_ascii_uppercase();
+        assert_eq!(
+            esplora_tx_hex_path(&upper).unwrap(),
+            format!("/tx/{TXID_A}/hex")
+        );
+        assert!(esplora_tx_hex_path("short").is_err());
+        assert!(esplora_tx_hex_path("../evil").is_err());
+    }
+
+    #[test]
+    fn mock_default_empty_address_txs() {
+        let mock = MockEsploraTransport::new().with_default_empty_address_txs();
+        let mut t = mock;
+        assert_eq!(t.get_text("/address/bc1qempty/txs").unwrap(), "[]");
+        assert_eq!(
+            t.get_text(&format!("/address/bc1qempty/txs/chain/{TXID_A}"))
+                .unwrap(),
+            "[]"
+        );
+        // Non-txs paths still hard-error without fixture.
+        assert!(t.get_text("/blocks/tip/height").is_err());
+        assert!(t.get_text(&format!("/tx/{TXID_A}/hex")).is_err());
     }
 
     #[test]

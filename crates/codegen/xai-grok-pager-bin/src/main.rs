@@ -1947,9 +1947,13 @@ async fn async_main() -> Result<()> {
                     RoutstrCommand::Topup {
                         sats,
                         status,
+                        recover,
                         no_poll,
                     } => {
-                        if let Some(id) = status {
+                        if let Some(bolt11) = recover {
+                            xai_grok_shell::auth::run_routstr_topup_recover(&bolt11)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        } else if let Some(id) = status {
                             xai_grok_shell::auth::run_routstr_topup_status(&id)
                                 .map_err(|e| anyhow::anyhow!("{e}"))?;
                         } else {
@@ -1957,9 +1961,49 @@ async fn async_main() -> Result<()> {
                                 .map_err(|e| anyhow::anyhow!("{e}"))?;
                         }
                     }
-                    RoutstrCommand::Refund => {
-                        xai_grok_shell::auth::run_routstr_refund()
+                    RoutstrCommand::Setup { sats, no_poll } => {
+                        match xai_grok_shell::auth::ensure_routstr_ready_with_options(
+                            sats,
+                            !no_poll,
+                            xai_grok_shell::auth::ROUTSTR_READY_MIN_MSATS,
+                        ) {
+                            Ok(xai_grok_shell::auth::RoutstrReadyOutcome::FeatureDisabled) => {
+                                return Err(anyhow::anyhow!(
+                                    "Routstr is disabled (`[features] routstr_enabled = false`)"
+                                ));
+                            }
+                            Ok(_) => {}
+                            Err(e) => return Err(anyhow::anyhow!("{e}")),
+                        }
+                    }
+                    RoutstrCommand::Redeem { cashu_token } => {
+                        let mut cashu_token = cashu_token;
+                        let result = xai_grok_shell::auth::run_routstr_redeem(&cashu_token)
+                            .map_err(|e| anyhow::anyhow!("{e}"));
+                        // Scrub clap-owned bearer buffer after redeem (product never
+                        // re-uses it; argv may still retain a third copy in process).
+                        grok_bitcoin_wallet::mnemonic::zeroize_phrase(&mut cashu_token);
+                        result?;
+                    }
+                    RoutstrCommand::Mint { sats, complete } => {
+                        // Outcome is printed inside run_routstr_mint; map for CLI exit only.
+                        xai_grok_shell::auth::run_routstr_mint(sats, complete.as_deref())
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                    RoutstrCommand::Refund { token, invoice } => {
+                        // Outcome printed inside run_routstr_refund (node token once /
+                        // melt Paid honesty / residual). Never invents float from melt.
+                        // Take ownership so we can zeroize clap-owned token after melt.
+                        let mut token = token;
+                        let result = xai_grok_shell::auth::run_routstr_refund(
+                            token.as_deref(),
+                            invoice.as_deref(),
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e}"));
+                        if let Some(ref mut t) = token {
+                            grok_bitcoin_wallet::mnemonic::zeroize_phrase(t);
+                        }
+                        result?;
                     }
                     RoutstrCommand::Fund => {
                         let grok_home = xai_grok_shell::util::grok_home::grok_home();

@@ -4,6 +4,12 @@
 resolver = "2"
 exclude = [
     "crates/codegen/cargo-mem-guard",
+    # Isolated LDK pay helper: owns ldk-node + rusqlite 0.31; cannot share the
+    # monorepo workspace resolution with shell's rusqlite 0.37 (links=sqlite3).
+    "crates/codegen/grok-bitcoin-ldk-node",
+    # Isolated Cashu CDK mint helper: owns cdk + cdk-sqlite + rusqlite 0.31;
+    # same links=sqlite3 isolation as ldk-node helper.
+    "crates/codegen/grok-bitcoin-cdk-mint",
 ]
 members = [
     "crates/build/xai-proto-build",
@@ -181,7 +187,7 @@ chacha20poly1305 = "0.10"
 hex = "0.4"
 bitcoin = { version = "0.32", default-features = false, features = ["std", "secp-recovery"] }
 qrcode = { version = "0.14", default-features = false }
-nostr = { version = "0.39", default-features = false, features = ["std", "nip06"] }
+nostr = { version = "0.39", default-features = false, features = ["std", "nip06", "nip98"] }
 libc = "0.2"
 linkify = "0.10"
 lipsum = "0.9"

@@ -14,7 +14,9 @@
 //!
 //! [`WatchSessionState`] can be serialized to disk so a deposit watch survives
 //! pager process restarts. The file holds **only** address / network / txid /
-//! confirmation progress — **never** BIP-39 or other seed material.
+//! confirmation progress — **never** BIP-39 mnemonic, BIP-39 passphrase, or
+//! other seed material. SeedVault must not use this path
+//! ([`crate::seed_vault::assert_allowed_seed_storage_path`]).
 
 use std::fs;
 use std::io::Write;
@@ -1494,8 +1496,21 @@ mod watch_session_tests {
         state.validate().unwrap();
 
         let json = serde_json::to_string_pretty(&state).unwrap();
-        assert!(!json.to_ascii_lowercase().contains("mnemonic"));
+        let lower = json.to_ascii_lowercase();
+        // Dual residual: never seed / passphrase fields on watch session disk.
+        assert!(!lower.contains("mnemonic"));
+        assert!(!lower.contains("passphrase"));
+        assert!(!lower.contains("bip39"));
+        assert!(!lower.contains("seed"));
         assert!(!json.contains("leader"));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().expect("watch session object");
+        for forbidden_key in ["mnemonic", "passphrase", "bip39_passphrase", "seed", "nsec"] {
+            assert!(
+                !obj.contains_key(forbidden_key),
+                "watch session must not serialize key {forbidden_key}"
+            );
+        }
         let back: WatchSessionState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.address, state.address);
         assert_eq!(back.network, state.network);

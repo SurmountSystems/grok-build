@@ -4,6 +4,16 @@
 //!
 //! `npub` is exportable; `nsec` / secret hex only through controlled APIs that
 //! return redacted secret wrappers.
+//!
+//! # Product residual
+//!
+//! Library derive + official vectors are green. Pure NIP-98 Authorization
+//! build/parse + request-match live in [`crate::nip98`] (offline-proveable
+//! against the NIP). **Product** Routstr API auth via this identity remains
+//! residual — live Routstr (OpenAPI / routstr-core `validate_bearer_key`)
+//! accepts Bearer `sk-` / `cashu…` only (re-verified 2026-07-20); never invent
+//! signed-auth Success, and never put nsec/seed into CredentialsStore /
+//! `provider_credentials` / watch_session.
 
 use std::fmt;
 

@@ -33,12 +33,49 @@ esplora = ["dep:reqwest"]
 # always available with `onchain-address`. TLS uses pure-Rust rustls + WebPKI
 # roots (no dangerous skip-verify). Do **not** enable in default CI (no forced network).
 electrum = ["dep:rustls", "dep:webpki-roots"]
-# Reserved feature names for future CDK / LDK deps (RESIDUAL.md P3/P4).
-# Empty today: enabling the flag does **not** wire a backend or flip live
-# capability flags. `default_*_backend()` still returns stubs. Do not enable
-# in default CI until real deps land and tests go green.
-cashu-cdk = []
+# Cashu mint path (NUT-04 HTTP quote + optional CDK helper proofs). **Not** default CI.
+#
+# Enables [`cashu::Nut04MintCashu`]: pure NUT-04 mint quote → BOLT11 via
+# injectable transport (product: blocking reqwest POST to mint URL). Sets
+# **`mint_live = true`** when a mint URL is configured via env
+# `GROK_BITCOIN_CASHU_MINT_URL` only (Routstr `/v1/info` mint pick is residual
+# product wire — parser exists, product_default does not fetch).
+# **`proofs_mint_live = true`** when mint URL is set **and** the helper
+# transport reports linked (process transport: binary resolvable via
+# `GROK_BITCOIN_CDK_MINT_BIN` / sibling / PATH — out-of-process CDK +
+# cdk-sqlite / rusqlite 0.31; never monorepo graph). Prefer seed-aware quote
+# (`request_mint_invoice_with_seed`) then `complete_mint_after_pay_with_seed`
+# for localstore continuity. Token only from helper IPC after paid quote; never
+# fabricated. `spend_live` / `refund_live` when helper resolvable (melt IPC PAID-only). Pure
+# parsers always available. Do **not** enable in default CI.
+# Build helper: `cargo build --manifest-path crates/codegen/grok-bitcoin-cdk-mint/Cargo.toml`
+# Env: GROK_BITCOIN_CASHU_MINT_URL, GROK_BITCOIN_CDK_MINT_BIN, GROK_BITCOIN_CDK_STORAGE.
+cashu-cdk = ["dep:reqwest"]
+# LDK BOLT11 pay + invoice-create (RESIDUAL.md P3). **Not** default CI.
+#
+# Enables [`lightning_ldk`] product adapter: SeedVault BIP-39 → out-of-process
+# `grok-bitcoin-ldk-node` helper (excluded crate; owns `ldk-node` + rusqlite
+# 0.31 so shell can keep rusqlite 0.37 / `links=sqlite3`). With this feature,
+# `LdkLightning` sets **`bolt11_pay_live = true`** and **`bolt11_invoice_live =
+# true`** when the helper transport is linked. Pay Success and invoice Created
+# only from helper IPC (`pay_bolt11` / `create_bolt11_invoice`); bare
+# pay/create without seed fail honestly (use `*_with_seed` / SeedVault). Default
+# features: stub backend, invoice-first QR path (P0). Build helper separately:
+#   cargo build --manifest-path crates/codegen/grok-bitcoin-ldk-node/Cargo.toml
+# Env: GROK_BITCOIN_LDK_NODE_BIN, GROK_BITCOIN_LDK_STORAGE, GROK_BITCOIN_LDK_ESPLORA_URL.
 ldk = []
+# Real `bdk_wallet` BIP84 auto-sync (spent-tx history + keychain index).
+# **Not** default CI — keeps monorepo free of forced BDK graph cost / network.
+# Offline-proveable: injectable [`bdk_sync::BdkUpdateSource`] + mock fixtures
+# + Esplora/Electrum full_scan transport adapters (`EsploraBdkUpdateSource` /
+# `ElectrumBdkUpdateSource` over mock transports; pure parsers always).
+# Live HTTP/TCP: compose `bdk` + `esplora` and/or `bdk` + `electrum`
+# (`with_http_base_url` / `with_tcp_addr` / `with_tls_addr`). Does **not** pull
+# `bdk_esplora` / `bdk_electrum`. Default product path remains gap-limit
+# ChainSource (`descriptor_wallet`). Pin: `bdk_wallet` 2.4.x (bitcoin 0.32).
+# Run tests: `cargo test -p grok-bitcoin-wallet --lib --features bdk`
+# Live composite (optional): `--features bdk,esplora` / `--features bdk,electrum`
+bdk = ["dep:bdk_wallet", "onchain-address"]
 
 [dependencies]
 thiserror = { workspace = true }
@@ -66,6 +103,12 @@ rustls = { version = "0.23", optional = true, default-features = false, features
     "tls12",
 ] }
 webpki-roots = { version = "0.26", optional = true }
+# Real BDK wallet engine (feature `bdk` only). default-features=false keeps
+# rusqlite / file_store off the monorepo graph; std is enough for in-memory
+# create_wallet_no_persist + apply_update.
+bdk_wallet = { version = "2.4", optional = true, default-features = false, features = [
+    "std",
+] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

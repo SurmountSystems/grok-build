@@ -108,3 +108,61 @@ jobs:
             nix shell .#just -c just test
             exit $?
           done
+
+  # Isolated LDK pay helper only — NOT a workspace member (rusqlite 0.31 vs
+  # shell 0.37 links=sqlite3). Must never pull ldk-node into the default monorepo
+  # graph or require feature `ldk` on shell/pager quality jobs.
+  ldk-node-helper:
+    name: grok-bitcoin-ldk-node (excluded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache helper target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/codegen/grok-bitcoin-ldk-node -> target
+          # Separate cache key so monorepo quality target is not mixed.
+          prefix-key: ldk-node-helper
+
+      - name: Build + test excluded helper only
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path crates/codegen/grok-bitcoin-ldk-node/Cargo.toml
+          # Ping smoke: helper must report ldk_node_linked without monorepo link.
+          echo '{"v":1,"cmd":"ping"}' | cargo run --manifest-path crates/codegen/grok-bitcoin-ldk-node/Cargo.toml --quiet
+
+  # Isolated Cashu CDK proofs-mint helper — NOT a workspace member (rusqlite 0.31
+  # vs shell 0.37 links=sqlite3). Must never pull cdk/cdk-sqlite into the default
+  # monorepo graph or require feature `cashu-cdk` on shell/pager quality jobs.
+  cdk-mint-helper:
+    name: grok-bitcoin-cdk-mint (excluded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache helper target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/codegen/grok-bitcoin-cdk-mint -> target
+          prefix-key: cdk-mint-helper
+
+      - name: Build + test excluded helper only
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path crates/codegen/grok-bitcoin-cdk-mint/Cargo.toml
+          # Ping smoke: assert ok + cdk_linked (not empty/silent success).
+          out="$(echo '{"v":1,"cmd":"ping"}' | cargo run --manifest-path crates/codegen/grok-bitcoin-cdk-mint/Cargo.toml --quiet)"
+          echo "$out"
+          echo "$out" | grep -q '"ok":true'
+          echo "$out" | grep -q 'cdk_linked'

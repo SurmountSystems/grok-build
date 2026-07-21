@@ -315,11 +315,18 @@ pub fn usage_warning_for_session_with_providers(
 
     if routstr_model {
         let r = routstr?;
-        let text = format!(
-            "Balance left: {}",
-            format_routstr_balance_msats(r.balance_msats)
-        );
         let critical = r.balance_msats <= ROUTSTR_LOW_BALANCE_MSATS;
+        let text = if critical {
+            format!(
+                "Balance left: {} — /routstr topup",
+                format_routstr_balance_msats(r.balance_msats)
+            )
+        } else {
+            format!(
+                "Balance left: {}",
+                format_routstr_balance_msats(r.balance_msats)
+            )
+        };
         return Some((text, critical));
     }
 
@@ -931,7 +938,7 @@ mod tests {
             // Routstr wins over OpenRouter when routstr_model is set.
             Some(("Balance left: 2500 sats".to_string(), false))
         );
-        // Low balance (≤ 1000 sats) → critical.
+        // Low balance (≤ 1000 sats) → critical + topup hint.
         assert_eq!(
             usage_warning_for_session_with_providers(
                 None,
@@ -943,7 +950,7 @@ mod tests {
                 false,
                 true,
             ),
-            Some(("Balance left: 500 sats".to_string(), true))
+            Some(("Balance left: 500 sats — /routstr topup".to_string(), true))
         );
         // Exactly 1000 sats is still low.
         assert_eq!(
@@ -957,7 +964,7 @@ mod tests {
                 false,
                 true,
             ),
-            Some(("Balance left: 1000 sats".to_string(), true))
+            Some(("Balance left: 1000 sats — /routstr topup".to_string(), true))
         );
         // Routstr model without fetched balance → no xAI fallback.
         assert_eq!(

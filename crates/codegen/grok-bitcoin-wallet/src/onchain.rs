@@ -1,7 +1,9 @@
 //! On-chain receive address derivation (BIP84 native segwit).
 //!
-//! Full BDK wallet / sync is residual. This module derives a stable receive
-//! address from BIP-39 seed via `bitcoin` bip32 only.
+//! This module derives a stable receive address from BIP-39 seed via `bitcoin`
+//! bip32 only. Real `bdk_wallet` auto-sync lives in feature-gated `bdk_sync`
+//! (not default CI); Esplora/Electrum BDK full_scan transport adapters land
+//! there behind injectable mocks (live HTTP/TCP compose `bdk`+`esplora`/`electrum`).
 
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use bitcoin::key::CompressedPublicKey;

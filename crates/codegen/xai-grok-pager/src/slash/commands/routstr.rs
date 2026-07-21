@@ -29,11 +29,11 @@ impl SlashCommand for RoutstrCommand {
     }
 
     fn description(&self) -> &str {
-        "Routstr balance, local Bitcoin fund, spend, rbf, cpfp, utxos, top up, refund, watch"
+        "Routstr balance, local Bitcoin fund, spend, rbf, cpfp, utxos, top up, mint, refund/melt, watch"
     }
 
     fn usage(&self) -> &str {
-        "/routstr [balance|fund|unlock|spend|rbf|cpfp|utxos|topup|refund|watch|stop|qr] [args]"
+        "/routstr [balance|fund|unlock|spend|rbf|cpfp|utxos|topup|mint|refund|watch|stop|qr] [args] (refund: optional token=… invoice=… melt)"
     }
 
     fn takes_args(&self) -> bool {
@@ -42,7 +42,7 @@ impl SlashCommand for RoutstrCommand {
 
     fn arg_placeholder(&self) -> Option<&str> {
         Some(
-            "balance | fund | unlock <phrase> | spend <addr> <sats> [broadcast] | rbf <addr> <sats> original-fee=… | cpfp <addr> <sats> parent-fee=… | utxos [--network …] | topup [sats] | refund | watch <addr> | stop | qr [addr]",
+            "balance | fund | unlock <phrase> | spend <addr> <sats> [broadcast] | rbf <addr> <sats> original-fee=… | cpfp <addr> <sats> parent-fee=… | utxos [--network …] | topup [sats] | mint [sats] | refund [token=… invoice=…] | watch <addr> | stop | qr [addr]",
         )
     }
 
@@ -96,6 +96,14 @@ impl SlashCommand for RoutstrCommand {
                     .to_string(),
             },
             ArgItem {
+                display: "mint".to_string(),
+                match_text: "mint".to_string(),
+                insert_text: "mint".to_string(),
+                description:
+                    "Cashu mint quote → pay → proofs → redeem (when live; else P0 topup residual)"
+                        .to_string(),
+            },
+            ArgItem {
                 display: "topup".to_string(),
                 match_text: "topup".to_string(),
                 insert_text: "topup".to_string(),
@@ -105,7 +113,9 @@ impl SlashCommand for RoutstrCommand {
                 display: "refund".to_string(),
                 match_text: "refund".to_string(),
                 insert_text: "refund".to_string(),
-                description: "Refund next steps (no live CDK yet)".to_string(),
+                description:
+                    "Node float refund, or melt: refund token=<cashuA…> invoice=<BOLT11> (never float)"
+                        .to_string(),
             },
             ArgItem {
                 display: "watch".to_string(),
@@ -343,7 +353,51 @@ pub(crate) fn parse_routstr_args(args: &str) -> CommandResult {
             let sats = parts.next().and_then(|s| s.parse::<u64>().ok());
             CommandResult::Action(Action::RoutstrTopup { sats })
         }
-        "refund" => CommandResult::Action(Action::RoutstrRefund),
+        "mint" | "cashu-mint" | "cashu_mint" => {
+            let sats = parts.next().and_then(|s| s.parse::<u64>().ok());
+            CommandResult::Action(Action::RoutstrMint { sats })
+        }
+        "refund" => {
+            let rest: Vec<&str> = parts.collect();
+            match parse_refund_slash_tokens(&rest) {
+                Ok((token, invoice)) => CommandResult::Action(Action::RoutstrRefund {
+                    token: token.map(SensitiveString::new),
+                    invoice,
+                }),
+                Err(e) => CommandResult::Error(format!(
+                    "{e}\nUsage: /routstr refund\n\
+                     Usage: /routstr refund token=<cashuA…> invoice=<BOLT11>\n\
+                     Bare refund = node float (Cashu token once). With token+invoice = local \
+                     melt when live (SeedVault unlock; never credits sk- float).\n\
+                     For melt-only alias: /routstr melt token=… invoice=… (token+invoice required)"
+                )),
+            }
+        }
+        // Melt alias always means local Cashu→BOLT11; never bare node float refund.
+        "melt" => {
+            let rest: Vec<&str> = parts.collect();
+            match parse_refund_slash_tokens(&rest) {
+                Ok((Some(token), Some(invoice))) => CommandResult::Action(Action::RoutstrRefund {
+                    token: Some(SensitiveString::new(token)),
+                    invoice: Some(invoice),
+                }),
+                Ok((None, None)) => CommandResult::Error(
+                    "Usage: /routstr melt token=<cashuA…> invoice=<BOLT11>\n\
+                     Melt requires both token and invoice (local Cashu → BOLT11; never sk- float).\n\
+                     For node float refund use bare: /routstr refund"
+                        .into(),
+                ),
+                Ok((Some(_), None)) | Ok((None, Some(_))) => CommandResult::Error(
+                    "Usage: /routstr melt token=<cashuA…> invoice=<BOLT11>\n\
+                     Both token= and invoice= are required (or use bare /routstr refund for node float)."
+                        .into(),
+                ),
+                Err(e) => CommandResult::Error(format!(
+                    "{e}\nUsage: /routstr melt token=<cashuA…> invoice=<BOLT11>\n\
+                     Melt never credits Routstr sk- float. Bare /routstr refund = node float."
+                )),
+            }
+        }
         "watch" => {
             let Some(address) = parts.next() else {
                 return CommandResult::Error("Usage: /routstr watch <receive-address>".into());
@@ -373,8 +427,92 @@ pub(crate) fn parse_routstr_args(args: &str) -> CommandResult {
             }
         }
         other => CommandResult::Error(format!(
-            "Unknown /routstr argument: {other}. Use balance, fund, unlock, spend, rbf, cpfp, utxos, topup, refund, watch, stop, or qr"
+            "Unknown /routstr argument: {other}. Use balance, fund, unlock, spend, rbf, cpfp, utxos, topup, mint, refund, watch, stop, or qr"
         )),
+    }
+}
+
+/// Parse `/routstr refund` optional melt tokens (pure; offline-testable).
+///
+/// Accepts `token=<cashu…>`, `invoice=<lnbc…>`, and `--token` / `--invoice`
+/// (with `=` or following arg). Both required together or both omitted.
+/// Does **not** put secrets into scrollback — caller wraps token in
+/// [`SensitiveString`].
+fn parse_refund_slash_tokens(tokens: &[&str]) -> Result<(Option<String>, Option<String>), String> {
+    let mut token: Option<String> = None;
+    let mut invoice: Option<String> = None;
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if let Some(v) = t.strip_prefix("token=") {
+            if token.is_some() {
+                return Err("duplicate token=".into());
+            }
+            if v.trim().is_empty() {
+                return Err("empty token= value".into());
+            }
+            token = Some(v.trim().to_owned());
+        } else if let Some(v) = t.strip_prefix("--token=") {
+            if token.is_some() {
+                return Err("duplicate --token".into());
+            }
+            if v.trim().is_empty() {
+                return Err("empty --token value".into());
+            }
+            token = Some(v.trim().to_owned());
+        } else if t == "--token" || t == "token" {
+            i += 1;
+            let Some(v) = tokens.get(i) else {
+                return Err(format!("missing value after {t}"));
+            };
+            if v.trim().is_empty() {
+                return Err("empty token value".into());
+            }
+            if token.is_some() {
+                return Err("duplicate token".into());
+            }
+            token = Some(v.trim().to_owned());
+        } else if let Some(v) = t.strip_prefix("invoice=") {
+            if invoice.is_some() {
+                return Err("duplicate invoice=".into());
+            }
+            if v.trim().is_empty() {
+                return Err("empty invoice= value".into());
+            }
+            invoice = Some(v.trim().to_owned());
+        } else if let Some(v) = t.strip_prefix("--invoice=") {
+            if invoice.is_some() {
+                return Err("duplicate --invoice".into());
+            }
+            if v.trim().is_empty() {
+                return Err("empty --invoice value".into());
+            }
+            invoice = Some(v.trim().to_owned());
+        } else if t == "--invoice" || t == "invoice" {
+            i += 1;
+            let Some(v) = tokens.get(i) else {
+                return Err(format!("missing value after {t}"));
+            };
+            if v.trim().is_empty() {
+                return Err("empty invoice value".into());
+            }
+            if invoice.is_some() {
+                return Err("duplicate invoice".into());
+            }
+            invoice = Some(v.trim().to_owned());
+        } else {
+            return Err(format!("unknown refund argument: {t}"));
+        }
+        i += 1;
+    }
+    match (&token, &invoice) {
+        (Some(_), Some(_)) | (None, None) => Ok((token, invoice)),
+        (Some(_), None) => {
+            Err("token= requires invoice= (or omit both for node float refund)".into())
+        }
+        (None, Some(_)) => {
+            Err("invoice= requires token= (or omit both for node float refund)".into())
+        }
     }
 }
 
@@ -448,7 +586,38 @@ mod tests {
         ));
         assert!(matches!(
             parse_routstr_args("refund"),
-            CommandResult::Action(Action::RoutstrRefund)
+            CommandResult::Action(Action::RoutstrRefund {
+                token: None,
+                invoice: None
+            })
+        ));
+        match parse_routstr_args(
+            "refund token=cashuAabcdefghijklmnopqrstuvwxyz012345 invoice=lnbc1mockdest",
+        ) {
+            CommandResult::Action(Action::RoutstrRefund {
+                token: Some(t),
+                invoice: Some(inv),
+            }) => {
+                assert!(t.as_str().starts_with("cashuA"));
+                assert!(inv.starts_with("lnbc"));
+            }
+            other => panic!("expected melt refund action: {other:?}"),
+        }
+        assert!(matches!(
+            parse_routstr_args("melt token=cashuAabc invoice=lnbc1x"),
+            CommandResult::Action(Action::RoutstrRefund {
+                token: Some(_),
+                invoice: Some(_)
+            })
+        ));
+        // Bare melt must not fall through to node float refund.
+        assert!(matches!(
+            parse_routstr_args("melt"),
+            CommandResult::Error(_)
+        ));
+        assert!(matches!(
+            parse_routstr_args("refund token=cashuAabc"),
+            CommandResult::Error(_)
         ));
         assert!(matches!(
             parse_routstr_args("watch bc1qtestaddress000000000000000000000"),

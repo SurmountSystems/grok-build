@@ -5,7 +5,13 @@
 **Seamless out-of-the-box:** user pays for **Routstr Grok 4.5** inference using
 keys generated locally in Grok OSS, without manually juggling five wallets.
 
-## Happy path (v1 target)
+**v1 product path (approved):** use **Routstr node Lightning invoice APIs**
+(create → pay QR → poll → store `sk-`) and pick Grok 4.5 on Routstr in the
+model picker. Full deposit → channel → CDK below is the **long-term** path
+(LDK/CDK residual). Canonical sequence:
+[AUTOMATIC_FUNDING.md](./AUTOMATIC_FUNDING.md) (ADR-011).
+
+## Happy path (long-term target)
 
 ```
                     ┌─────────────────────┐
@@ -132,8 +138,8 @@ keys generated locally in Grok OSS, without manually juggling five wallets.
   feature is built (mempool `POST /api/tx`, Esplora `POST /tx`, Electrum
   `blockchain.transaction.broadcast`). Default remains mempool-only with no
   feature flip.
-- Product on-chain **spend** UTXO discovery: gap-limit ChainSource sync
-  (`sync_with_gap_extend` via `select_and_prepare_bip84_spend_with_gap_sync`)
+- Product on-chain **spend** UTXO discovery (**default**): gap-limit ChainSource
+  sync (`sync_with_gap_extend` via `select_and_prepare_bip84_spend_with_gap_sync`)
   with BIP44-style default look-ahead 20 and hard `MAX_ADDRESS_GAP` **before**
   coin select/sign. Recovers deep receive/change indices when activity sits near
   the look-ahead tip of the current window. Coin select uses the final sync
@@ -142,8 +148,19 @@ keys generated locally in Grok OSS, without manually juggling five wallets.
   authoritative as of that final list). On insufficient funds / no UTXOs
   after a successful extend, structured `GapSyncSpendFailure::AfterSync` still
   surfaces honest hit-max / extended-window notices (not success-path only).
-  **Not** full `bdk_wallet` auto-sync (no spent-tx history / script scan).
   RBF/CPFP keep explicit prevouts and do not re-extend.
+- Optional **`bdk_wallet` auto-sync** (feature `bdk`, not default CI): real BDK
+  engine with spent-tx history + keychain index (`bdk_sync` module). Injectable
+  `BdkUpdateSource` + Esplora/Electrum full_scan transport adapters (offline mock
+  green; live HTTP/TCP compose `bdk`+`esplora` / `bdk`+`electrum`, not default CI).
+  Product helpers `list_bip84_utxos_with_bdk_sync` /
+  `select_and_prepare_bip84_spend_with_bdk_sync` feed the same prepare-from-snapshot
+  path. **Shell/CLI prefer-BDK wire landed:** rebuild product with
+  `--features bdk,esplora` (or `bdk,electrum`) and set
+  `GROK_BITCOIN_UTXO_SYNC=bdk` (empty/unset → **gap**). Chain source must be
+  esplora or electrum (mempool + bdk fails closed with residual guidance).
+  Prefer-BDK without feature → structured residual. Default monorepo CI stays
+  gap-limit only (`bdk` off).
 
 ## Non-goals for this flow
 

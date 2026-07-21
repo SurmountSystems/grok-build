@@ -402,10 +402,14 @@ pub fn topup_next_steps_lines(sats: Option<u64>) -> Vec<String> {
     )
 }
 
-/// Capability-aware top-up lines. Live mint invoice only when Cashu reports
+/// Capability-aware top-up lines. Live mint **quote** only when Cashu reports
 /// `mint_live` **and** returns [`crate::cashu::MintQuoteOutcome::Invoice`].
 ///
-/// Never fabricates a BOLT11 from a stub outcome.
+/// Never fabricates a BOLT11 from a stub outcome. NUT-04 quote success is
+/// **not** Routstr float credit. When `proofs_mint_live`, product copy points
+/// at paid-quote → `cashuA` via CDK helper then **redeem** (float only after
+/// redeem). Mint Failed/Unsupported falls through to the P0 Routstr node
+/// invoice path.
 pub fn topup_next_steps_for_backends(
     cashu: &dyn crate::cashu::CashuBackend,
     ln: &dyn crate::lightning::LightningCapability,
@@ -413,112 +417,147 @@ pub fn topup_next_steps_for_backends(
 ) -> Vec<String> {
     let cashu_caps = cashu.capabilities();
     let ln_caps = ln.capabilities();
+    // Honest mint-failure preamble; always fall through to P0 residual so float
+    // funding remains discoverable (mirror LDK bare-create fail-through).
+    let mut mint_failure_preamble: Vec<String> = Vec::new();
 
     // Prefer a real Cashu mint quote when the backend is live.
     if cashu_caps.mint_live {
         match cashu.request_mint_invoice(sats) {
             Ok(crate::cashu::MintQuoteOutcome::Invoice { bolt11, quote_id }) => {
                 let mut lines = vec![
-                    "Routstr top up: Cashu mint invoice ready.".to_owned(),
+                    "Cashu mint quote invoice (NUT-04) — not a Routstr node invoice.".to_owned(),
                     format!("Quote id: {quote_id}"),
                     format!("BOLT11: {bolt11}"),
-                    "Pay the invoice, then `grok routstr balance` to verify float.".to_owned(),
+                    "Paying this invoice pays the mint for a quote only.".to_owned(),
                 ];
+                if cashu_caps.proofs_mint_live {
+                    lines.push(
+                        "After pay: complete proofs mint via CDK helper (SeedVault) to \
+                         obtain a cashuA… token — still not Routstr float until redeem."
+                            .to_owned(),
+                    );
+                    lines.push(
+                        "Then redeem: `grok routstr redeem <cashuA…>` (or login paste) to \
+                         fund Routstr float."
+                            .to_owned(),
+                    );
+                } else {
+                    lines.push(
+                        "Mint completion (proofs → cashuA token) needs the \
+                         grok-bitcoin-cdk-mint helper (build + GROK_BITCOIN_CDK_MINT_BIN) \
+                         or an external Cashu wallet."
+                            .to_owned(),
+                    );
+                    lines.push(
+                        "When you have a cashuA… token, redeem with `grok routstr redeem` \
+                         (or login) to fund Routstr float."
+                            .to_owned(),
+                    );
+                }
+                lines.push(
+                    "For prepaid float now without Cashu: `grok routstr topup` (Routstr \
+                     node BOLT11)."
+                        .to_owned(),
+                );
                 if let Some(s) = sats {
                     lines.insert(1, format!("Requested amount: {s} sats."));
                 }
                 return lines;
             }
             Ok(crate::cashu::MintQuoteOutcome::Unsupported(reason)) => {
-                return vec![
-                    "Routstr top up: mint backend reported live but returned unsupported."
-                        .to_owned(),
+                mint_failure_preamble = vec![
+                    "Cashu mint quote: backend reported live but returned unsupported.".to_owned(),
                     format!("Detail: {reason}"),
-                    "No invoice was created.".to_owned(),
+                    "No mint quote invoice was created.".to_owned(),
                 ];
             }
             Ok(crate::cashu::MintQuoteOutcome::Failed(e)) => {
-                return vec![
-                    "Routstr top up: mint quote failed.".to_owned(),
+                mint_failure_preamble = vec![
+                    "Cashu mint quote failed.".to_owned(),
                     format!("Detail: {e}"),
-                    "No invoice was created.".to_owned(),
+                    "No mint quote invoice was created.".to_owned(),
                 ];
             }
             Err(e) => {
-                return vec![
-                    "Routstr top up: mint quote error.".to_owned(),
+                mint_failure_preamble = vec![
+                    "Cashu mint quote error.".to_owned(),
                     format!("Detail: {e}"),
-                    "No invoice was created.".to_owned(),
+                    "No mint quote invoice was created.".to_owned(),
                 ];
             }
         }
+        // fall through: P0 Routstr float path remains available after mint fail
     }
 
-    // Optional LDK receive invoice when LN invoice path is live (no Cashu mint).
-    // When the flag is true, failures must not fall through to "not wired yet".
+    // Optional local LDK receive invoice when live **and** bare create yields a
+    // real bolt11. Local receive is **not** Routstr prepaid float funding — on
+    // Failed/Unsupported (e.g. SeedVault required for LdkLightning bare create)
+    // fall through to the residual Routstr node invoice-first path (P0). Never
+    // claim residual "not wired yet" language for a live-flag backend.
     if ln_caps.bolt11_invoice_live {
-        match ln.create_bolt11_invoice(sats) {
-            Ok(crate::lightning::InvoiceOutcome::Created { bolt11 }) => {
-                let mut lines = vec![
-                    "Routstr top up: Lightning invoice ready (local node).".to_owned(),
-                    format!("BOLT11: {bolt11}"),
-                    "This is a local receive invoice; Routstr node float may still need a separate path."
-                        .to_owned(),
-                ];
-                if let Some(s) = sats {
-                    lines.insert(1, format!("Requested amount: {s} sats."));
+        if let Ok(crate::lightning::InvoiceOutcome::Created { bolt11 }) =
+            ln.create_bolt11_invoice(sats)
+        {
+            let b = bolt11.trim();
+            if !b.is_empty() && crate::routstr_invoice::looks_like_bolt11(b) {
+                let mut lines = mint_failure_preamble;
+                if !lines.is_empty() {
+                    lines.push(String::new());
                 }
+                lines.push("Local Lightning receive invoice ready (LDK).".to_owned());
+                if let Some(s) = sats {
+                    lines.push(format!("Requested amount: {s} sats."));
+                }
+                lines.push(format!("BOLT11: {b}"));
+                lines.push(
+                    "This is a **local** receive invoice — it does not fund Routstr \
+                     prepaid float by itself. Prefer `grok routstr topup` for node float."
+                        .to_owned(),
+                );
+                lines.extend(crate::lightning::inbound_liquidity_honesty_lines());
                 return lines;
             }
-            Ok(crate::lightning::InvoiceOutcome::Unsupported(reason)) => {
-                return vec![
-                    "Routstr top up: Lightning invoice backend reported live but returned unsupported."
-                        .to_owned(),
-                    format!("Detail: {reason}"),
-                    "No invoice was created.".to_owned(),
-                ];
-            }
-            Ok(crate::lightning::InvoiceOutcome::Failed(e)) => {
-                return vec![
-                    "Routstr top up: Lightning invoice create failed.".to_owned(),
-                    format!("Detail: {e}"),
-                    "No invoice was created.".to_owned(),
-                ];
-            }
-            Err(e) => {
-                return vec![
-                    "Routstr top up: Lightning invoice create error.".to_owned(),
-                    format!("Detail: {e}"),
-                    "No invoice was created.".to_owned(),
-                ];
-            }
         }
+        // else: fall through to residual Routstr invoice-first (primary float path)
     }
 
-    // Residual honest stub copy only when neither Cashu mint nor LN invoice is live.
-    let mut lines =
-        vec!["Routstr top up (Lightning / Cashu pay path is not wired yet).".to_owned()];
+    // Residual when local CDK/LDK mint+invoice are not usable for float. Prefer
+    // live node invoice via `grok routstr topup` (no website).
+    let mut lines = mint_failure_preamble;
+    if !lines.is_empty() {
+        lines.push(String::new());
+        lines.push("Falling back to Routstr node float (invoice-first; no website).".to_owned());
+    }
+    lines.push("Routstr node float: create a Lightning invoice in-app (no website).".to_owned());
     if let Some(s) = sats {
         lines.push(format!("Requested amount: {s} sats."));
     }
     lines.push("Next steps:".to_owned());
     lines.push(
-        "  1. `grok login --routstr` with a sk- or cashuA… bearer if you have one.".to_owned(),
-    );
-    lines.push(
-        "  2. `grok routstr fund` (or /routstr fund in the TUI) to create a local wallet \
-         and show a receive address."
+        "  1. `grok routstr topup` (or /routstr topup) — creates a mainnet BOLT11 on the \
+         Routstr node; pay with any Lightning wallet."
             .to_owned(),
     );
     lines.push(
-        "  3. Pay a Routstr BOLT11 invoice from docs.routstr.com when you need node float."
+        "  2. After pay: `grok routstr topup --status <invoice_id>` (or wait for the poll) \
+         then `grok routstr balance`."
             .to_owned(),
     );
     lines.push(
-        "  4. `grok routstr balance` (or /routstr balance) to verify prepaid float after funding."
+        "  3. Optional: `grok login --routstr` / `grok routstr redeem <cashuA…>` if you \
+         already have a key or Cashu token."
             .to_owned(),
     );
-    lines.push("This command does not spend Bitcoin or create a live mint invoice yet.".to_owned());
+    lines.push(
+        "  4. Local on-chain deposit: `grok routstr fund` (does not mint node float by itself)."
+            .to_owned(),
+    );
+    lines.push(
+        "If live invoice create failed, check network access to api.routstr.com and retry \
+         `grok routstr topup`. No fabricated invoice is shown."
+            .to_owned(),
+    );
     lines
 }
 
@@ -527,8 +566,52 @@ pub fn refund_next_steps_lines() -> Vec<String> {
     refund_next_steps_for_backend(&crate::cashu::default_cashu_backend())
 }
 
+/// True when bare `refund()` Failed means melt capability is available but the
+/// call has no token+bolt11+seed — not a product float refund that already ran.
+fn bare_refund_needs_token_context(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    d.contains("token context")
+        || d.contains("melt_token_to_bolt11")
+        || d.contains("bare refund has no token")
+}
+
+/// Residual product refund guide (node float preferred; library melt when wired).
+///
+/// Guidance: prefer spend/melt of held `cashuA…` over parking large hot `sk-`
+/// float; node refund remains the product path for existing prepaid float.
+fn refund_residual_next_steps() -> Vec<String> {
+    vec![
+        "Routstr refund: prefer live node API `grok routstr refund` (POST /v1/balance/refund) \
+         for existing sk- float."
+            .to_owned(),
+        "Next steps:".to_owned(),
+        "  1. With a stored key: `grok routstr refund` — returns a Cashu token once when the \
+         node succeeds (copy it; it is not re-logged)."
+            .to_owned(),
+        "  2. Prefer spend/melt of cashuA… you already hold over parking large hot sk- float."
+            .to_owned(),
+        "  3. Prefer spending down remaining hot sk- float rather than leaving large balances \
+         on the node."
+            .to_owned(),
+        "  4. `grok routstr balance` (or /routstr balance) to check remaining float.".to_owned(),
+        "Local CDK melt (Cashu → destination BOLT11; never sk- float credit): when feature \
+         `cashu-cdk` + mint URL + resolvable grok-bitcoin-cdk-mint helper, \
+         `grok routstr refund --token <cashuA…> --invoice <BOLT11>` (or TUI \
+         `/routstr refund token=… invoice=…`) unlocks SeedVault and melts via helper IPC \
+         (Paid only). Bare refund without token+invoice has no melt context."
+            .to_owned(),
+        "Node refund remains the product path for Routstr prepaid float when the network \
+         is reachable."
+            .to_owned(),
+    ]
+}
+
 /// Capability-aware refund lines. Live completion only when Cashu reports
 /// `refund_live` **and** returns [`crate::cashu::CashuRefundOutcome::Completed`].
+///
+/// When `refund_live` but bare `refund()` returns Failed because melt needs
+/// token+bolt11+seed (Nut04MintCashu), show residual next-steps — not
+/// "Routstr refund failed." (capability available ≠ bare refund executed).
 pub fn refund_next_steps_for_backend(cashu: &dyn crate::cashu::CashuBackend) -> Vec<String> {
     let caps = cashu.capabilities();
     if caps.refund_live {
@@ -547,6 +630,21 @@ pub fn refund_next_steps_for_backend(cashu: &dyn crate::cashu::CashuBackend) -> 
                 ];
             }
             Ok(crate::cashu::CashuRefundOutcome::Failed(e)) => {
+                // Melt live does not mean bare refund ran — guide product paths.
+                if bare_refund_needs_token_context(&e) {
+                    let mut lines = vec![
+                        "Local CDK melt is available but bare refund has no token context \
+                         (needs cashuA… + destination BOLT11 + SeedVault)."
+                            .to_owned(),
+                        "Use: `grok routstr refund --token <cashuA…> --invoice <BOLT11>` \
+                         (or TUI `/routstr refund token=… invoice=…`)."
+                            .to_owned(),
+                        "Melt never credits Routstr sk- float. No refund was completed.".to_owned(),
+                        String::new(),
+                    ];
+                    lines.extend(refund_residual_next_steps());
+                    return lines;
+                }
                 return vec![
                     "Routstr refund failed.".to_owned(),
                     format!("Detail: {e}"),
@@ -563,16 +661,7 @@ pub fn refund_next_steps_for_backend(cashu: &dyn crate::cashu::CashuBackend) -> 
         }
     }
 
-    vec![
-        "Routstr refund (Cashu return path is not wired yet).".to_owned(),
-        "Next steps:".to_owned(),
-        "  1. Prefer spending down hot float rather than leaving large balances on the node."
-            .to_owned(),
-        "  2. Use Routstr account tools / docs.routstr.com for manual Cashu export if available."
-            .to_owned(),
-        "  3. `grok routstr balance` (or /routstr balance) to check remaining float.".to_owned(),
-        "Automated refund via CDK is not available in this build.".to_owned(),
-    ]
+    refund_residual_next_steps()
 }
 
 /// System-block lines for a receive address: text + optional QR matrix + copy hint.
@@ -870,14 +959,16 @@ pub fn format_rbf_input_cli_flag(utxo: &crate::descriptor_wallet::WalletUtxo) ->
     )
 }
 
-/// Short clap `about` for `grok routstr utxos` (gap-sync UTXO list / balance).
+/// Short clap `about` for `grok routstr utxos` (UTXO list / balance).
 pub const UTXOS_CLI_ABOUT: &str =
-    "List local wallet UTXOs and on-chain balance (gap-limit ChainSource sync)";
+    "List local wallet UTXOs and on-chain balance (default gap-limit ChainSource sync)";
 
 /// Longer honesty blurb for `grok routstr utxos`.
 pub const UTXOS_CLI_LONG_ABOUT: &str = "\
-List confirmed/unconfirmed on-chain balance and each UTXO for the local SeedVault wallet \
-after gap-limit ChainSource sync (BIP44-style look-ahead; not full bdk_wallet auto-sync). \
+List confirmed/unconfirmed on-chain balance and each UTXO for the local SeedVault wallet. \
+Default discovery is gap-limit ChainSource sync (BIP44-style look-ahead). \
+Optional prefer-BDK (`GROK_BITCOIN_UTXO_SYNC=bdk`) when the product binary is built with \
+feature `bdk` (not default CI) and chain source is esplora or electrum. \
 Requires SeedVault unlock + recovery-phrase re-entry (same gate as spend/fund). \
 Chain backend via GROK_BITCOIN_CHAIN_SOURCE (default mempool). \
 Never invents UTXOs; empty wallet prints zero balance. \
@@ -889,7 +980,8 @@ pub fn utxos_usage_lines() -> Vec<String> {
         "Usage:".to_owned(),
         "  grok routstr utxos [--network mainnet|signet|testnet|testnet4]".to_owned(),
         UTXOS_CLI_ABOUT.to_owned(),
-        "Gap-limit ChainSource sync only — not full bdk_wallet auto-sync. Requires \
+        "Default: gap-limit ChainSource sync. Optional GROK_BITCOIN_UTXO_SYNC=bdk when \
+         built with feature bdk + esplora|electrum (not default CI). Requires \
          SeedVault unlock + recovery-phrase re-entry."
             .to_owned(),
         "Omit --network to use GROK_BITCOIN_NETWORK (default mainnet). Chain source via \
@@ -952,6 +1044,7 @@ pub fn format_utxos_list_lines(utxos: &[crate::descriptor_wallet::WalletUtxo]) -
 ///
 /// Balance + per-UTXO + shared gap notices ([`crate::descriptor_wallet::gap_sync_spend_notice_lines`]).
 /// Never invents balance/UTXO counts — only formats `snap`.
+/// **Do not** use for the BDK path — see [`format_bdk_sync_utxos_cli_lines`].
 #[cfg(feature = "onchain-address")]
 pub fn format_gap_sync_utxos_cli_lines(
     snap: &crate::descriptor_wallet::WalletSyncSnapshot,
@@ -962,8 +1055,28 @@ pub fn format_gap_sync_utxos_cli_lines(
     lines.extend(crate::descriptor_wallet::gap_sync_spend_notice_lines(snap));
     lines.push(
         "Gap-limit ChainSource sync only — not full bdk_wallet auto-sync. \
-         Snapshot authoritative as of final sync list (no extra list)."
+         Snapshot authoritative as of final sync list (no extra list). \
+         Prefer-BDK: GROK_BITCOIN_UTXO_SYNC=bdk (feature bdk + esplora|electrum)."
             .to_owned(),
+    );
+    lines
+}
+
+/// Pure product CLI lines for a BDK-sync UTXO snapshot (offline-testable).
+///
+/// Balance + per-UTXO + BDK notices ([`crate::bdk_sync::bdk_sync_notice_lines`]).
+/// Never invents balance/UTXO counts — only formats `snap`.
+/// **Do not** use gap-limit residual copy when the BDK path ran.
+#[cfg(all(feature = "onchain-address", feature = "bdk"))]
+pub fn format_bdk_sync_utxos_cli_lines(
+    snap: &crate::descriptor_wallet::WalletSyncSnapshot,
+    network_label: &str,
+) -> Vec<String> {
+    let mut lines = format_utxos_balance_lines(&snap.balance, network_label);
+    lines.extend(format_utxos_list_lines(&snap.utxos));
+    lines.extend(crate::bdk_sync::bdk_sync_notice_lines(snap));
+    lines.push(
+        "Snapshot authoritative as of BDK full_scan apply_update (no extra list).".to_owned(),
     );
     lines
 }
@@ -1315,6 +1428,10 @@ pub fn spend_usage_lines() -> Vec<String> {
          (same prevouts; never invents witnesses). To fee-bump without replacing the \
          parent, use `grok routstr cpfp` or `/routstr cpfp` (child spends a wallet-owned \
          parent output)."
+            .to_owned(),
+        "UTXO discovery default: gap-limit ChainSource. Optional prefer-BDK: \
+         GROK_BITCOIN_UTXO_SYNC=bdk when built with feature bdk + esplora|electrum \
+         (not default CI; mempool+bdk fails closed). Empty/unset = gap."
             .to_owned(),
     ]
 }
@@ -2368,15 +2485,18 @@ mod tests {
     fn topup_refund_copy_is_honest_no_live_mint_claim() {
         let top = topup_next_steps_lines(Some(21_000));
         let joined = top.join("\n").to_ascii_lowercase();
-        assert!(joined.contains("not wired yet") || joined.contains("not available"));
+        // Residual points at in-app `grok routstr topup`, never a website.
+        assert!(joined.contains("grok routstr topup") || joined.contains("routstr topup"));
         assert!(joined.contains("21000"));
+        assert!(!joined.contains("docs.routstr.com"));
         assert!(!joined.contains("invoice created"));
         assert!(!joined.contains("payment sent"));
         assert!(!joined.contains("bolt11:"));
         assert!(!joined.contains("mint invoice ready"));
 
         let refnd = refund_next_steps_lines().join("\n").to_ascii_lowercase();
-        assert!(refnd.contains("not wired yet") || refnd.contains("not available"));
+        assert!(refnd.contains("grok routstr refund") || refnd.contains("balance/refund"));
+        assert!(!refnd.contains("docs.routstr.com"));
         assert!(!refnd.contains("refund completed"));
     }
 
@@ -2388,12 +2508,28 @@ mod tests {
             Some(100),
         );
         let joined = lines.join("\n").to_ascii_lowercase();
-        assert!(joined.contains("not wired yet"));
+        assert!(joined.contains("grok routstr topup") || joined.contains("no website"));
+        assert!(!joined.contains("docs.routstr.com"));
         assert!(!joined.contains("lnbc"));
         assert!(!joined.contains("invoice ready"));
     }
 
-    /// LN backend that advertises live invoices but fails create — must not say "not wired".
+    #[test]
+    fn residual_topup_refund_copy_has_no_website() {
+        let top = topup_next_steps_lines(None).join("\n");
+        let refnd = refund_next_steps_lines().join("\n");
+        assert!(
+            !top.to_ascii_lowercase().contains("docs.routstr.com"),
+            "topup residual must not mention docs.routstr.com: {top}"
+        );
+        assert!(
+            !refnd.to_ascii_lowercase().contains("docs.routstr.com"),
+            "refund residual must not mention docs.routstr.com: {refnd}"
+        );
+    }
+
+    /// LN backend that advertises live invoices but fails bare create — product
+    /// falls through to residual Routstr invoice-first (local receive ≠ float).
     struct LiveInvoiceFailLn;
     impl crate::lightning::LightningCapability for LiveInvoiceFailLn {
         fn capabilities(&self) -> crate::lightning::LightningCapabilities {
@@ -2401,6 +2537,8 @@ mod tests {
                 bolt11_pay_live: false,
                 bolt11_invoice_live: true,
                 bolt12_supported: false,
+                channel_open_live: false,
+                connect_peer_live: false,
             }
         }
         fn pay_bolt11(
@@ -2420,22 +2558,24 @@ mod tests {
     }
 
     #[test]
-    fn topup_live_ln_invoice_failure_is_honest_not_not_wired() {
+    fn topup_live_ln_invoice_failure_falls_through_to_routstr_residual() {
         let lines = topup_next_steps_for_backends(
             &crate::cashu::StubCashu,
             &LiveInvoiceFailLn,
             Some(21_000),
         );
         let joined = lines.join("\n").to_ascii_lowercase();
+        // Primary float path remains Routstr node invoice-first.
         assert!(
-            joined.contains("failed") || joined.contains("no invoice was created"),
-            "expected failure wording: {joined}"
+            joined.contains("grok routstr topup") || joined.contains("no website"),
+            "expected residual Routstr topup path: {joined}"
         );
         assert!(
             !joined.contains("not wired yet"),
-            "must not claim residual stub when bolt11_invoice_live: {joined}"
+            "must not claim residual stub wording: {joined}"
         );
         assert!(!joined.contains("lnbc"));
+        assert!(!joined.contains("docs.routstr.com"));
     }
 
     /// Cashu backend with live mint that returns a real-shaped invoice (flip-path proof).
@@ -2444,6 +2584,7 @@ mod tests {
         fn capabilities(&self) -> crate::cashu::CashuCapabilities {
             crate::cashu::CashuCapabilities {
                 mint_live: true,
+                proofs_mint_live: false,
                 spend_live: false,
                 refund_live: false,
             }
@@ -2462,12 +2603,13 @@ mod tests {
         }
     }
 
-    /// Cashu mint live but Failed — must not fall through to residual "not wired".
+    /// Cashu mint live but Failed — honest failure + fall through to P0 residual.
     struct LiveMintFailCashu;
     impl crate::cashu::CashuBackend for LiveMintFailCashu {
         fn capabilities(&self) -> crate::cashu::CashuCapabilities {
             crate::cashu::CashuCapabilities {
                 mint_live: true,
+                proofs_mint_live: false,
                 spend_live: false,
                 refund_live: false,
             }
@@ -2491,6 +2633,7 @@ mod tests {
         fn capabilities(&self) -> crate::cashu::CashuCapabilities {
             crate::cashu::CashuCapabilities {
                 mint_live: false,
+                proofs_mint_live: false,
                 spend_live: false,
                 refund_live: true,
             }
@@ -2514,6 +2657,7 @@ mod tests {
         fn capabilities(&self) -> crate::cashu::CashuCapabilities {
             crate::cashu::CashuCapabilities {
                 mint_live: false,
+                proofs_mint_live: false,
                 spend_live: false,
                 refund_live: true,
             }
@@ -2539,6 +2683,8 @@ mod tests {
                 bolt11_pay_live: false,
                 bolt11_invoice_live: true,
                 bolt12_supported: false,
+                channel_open_live: false,
+                connect_peer_live: false,
             }
         }
         fn pay_bolt11(
@@ -2558,7 +2704,7 @@ mod tests {
     }
 
     #[test]
-    fn topup_live_cashu_mint_success_emits_invoice_copy() {
+    fn topup_live_cashu_mint_success_emits_quote_honest_copy() {
         let lines = topup_next_steps_for_backends(
             &LiveMintOkCashu,
             &crate::lightning::StubLightning,
@@ -2567,8 +2713,31 @@ mod tests {
         let joined = lines.join("\n");
         let lower = joined.to_ascii_lowercase();
         assert!(
-            lower.contains("mint invoice ready"),
-            "live mint success must claim ready: {joined}"
+            lower.contains("mint quote") || lower.contains("nut-04"),
+            "live mint success must name mint quote: {joined}"
+        );
+        assert!(
+            lower.contains("not a routstr node invoice")
+                || lower.contains("pays the mint for a quote"),
+            "must not claim Routstr float from mint pay alone: {joined}"
+        );
+        assert!(
+            lower.contains("proofs") || lower.contains("residual"),
+            "must note proofs→token residual: {joined}"
+        );
+        assert!(
+            lower.contains("redeem") || lower.contains("cashua"),
+            "must point at redeem for cashuA: {joined}"
+        );
+        assert!(
+            lower.contains("grok routstr topup"),
+            "must still offer P0 node topup for float: {joined}"
+        );
+        // Must not claim float is ready after pay alone.
+        assert!(
+            !lower.contains("pay the invoice, then `grok routstr balance`")
+                && !lower.contains("verify float"),
+            "must not claim balance/float after mint pay alone: {joined}"
         );
         assert!(joined.contains("lnbc210u1ptestquote-test"));
         assert!(joined.contains("quote-test-1"));
@@ -2580,7 +2749,7 @@ mod tests {
     }
 
     #[test]
-    fn topup_live_cashu_mint_failure_is_honest_not_not_wired() {
+    fn topup_live_cashu_mint_failure_falls_through_to_routstr_residual() {
         let lines = topup_next_steps_for_backends(
             &LiveMintFailCashu,
             &crate::lightning::StubLightning,
@@ -2588,15 +2757,21 @@ mod tests {
         );
         let joined = lines.join("\n").to_ascii_lowercase();
         assert!(
-            joined.contains("failed") || joined.contains("no invoice was created"),
-            "expected failure wording: {joined}"
+            joined.contains("failed") || joined.contains("no mint quote"),
+            "expected mint failure wording: {joined}"
+        );
+        assert!(
+            joined.contains("grok routstr topup") || joined.contains("no website"),
+            "mint fail must fall through to Routstr float path: {joined}"
         );
         assert!(
             !joined.contains("not wired yet"),
             "must not claim residual stub when mint_live: {joined}"
         );
         assert!(!joined.contains("lnbc"));
-        assert!(!joined.contains("invoice ready"));
+        // Local LDK "invoice ready" only on Created — not on mint fail residual.
+        assert!(!joined.contains("local lightning receive invoice ready"));
+        assert!(!joined.contains("docs.routstr.com"));
     }
 
     #[test]
@@ -2606,11 +2781,16 @@ mod tests {
         let joined = lines.join("\n");
         let lower = joined.to_ascii_lowercase();
         assert!(
-            lower.contains("lightning invoice ready"),
-            "live LN invoice must claim ready: {joined}"
+            lower.contains("local") && lower.contains("invoice ready"),
+            "live LN invoice must claim local ready: {joined}"
         );
         assert!(joined.contains("lnbc100n1ptestlocal-test"));
+        assert!(
+            lower.contains("does not fund routstr") || lower.contains("routstr topup"),
+            "must clarify local ≠ Routstr float: {joined}"
+        );
         assert!(!lower.contains("not wired yet"));
+        assert!(!lower.contains("docs.routstr.com"));
     }
 
     #[test]
@@ -2644,6 +2824,61 @@ mod tests {
         assert!(!joined.contains("refund completed"));
     }
 
+    /// Cashu melt capability live but bare refund needs token+bolt11 — not
+    /// "Routstr refund failed." (product next-steps must stay residual-style).
+    struct LiveRefundNeedsTokenContextCashu;
+    impl crate::cashu::CashuBackend for LiveRefundNeedsTokenContextCashu {
+        fn capabilities(&self) -> crate::cashu::CashuCapabilities {
+            crate::cashu::CashuCapabilities {
+                mint_live: true,
+                proofs_mint_live: true,
+                spend_live: true,
+                refund_live: true,
+            }
+        }
+        fn request_mint_invoice(
+            &self,
+            _amount_sats: Option<u64>,
+        ) -> crate::error::Result<crate::cashu::MintQuoteOutcome> {
+            Ok(crate::cashu::MintQuoteOutcome::Unsupported("n/a"))
+        }
+        fn refund(&self) -> crate::error::Result<crate::cashu::CashuRefundOutcome> {
+            Ok(crate::cashu::CashuRefundOutcome::Failed(
+                "CDK melt requires cashuA token + destination BOLT11 + SeedVault \
+                 (use melt_token_to_bolt11_with_seed); bare refund has no token context. \
+                 For Routstr node float use `grok routstr refund`."
+                    .into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn refund_live_bare_token_context_is_residual_not_failed_headline() {
+        let lines = refund_next_steps_for_backend(&LiveRefundNeedsTokenContextCashu);
+        let joined = lines.join("\n");
+        let lower = joined.to_ascii_lowercase();
+        assert!(
+            !lower.contains("routstr refund failed"),
+            "token-context bare refund must not headline as executed failure: {joined}"
+        );
+        assert!(
+            lower.contains("token context")
+                || lower.contains("melt_token_to_bolt11")
+                || lower.contains("--token")
+                || lower.contains("invoice"),
+            "must explain bare refund needs token: {joined}"
+        );
+        assert!(
+            lower.contains("grok routstr refund") || lower.contains("balance/refund"),
+            "must still prefer node refund path: {joined}"
+        );
+        assert!(!lower.contains("refund completed"));
+        assert!(
+            lower.contains("no refund was completed"),
+            "honest: nothing completed: {joined}"
+        );
+    }
+
     #[test]
     fn default_backends_are_honest_stubs() {
         let cashu = crate::cashu::default_cashu_backend();
@@ -2651,13 +2886,32 @@ mod tests {
         let c = crate::cashu::CashuBackend::capabilities(&cashu);
         let l = crate::lightning::LightningCapability::capabilities(&ln);
         assert!(!c.mint_live && !c.spend_live && !c.refund_live);
-        assert!(!l.bolt11_pay_live && !l.bolt11_invoice_live && !l.bolt12_supported);
-        // Product entry points must still resolve to residual copy today.
+        // Feature `ldk` → LdkLightning claims bolt11_pay_live (IPC helper).
+        // Default CI (no feature) → stub keeps pay live false.
+        #[cfg(feature = "ldk")]
+        assert!(
+            l.bolt11_pay_live,
+            "feature ldk default LN backend must claim live BOLT11 pay"
+        );
+        #[cfg(not(feature = "ldk"))]
+        assert!(!l.bolt11_pay_live);
+        #[cfg(feature = "ldk")]
+        assert!(
+            l.bolt11_invoice_live,
+            "feature ldk default LN backend must claim live BOLT11 invoice create"
+        );
+        #[cfg(not(feature = "ldk"))]
+        assert!(!l.bolt11_invoice_live);
+        assert!(!l.bolt12_supported);
+        // Residual topup copy (invoice-first): bare LDK create needs SeedVault so
+        // product falls through to Routstr node path (no fabricated lnbc).
         let top = topup_next_steps_lines(None).join("\n").to_ascii_lowercase();
-        assert!(top.contains("not wired yet"));
+        assert!(top.contains("grok routstr topup") || top.contains("no website"));
+        assert!(!top.contains("docs.routstr.com"));
         assert!(!top.contains("lnbc"));
         let refnd = refund_next_steps_lines().join("\n").to_ascii_lowercase();
-        assert!(refnd.contains("not wired yet") || refnd.contains("not available"));
+        assert!(refnd.contains("grok routstr refund") || refnd.contains("balance/refund"));
+        assert!(!refnd.contains("docs.routstr.com"));
         assert!(!refnd.contains("refund completed"));
     }
 
@@ -2977,6 +3231,15 @@ mod tests {
         assert!(
             usage.contains("grok_bitcoin_bip39_passphrase"),
             "usage should document optional passphrase env: {usage}"
+        );
+        // Prefer-BDK opt-in honesty (same env as utxos / shell spend branch).
+        assert!(
+            usage.contains("utxo_sync") || usage.contains("bdk"),
+            "usage should document prefer-BDK opt-in: {usage}"
+        );
+        assert!(
+            usage.contains("gap") || usage.contains("default"),
+            "usage should note default gap-limit: {usage}"
         );
         assert!(!usage.contains("crypto"));
     }
@@ -3403,6 +3666,52 @@ mod tests {
         assert!(!hit_l.contains("crypto"));
     }
 
+    /// BDK CLI formatter must use BDK notice copy, never gap-limit residual.
+    #[cfg(all(feature = "onchain-address", feature = "bdk"))]
+    #[test]
+    fn format_bdk_sync_utxos_cli_lines_uses_bdk_notices() {
+        use crate::descriptor_wallet::{
+            OutPointRef, WalletBalance, WalletSyncSnapshot, WalletUtxo,
+        };
+
+        let utxo = WalletUtxo {
+            outpoint: OutPointRef::new("ef".repeat(32), 0),
+            amount_sats: 9_000,
+            address: "bc1qbdk".into(),
+            confirmations: 2,
+            is_change: false,
+        };
+        let snap = WalletSyncSnapshot {
+            utxos: vec![utxo],
+            balance: WalletBalance {
+                confirmed_sats: 9_000,
+                unconfirmed_sats: 0,
+            },
+            receive_gap: 1,
+            change_gap: 1,
+            highest_used_receive: Some(0),
+            highest_used_change: None,
+            extended_receive_by: 1,
+            extended_change_by: 0,
+            hit_max_gap: false,
+        };
+        let lines = format_bdk_sync_utxos_cli_lines(&snap, "signet");
+        let j = lines.join("\n");
+        let lower = j.to_ascii_lowercase();
+        assert!(j.contains("signet"));
+        assert!(j.contains("9000") || j.contains("confirmed"));
+        assert!(j.contains("--input"));
+        assert!(lower.contains("bdk"), "must label BDK path: {j}");
+        // Gap residual says "Gap-limit ChainSource sync only — not full bdk…".
+        // BDK notice may say "not gap-limit ChainSource" (honest contrast) — allow that.
+        assert!(
+            !lower.contains("gap-limit chainsource sync only")
+                && !lower.contains("not full bdk_wallet"),
+            "must not emit gap residual when BDK path ran: {j}"
+        );
+        assert!(!lower.contains("crypto"));
+    }
+
     #[test]
     fn utxos_usage_is_honest_gap_sync_list() {
         let usage = utxos_usage_lines().join("\n").to_ascii_lowercase();
@@ -3416,8 +3725,13 @@ mod tests {
         assert!(!usage.contains("--broadcast"));
         assert!(UTXOS_CLI_ABOUT.to_ascii_lowercase().contains("utxo"));
         let long = UTXOS_CLI_LONG_ABOUT.to_ascii_lowercase();
-        assert!(long.contains("gap") || long.contains("not full"));
+        assert!(long.contains("gap") || long.contains("default"));
         assert!(long.contains("never invents") || long.contains("empty"));
+        // Prefer-BDK honesty (env name) without inventing live Success.
+        assert!(
+            long.contains("utxo_sync") || long.contains("bdk") || usage.contains("bdk"),
+            "usage should document prefer-BDK opt-in"
+        );
     }
 
     fn sample_cpfp_parent() -> String {

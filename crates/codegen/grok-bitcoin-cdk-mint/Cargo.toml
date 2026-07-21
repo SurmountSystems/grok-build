@@ -1,0 +1,37 @@
+# Standalone helper (NOT a monorepo workspace member).
+#
+# Owns `cdk` + `cdk-sqlite` + their transitive `rusqlite 0.31` / `libsqlite3-sys`
+# so the shell binary can keep `rusqlite 0.37` (FTS5 / sqlite-vec / CVE pins)
+# without Cargo `links = "sqlite3"` conflicts. Parent wallet talks over
+# stdin/stdout JSON; seed material is never written to disk in plaintext and
+# never appears on argv/env.
+#
+# Build: `cargo build --manifest-path crates/codegen/grok-bitcoin-cdk-mint/Cargo.toml`
+# Exclude: listed in root workspace `exclude` (mirror grok-bitcoin-ldk-node).
+[workspace]
+
+[package]
+name = "grok-bitcoin-cdk-mint"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Out-of-process Cashu CDK mint-quote + proofs→token helper for grok-bitcoin-wallet (Surmount)"
+authors = ["Surmount"]
+publish = false
+
+[[bin]]
+name = "grok-bitcoin-cdk-mint"
+path = "src/main.rs"
+
+[dependencies]
+bip39 = "2"
+cdk = { version = "0.17", default-features = false, features = ["wallet"] }
+cdk-sqlite = { version = "0.17", default-features = false, features = ["wallet"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = false
+codegen-units = 16

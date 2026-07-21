@@ -4591,6 +4591,20 @@ pub(crate) fn collect_own_credentials(
                     push_unique_key(&mut keys, k);
                 }
             }
+            // Product use-path honesty: never hand residual material (NIP-98 /
+            // nsec / BIP-39 / Other) to the sampler as Authorization Bearer.
+            // Live contract is sk-… / cashu… only (`ROUTSTR_PRODUCT_NIP98_AUTH_LIVE=false`).
+            // Zeroize owned rejected (and accepted) buffers after classify —
+            // inference may transiently hold seed-like residual from inline/
+            // env multi-lists or a legacy store read.
+            let mut live_only = Vec::with_capacity(keys.len());
+            for mut k in keys {
+                if let Ok(live) = crate::auth::routstr::validate_routstr_product_bearer_key(&k) {
+                    push_unique_key(&mut live_only, live.to_owned());
+                }
+                grok_bitcoin_wallet::mnemonic::zeroize_phrase(&mut k);
+            }
+            return live_only;
         }
         ThirdPartyProvider::None => {}
     }
@@ -6152,12 +6166,13 @@ reasoning_effort = "low"
         let model = test_model_entry(
             "grok-4.5",
             "https://api.routstr.com/v1",
-            Some("routstr-sk-primary"),
+            // Live Bearer shape only (`sk-…` / `cashu…`); residual material is filtered.
+            Some("sk-routstr-primary"),
             None,
             None,
         );
         let creds = resolve_credentials(&model, Some("session-jwt-for-grok-api"));
-        assert_eq!(creds.api_key.as_deref(), Some("routstr-sk-primary"));
+        assert_eq!(creds.api_key.as_deref(), Some("sk-routstr-primary"));
         assert_eq!(creds.base_url, "https://api.routstr.com/v1");
         assert_eq!(
             creds.failover_providers.len(),
@@ -6180,12 +6195,12 @@ reasoning_effort = "low"
         let model = test_model_entry(
             "grok-4.5",
             "https://api.routstr.com/v1",
-            Some("routstr-only"),
+            Some("sk-routstr-only"),
             None,
             None,
         );
         let creds = resolve_credentials(&model, None);
-        assert_eq!(creds.api_key.as_deref(), Some("routstr-only"));
+        assert_eq!(creds.api_key.as_deref(), Some("sk-routstr-only"));
         assert!(
             creds.failover_providers.is_empty(),
             "no session and no XAI_API_KEY → cannot fail over to Grok API"
@@ -6590,6 +6605,59 @@ reasoning_effort = "low"
                 .to_ascii_lowercase()
                 .contains("crypto"),
             "user-facing description must not say crypto"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn collect_own_credentials_routstr_filters_residual_auth_material() {
+        // Product inference must never hand residual NIP-98 / seed / Other as
+        // Authorization Bearer (ROUTSTR_PRODUCT_NIP98_AUTH_LIVE=false).
+        //
+        // Inline-only exercise of the Routstr filter arm (no ROUTSTR_API_KEY*
+        // mutation — those env vars race non-serial tests when set process-wide).
+        let _primary =
+            xai_grok_test_support::EnvGuard::unset(crate::auth::routstr::ROUTSTR_API_KEY_ENV);
+        let _extra =
+            xai_grok_test_support::EnvGuard::unset(crate::auth::routstr::ROUTSTR_API_KEYS_ENV);
+
+        let nsec = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
+        let mnemonic = grok_bitcoin_wallet::nip06::NIP06_TEST_MNEMONIC;
+        let mixed = format!("Nostr e30=,sk-live-ok,{nsec},cashuAok,not-a-key,{mnemonic}");
+        let keys = collect_own_credentials(Some(&mixed), None, ThirdPartyProvider::Routstr);
+        // Every collected key must be live Bearer shape only (store/keyring may
+        // add ambient live keys; residual from inline must never appear).
+        for k in &keys {
+            assert!(
+                crate::auth::routstr::validate_routstr_product_bearer_key(k).is_ok(),
+                "residual material leaked into Routstr credentials: {k}"
+            );
+        }
+        assert!(
+            keys.iter().any(|k| k == "sk-live-ok"),
+            "live sk- must survive filter: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k == "cashuAok"),
+            "live cashu must survive filter: {keys:?}"
+        );
+        assert!(
+            !keys
+                .iter()
+                .any(|k| { k.contains("Nostr") || k == nsec || k == mnemonic || k == "not-a-key" }),
+            "residual shapes must be filtered out: {keys:?}"
+        );
+
+        // Pure residual inline → residual string never reaches sampler.
+        let pure = collect_own_credentials(Some("Nostr e30="), None, ThirdPartyProvider::Routstr);
+        assert!(
+            pure.iter()
+                .all(|k| { crate::auth::routstr::validate_routstr_product_bearer_key(k).is_ok() }),
+            "pure residual must not yield residual keys: {pure:?}"
+        );
+        assert!(
+            !pure.iter().any(|k| k.contains("Nostr")),
+            "NIP-98 must never reach sampler: {pure:?}"
         );
     }
 

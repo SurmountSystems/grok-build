@@ -4211,6 +4211,173 @@ pub(crate) fn execute(
                 TaskResult::RoutstrUtxosCompleted { agent_id, result }
             });
         }
+        Effect::RoutstrTopupLocalPayComplete {
+            agent_id,
+            grok_home,
+            phrase,
+            password,
+            bip39_passphrase,
+            bolt11,
+            invoice_id: _invoice_id,
+        } => {
+            let phrase = phrase.into_inner();
+            let password = password.map(|p| p.into_inner());
+            let bip39_passphrase = bip39_passphrase.map(|p| p.into_inner());
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    // invoice_id is for user copy only (poll already armed); pay uses bolt11.
+                    let _ = _invoice_id;
+                    let mut phrase = phrase;
+                    let mut password = password;
+                    let mut bip39_passphrase = bip39_passphrase;
+                    let result =
+                        xai_grok_shell::auth::complete_routstr_topup_local_pay_reentry_for_tui(
+                            &grok_home,
+                            &phrase,
+                            password.as_deref(),
+                            &bolt11,
+                            bip39_passphrase.as_deref(),
+                        )
+                        .map_err(|e| e.to_string());
+                    // Scrub effect-boundary secret buffers after complete (success or fail).
+                    // Shell already zeroizes its owned re-entry copy + locks the session;
+                    // these outer Strings must not linger until non-zeroizing drop.
+                    grok_bitcoin_wallet::mnemonic::zeroize_phrase(&mut phrase);
+                    if let Some(ref mut p) = password {
+                        grok_bitcoin_wallet::mnemonic::zeroize_phrase(p);
+                    }
+                    if let Some(ref mut p) = bip39_passphrase {
+                        grok_bitcoin_wallet::mnemonic::zeroize_phrase(p);
+                    }
+                    result
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("topup local pay complete task failed: {e}")));
+                TaskResult::RoutstrTopupLocalPayCompleted { agent_id, result }
+            });
+        }
+        Effect::RoutstrMintQuoteComplete {
+            agent_id,
+            grok_home,
+            phrase,
+            password,
+            bip39_passphrase,
+            amount_sats,
+        } => {
+            let phrase = phrase.into_inner();
+            let password = password.map(|p| p.into_inner());
+            let bip39_passphrase = bip39_passphrase.map(|p| p.into_inner());
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut phrase = phrase;
+                    let mut password = password;
+                    let mut bip39_passphrase = bip39_passphrase;
+                    let result = xai_grok_shell::auth::complete_routstr_mint_quote_reentry_for_tui(
+                        &grok_home,
+                        &phrase,
+                        password.as_deref(),
+                        amount_sats,
+                        bip39_passphrase.as_deref(),
+                    )
+                    .map_err(|e| e.to_string());
+                    grok_bitcoin_wallet::mnemonic::zeroize_phrase(&mut phrase);
+                    if let Some(ref mut p) = password {
+                        grok_bitcoin_wallet::mnemonic::zeroize_phrase(p);
+                    }
+                    if let Some(ref mut p) = bip39_passphrase {
+                        grok_bitcoin_wallet::mnemonic::zeroize_phrase(p);
+                    }
+                    result
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("mint quote complete task failed: {e}")));
+                TaskResult::RoutstrMintQuoteCompleted { agent_id, result }
+            });
+        }
+        Effect::RoutstrMintAfterPayComplete {
+            agent_id,
+            grok_home,
+            phrase,
+            password,
+            bip39_passphrase,
+            quote_id,
+            amount_sats,
+        } => {
+            let phrase = phrase.into_inner();
+            let password = password.map(|p| p.into_inner());
+            let bip39_passphrase = bip39_passphrase.map(|p| p.into_inner());
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut phrase = phrase;
+                    let mut password = password;
+                    let mut bip39_passphrase = bip39_passphrase;
+                    let result =
+                        xai_grok_shell::auth::complete_routstr_mint_after_pay_reentry_for_tui(
+                            &grok_home,
+                            &phrase,
+                            password.as_deref(),
+                            &quote_id,
+                            bip39_passphrase.as_deref(),
+                            amount_sats,
+                        )
+                        .map_err(|e| e.to_string());
+                    grok_bitcoin_wallet::mnemonic::zeroize_phrase(&mut phrase);
+                    if let Some(ref mut p) = password {
+                        grok_bitcoin_wallet::mnemonic::zeroize_phrase(p);
+                    }
+                    if let Some(ref mut p) = bip39_passphrase {
+                        grok_bitcoin_wallet::mnemonic::zeroize_phrase(p);
+                    }
+                    result
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("mint after-pay complete task failed: {e}")));
+                TaskResult::RoutstrMintAfterPayCompleted { agent_id, result }
+            });
+        }
+        Effect::RoutstrMeltComplete {
+            agent_id,
+            grok_home,
+            phrase,
+            password,
+            bip39_passphrase,
+            token,
+            bolt11,
+        } => {
+            let phrase = phrase.into_inner();
+            let password = password.map(|p| p.into_inner());
+            let bip39_passphrase = bip39_passphrase.map(|p| p.into_inner());
+            let token = token.into_inner();
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut phrase = phrase;
+                    let mut password = password;
+                    let mut bip39_passphrase = bip39_passphrase;
+                    let mut token = token;
+                    let result = xai_grok_shell::auth::complete_routstr_melt_reentry_for_tui(
+                        &grok_home,
+                        &phrase,
+                        password.as_deref(),
+                        &token,
+                        &bolt11,
+                        bip39_passphrase.as_deref(),
+                    )
+                    .map_err(|e| e.to_string());
+                    grok_bitcoin_wallet::mnemonic::zeroize_phrase(&mut phrase);
+                    if let Some(ref mut p) = password {
+                        grok_bitcoin_wallet::mnemonic::zeroize_phrase(p);
+                    }
+                    if let Some(ref mut p) = bip39_passphrase {
+                        grok_bitcoin_wallet::mnemonic::zeroize_phrase(p);
+                    }
+                    grok_bitcoin_wallet::mnemonic::zeroize_phrase(&mut token);
+                    result
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("melt complete task failed: {e}")));
+                TaskResult::RoutstrMeltCompleted { agent_id, result }
+            });
+        }
         Effect::RoutstrCpfpComplete {
             agent_id,
             grok_home,
@@ -4315,6 +4482,54 @@ pub(crate) fn execute(
                         status_line: format!("Watch error: {message}"),
                         confirmed: false,
                         address: address_for_err,
+                    },
+                }
+            });
+        }
+        Effect::RoutstrInvoicePoll {
+            agent_id,
+            invoice_id,
+            generation,
+            skip_sleep,
+        } => {
+            tasks.spawn(async move {
+                // First arm after topup create polls immediately; re-arms sleep ~5s.
+                if !skip_sleep {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                let invoice_for_err = invoice_id.clone();
+                let poll = tokio::task::spawn_blocking(move || {
+                    xai_grok_shell::auth::fetch_routstr_invoice_status(&invoice_id)
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("invoice poll task failed: {e}")));
+                match poll {
+                    Ok(st) => {
+                        let paid = st.is_paid();
+                        let api_key = st
+                            .api_key_if_paid()
+                            .map(|s| crate::app::actions::SensitiveString::new(s.to_owned()));
+                        let expires_at = (st.expires_at > 0).then_some(st.expires_at);
+                        TaskResult::RoutstrInvoiceTick {
+                            agent_id,
+                            generation,
+                            invoice_id: invoice_for_err,
+                            status: st.status,
+                            api_key,
+                            paid,
+                            expires_at,
+                            error: None,
+                        }
+                    }
+                    Err(message) => TaskResult::RoutstrInvoiceTick {
+                        agent_id,
+                        generation,
+                        invoice_id: invoice_for_err,
+                        status: "error".into(),
+                        api_key: None,
+                        paid: false,
+                        expires_at: None,
+                        error: Some(message),
                     },
                 }
             });

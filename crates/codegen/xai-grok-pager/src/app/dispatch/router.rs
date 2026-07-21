@@ -57,8 +57,8 @@ use super::rewind::{
 use super::routstr::{
     dispatch_routstr_balance, dispatch_routstr_bip39_passphrase_cancel,
     dispatch_routstr_bip39_passphrase_submit, dispatch_routstr_cpfp, dispatch_routstr_fund,
-    dispatch_routstr_fund_reentry, dispatch_routstr_qr, dispatch_routstr_rbf,
-    dispatch_routstr_refund, dispatch_routstr_spend, dispatch_routstr_topup,
+    dispatch_routstr_fund_reentry, dispatch_routstr_mint, dispatch_routstr_qr,
+    dispatch_routstr_rbf, dispatch_routstr_refund, dispatch_routstr_spend, dispatch_routstr_topup,
     dispatch_routstr_utxos, dispatch_routstr_watch, dispatch_routstr_watch_stop,
 };
 use super::session::foreign::dispatch_fetch_session_list;
@@ -971,7 +971,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         ),
         Action::RoutstrUtxos { network } => dispatch_routstr_utxos(app, network),
         Action::RoutstrTopup { sats } => dispatch_routstr_topup(app, sats),
-        Action::RoutstrRefund => dispatch_routstr_refund(app),
+        Action::RoutstrMint { sats } => dispatch_routstr_mint(app, sats),
+        Action::RoutstrRefund { token, invoice } => dispatch_routstr_refund(app, token, invoice),
         Action::RoutstrWatch { address } => dispatch_routstr_watch(app, address),
         Action::RoutstrWatchStop => dispatch_routstr_watch_stop(app),
         Action::RoutstrQr { address } => dispatch_routstr_qr(app, address),

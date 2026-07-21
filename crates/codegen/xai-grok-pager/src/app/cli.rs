@@ -189,14 +189,66 @@ pub enum RoutstrCommand {
         #[arg(long)]
         sats: Option<u64>,
         /// Poll a previously created invoice id (store api_key when paid)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "recover")]
         status: Option<String>,
+        /// Recover invoice status from a BOLT11 string (`POST /lightning/recover`)
+        #[arg(long, conflicts_with = "status")]
+        recover: Option<String>,
         /// Create invoice and print QR without polling for payment
         #[arg(long)]
         no_poll: bool,
     },
-    /// Guide refund of unused Routstr float back toward Cashu (stub until CDK)
-    Refund,
+    /// Ensure Routstr key + prepaid float (alias for readiness / topup orchestrator).
+    ///
+    /// When already funded, prints balance. Otherwise creates a Lightning invoice
+    /// like `topup`. Does **not** auto-select a model.
+    Setup {
+        /// Amount in sats when an invoice is needed (default 1000)
+        #[arg(long)]
+        sats: Option<u64>,
+        /// Skip post-create payment poll
+        #[arg(long)]
+        no_poll: bool,
+    },
+    /// Redeem a Cashu token (`cashuA…`) into a new balance or top up an existing key.
+    Redeem {
+        /// Cashu token string (cashuA… / cashuB…)
+        cashu_token: String,
+    },
+    /// Cashu mint path: NUT-04 quote → pay mint BOLT11 → proofs → redeem (when live).
+    ///
+    /// Requires feature `cashu-cdk` + `GROK_BITCOIN_CASHU_MINT_URL` + resolvable
+    /// `grok-bitcoin-cdk-mint` helper (`proofs_mint_live`). SeedVault unlock (same
+    /// gates as topup local-pay / spend). Token ≠ Routstr float until redeem
+    /// succeeds. When not live / unlock cancel / failure: residual + P0
+    /// `grok routstr topup` fall-through (never fabricates invoice or float).
+    Mint {
+        /// Amount in sats (default 1000; min 1, max 1_000_000)
+        #[arg(long)]
+        sats: Option<u64>,
+        /// Resume after mint quote BOLT11 is paid: proofs mint + redeem
+        #[arg(long = "complete", value_name = "QUOTE_ID")]
+        complete: Option<String>,
+    },
+    /// Refund unused Routstr float via live node API, or melt a Cashu token to BOLT11.
+    ///
+    /// Default (no flags): `POST /v1/balance/refund` when a key exists — returns a
+    /// Cashu token once (stdout); residual next-steps otherwise.
+    ///
+    /// With **both** `--token` and `--invoice`: local CDK melt when feature
+    /// `cashu-cdk` + mint URL + resolvable `grok-bitcoin-cdk-mint` helper
+    /// (`spend_live` / `refund_live`). SeedVault unlock (same gates as mint /
+    /// spend). Success only when helper IPC returns state=PAID. **Never** claims
+    /// Routstr sk- float (melt spends Cashu to LN). When not live / unlock
+    /// cancel / fail: residual + node refund next-steps.
+    Refund {
+        /// Bearer Cashu token (`cashuA…` / `cashuB…`) to melt (requires `--invoice`)
+        #[arg(long, requires = "invoice")]
+        token: Option<String>,
+        /// Destination BOLT11 for local melt (requires `--token`)
+        #[arg(long, requires = "token")]
+        invoice: Option<String>,
+    },
     /// Create or unlock local wallet, confirm BIP-39 backup, show receive address
     Fund,
     /// Build (and optionally broadcast) a BIP84 P2WPKH payment from the local wallet.
@@ -1418,11 +1470,13 @@ mod tests {
             .expect("routstr topup parses");
         match args.command {
             Some(Command::Routstr(RoutstrArgs {
-                command: RoutstrCommand::Topup {
-                    sats: Some(21_000),
-                    status: None,
-                    no_poll: false,
-                },
+                command:
+                    RoutstrCommand::Topup {
+                        sats: Some(21_000),
+                        status: None,
+                        recover: None,
+                        no_poll: false,
+                    },
             })) => {}
             other => panic!("unexpected: {other:?}"),
         }
@@ -1430,23 +1484,93 @@ mod tests {
 
     #[test]
     fn routstr_topup_parses_status() {
-        let args = PagerArgs::try_parse_from([
-            "grok",
-            "routstr",
-            "topup",
-            "--status",
-            "inv123",
-        ])
-        .expect("routstr topup status parses");
+        let args = PagerArgs::try_parse_from(["grok", "routstr", "topup", "--status", "inv123"])
+            .expect("routstr topup status parses");
         match args.command {
             Some(Command::Routstr(RoutstrArgs {
-                command: RoutstrCommand::Topup {
-                    sats: None,
-                    status: Some(id),
-                    no_poll: false,
-                },
+                command:
+                    RoutstrCommand::Topup {
+                        sats: None,
+                        status: Some(id),
+                        recover: None,
+                        no_poll: false,
+                    },
             })) if id == "inv123" => {}
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routstr_topup_parses_recover() {
+        let args =
+            PagerArgs::try_parse_from(["grok", "routstr", "topup", "--recover", "lnbc10u1ptest"])
+                .expect("routstr topup recover parses");
+        match args.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Topup {
+                        recover: Some(b),
+                        status: None,
+                        ..
+                    },
+            })) if b == "lnbc10u1ptest" => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routstr_setup_and_redeem_parse() {
+        let setup = PagerArgs::try_parse_from(["grok", "routstr", "setup", "--sats", "500"])
+            .expect("routstr setup parses");
+        match setup.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Setup {
+                        sats: Some(500),
+                        no_poll: false,
+                    },
+            })) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        let redeem = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "redeem",
+            "cashuAabcdefghijklmnopqrstuvwxyz",
+        ])
+        .expect("routstr redeem parses");
+        match redeem.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command: RoutstrCommand::Redeem { cashu_token },
+            })) => {
+                assert!(cashu_token.starts_with("cashuA"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let mint = PagerArgs::try_parse_from(["grok", "routstr", "mint", "--sats", "210"])
+            .expect("routstr mint parses");
+        match mint.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Mint {
+                        sats: Some(210),
+                        complete: None,
+                    },
+            })) => {}
+            other => panic!("unexpected mint: {other:?}"),
+        }
+        let mint_c =
+            PagerArgs::try_parse_from(["grok", "routstr", "mint", "--complete", "quote-abc"])
+                .expect("routstr mint --complete parses");
+        match mint_c.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Mint {
+                        sats: None,
+                        complete: Some(q),
+                    },
+            })) => assert_eq!(q, "quote-abc"),
+            other => panic!("unexpected mint complete: {other:?}"),
         }
     }
 
@@ -1457,9 +1581,44 @@ mod tests {
         assert!(matches!(
             refund.command,
             Some(Command::Routstr(RoutstrArgs {
-                command: RoutstrCommand::Refund
+                command: RoutstrCommand::Refund {
+                    token: None,
+                    invoice: None
+                }
             }))
         ));
+        let melt = PagerArgs::try_parse_from([
+            "grok",
+            "routstr",
+            "refund",
+            "--token",
+            "cashuAabcdefghijklmnopqrstuvwxyz012345",
+            "--invoice",
+            "lnbc1x",
+        ])
+        .expect("routstr refund melt parses");
+        match melt.command {
+            Some(Command::Routstr(RoutstrArgs {
+                command:
+                    RoutstrCommand::Refund {
+                        token: Some(t),
+                        invoice: Some(inv),
+                    },
+            })) => {
+                assert!(t.starts_with("cashuA"));
+                assert!(inv.starts_with("lnbc"));
+            }
+            other => panic!("unexpected melt refund: {other:?}"),
+        }
+        // Token without invoice / invoice without token rejected by clap requires.
+        assert!(
+            PagerArgs::try_parse_from(["grok", "routstr", "refund", "--token", "cashuAabc",])
+                .is_err()
+        );
+        assert!(
+            PagerArgs::try_parse_from(["grok", "routstr", "refund", "--invoice", "lnbc1x",])
+                .is_err()
+        );
         let fund =
             PagerArgs::try_parse_from(["grok", "routstr", "fund"]).expect("routstr fund parses");
         assert!(matches!(

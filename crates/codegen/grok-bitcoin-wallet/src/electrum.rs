@@ -7,6 +7,8 @@
 //!
 //! Protocol (subset used here):
 //! - `blockchain.scripthash.listunspent` — UTXOs for an address script hash
+//! - `blockchain.scripthash.get_history` — spent-tx history for BDK full_scan
+//! - `blockchain.transaction.get` — raw tx hex (verbose=false) for BDK apply_update
 //! - `blockchain.headers.subscribe` — tip height for confirmation math
 //! - `blockchain.transaction.broadcast` — push raw tx hex; result is txid string
 //!
@@ -223,18 +225,25 @@ fn electrum_tls_client_config() -> Result<std::sync::Arc<rustls::ClientConfig>> 
 
 /// In-memory Electrum transport for unit tests (offline fixtures only).
 ///
-/// Keys for listunspent fixtures are Electrum script hashes (64 hex chars).
-/// Missing fixtures and scripted failures are hard errors.
+/// Keys for listunspent / get_history fixtures are Electrum script hashes
+/// (64 hex chars). Missing fixtures and scripted failures are hard errors
+/// unless [`Self::default_empty_history`] is set for BDK full_scan look-ahead.
 #[derive(Debug, Default)]
 pub struct MockElectrumTransport {
     /// script_hash (hex) → JSON array body for `listunspent` result.
     pub listunspent: BTreeMap<String, Value>,
+    /// script_hash (hex) → JSON array for `get_history` result.
+    pub history: BTreeMap<String, Value>,
+    /// txid (lowercase hex) → raw tx hex for `blockchain.transaction.get`.
+    pub transactions: BTreeMap<String, String>,
     /// Optional tip height returned by `blockchain.headers.subscribe`.
     pub tip_height: Option<u64>,
     /// When true, headers.subscribe returns an error.
     pub fail_headers: bool,
     /// Script hashes that hard-error on listunspent.
     pub fail_scripthashes: BTreeMap<String, String>,
+    /// Script hashes that hard-error on get_history.
+    pub fail_history: BTreeMap<String, String>,
     /// Scripted `blockchain.transaction.broadcast` results (pop front).
     ///
     /// `Ok(Value)` is returned as the JSON-RPC result; `Err(msg)` is a transport
@@ -242,6 +251,8 @@ pub struct MockElectrumTransport {
     pub broadcast_results: VecDeque<std::result::Result<Value, String>>,
     /// Recorded (method, params) calls.
     pub calls: Vec<(String, Vec<Value>)>,
+    /// When true, missing get_history fixtures return `[]` (BDK full_scan).
+    pub default_empty_history: bool,
 }
 
 impl MockElectrumTransport {
@@ -254,14 +265,35 @@ impl MockElectrumTransport {
         self
     }
 
+    /// Enable empty default for missing get_history (BDK full_scan tests).
+    pub fn with_default_empty_history(mut self) -> Self {
+        self.default_empty_history = true;
+        self
+    }
+
     /// Insert listunspent result for a script hash (accepts JSON array value).
     pub fn insert_listunspent(&mut self, script_hash: impl Into<String>, result: Value) {
         self.listunspent.insert(script_hash.into(), result);
     }
 
+    /// Insert get_history result for a script hash.
+    pub fn insert_history(&mut self, script_hash: impl Into<String>, result: Value) {
+        self.history.insert(script_hash.into(), result);
+    }
+
+    /// Insert raw tx hex for `blockchain.transaction.get` (txid key normalized).
+    pub fn insert_transaction(&mut self, txid: impl AsRef<str>, raw_hex: impl Into<String>) {
+        self.transactions
+            .insert(txid.as_ref().trim().to_ascii_lowercase(), raw_hex.into());
+    }
+
     pub fn fail_listunspent(&mut self, script_hash: impl Into<String>, message: impl Into<String>) {
         self.fail_scripthashes
             .insert(script_hash.into(), message.into());
+    }
+
+    pub fn fail_get_history(&mut self, script_hash: impl Into<String>, message: impl Into<String>) {
+        self.fail_history.insert(script_hash.into(), message.into());
     }
 
     /// Queue a successful broadcast result (typically a JSON string txid).
@@ -306,6 +338,41 @@ impl ElectrumTransport for MockElectrumTransport {
                         "mock electrum: no listunspent fixture for scripthash {sh}"
                     ))
                 })
+            }
+            "blockchain.scripthash.get_history" => {
+                let sh = params.first().and_then(|v| v.as_str()).ok_or_else(|| {
+                    WalletError::Explorer(
+                        "mock electrum: get_history missing scripthash param".into(),
+                    )
+                })?;
+                if let Some(msg) = self.fail_history.get(sh) {
+                    return Err(WalletError::Explorer(msg.clone()));
+                }
+                if let Some(v) = self.history.get(sh) {
+                    return Ok(v.clone());
+                }
+                if self.default_empty_history {
+                    return Ok(json!([]));
+                }
+                Err(WalletError::Explorer(format!(
+                    "mock electrum: no get_history fixture for scripthash {sh}"
+                )))
+            }
+            "blockchain.transaction.get" => {
+                let txid = params.first().and_then(|v| v.as_str()).ok_or_else(|| {
+                    WalletError::Explorer(
+                        "mock electrum: transaction.get missing txid param".into(),
+                    )
+                })?;
+                let key = txid.trim().to_ascii_lowercase();
+                self.transactions
+                    .get(&key)
+                    .map(|h| Value::String(h.clone()))
+                    .ok_or_else(|| {
+                        WalletError::Explorer(format!(
+                            "mock electrum: no transaction.get fixture for txid {key}"
+                        ))
+                    })
             }
             "blockchain.transaction.broadcast" => {
                 // Require a string hex param (shape only; full validate is in broadcaster).
@@ -548,6 +615,91 @@ pub fn parse_electrum_broadcast_result(result: &Value) -> Result<String> {
         )));
     }
     Ok(t.to_ascii_lowercase())
+}
+
+/// One item from Electrum `blockchain.scripthash.get_history`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElectrumHistoryEntry {
+    pub txid: String,
+    /// Electrum height: `>0` confirmed, `0` mempool, `-1` unconfirmed parent.
+    pub height: i64,
+}
+
+/// Parse `blockchain.scripthash.get_history` into ordered unique entries.
+///
+/// Item shape: `{"tx_hash":"…","height":N}`. Empty array → empty vec. Malformed
+/// / non-array / invalid tx_hash → hard error (never invents history).
+pub fn parse_electrum_get_history_entries(result: &Value) -> Result<Vec<ElectrumHistoryEntry>> {
+    let arr = result
+        .as_array()
+        .ok_or_else(|| WalletError::Explorer("electrum get_history: expected JSON array".into()))?;
+    let mut out = Vec::with_capacity(arr.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for item in arr {
+        let txid = item
+            .get("tx_hash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                WalletError::Explorer("electrum get_history item missing tx_hash".into())
+            })?
+            .trim();
+        if !is_valid_txid_hex(txid) {
+            return Err(WalletError::Explorer(format!(
+                "electrum get_history tx_hash must be 64 hex chars, got len {} / non-hex",
+                txid.len()
+            )));
+        }
+        let lower = txid.to_ascii_lowercase();
+        if !seen.insert(lower.clone()) {
+            continue;
+        }
+        // height missing → treat as unconfirmed (0); do not invent confirmed depth.
+        let height = item
+            .get("height")
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+            })
+            .unwrap_or(0);
+        out.push(ElectrumHistoryEntry {
+            txid: lower,
+            height,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse `blockchain.scripthash.get_history` result into ordered unique txids.
+///
+/// Convenience over [`parse_electrum_get_history_entries`] when only ids matter.
+pub fn parse_electrum_get_history_txids(result: &Value) -> Result<Vec<String>> {
+    Ok(parse_electrum_get_history_entries(result)?
+        .into_iter()
+        .map(|e| e.txid)
+        .collect())
+}
+
+/// Parse `blockchain.transaction.get` (verbose=false) result as raw tx hex.
+///
+/// Expects a string of even-length ASCII hex. Never invents a body.
+pub fn parse_electrum_transaction_get_hex(result: &Value) -> Result<String> {
+    let s = result.as_str().ok_or_else(|| {
+        WalletError::Explorer(format!(
+            "electrum transaction.get result must be a hex string, got {result}"
+        ))
+    })?;
+    let t = s.trim();
+    if t.is_empty() {
+        return Err(WalletError::Explorer(
+            "electrum transaction.get result is empty".into(),
+        ));
+    }
+    if !t.bytes().all(|b| b.is_ascii_hexdigit()) || !t.len().is_multiple_of(2) {
+        return Err(WalletError::Explorer(
+            "electrum transaction.get result must be even-length ASCII hex".into(),
+        ));
+    }
+    Ok(t.to_owned())
 }
 
 /// Electrum JSON-RPC [`ChainSource`] over an injectable transport.

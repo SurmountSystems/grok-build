@@ -15,6 +15,15 @@ use crate::scrollback::block::RenderBlock;
 /// errors still update `routstr_watch_status` (footer) only.
 const WATCH_ERROR_SCROLLBACK_CAP: u32 = 2;
 
+/// Max consecutive invoice poll error lines in scrollback (mirror watch).
+const INVOICE_POLL_ERROR_SCROLLBACK_CAP: u32 = 2;
+
+/// Stop invoice poll after this many consecutive errors (incl. quiet re-arms).
+const INVOICE_POLL_ERROR_STOP_CAP: u32 = 5;
+
+/// Soft wall-clock timeout for TUI background invoice poll (~30 min).
+const INVOICE_POLL_SOFT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 // Test-only override for the durable watch path. When set under `cfg!(test)`,
 // pager unit tests may exercise resume/persist glue against a `tempfile`
 // without touching developer `~/.grok`. Product builds never set this.
@@ -288,7 +297,7 @@ fn clear_routstr_passphrase_modal(app: &mut AppView, reason: &str) -> bool {
         agent_id,
         format!(
             "Cancelled private BIP-39 passphrase entry ({reason}). \
-             Staged spend/rbf/cpfp/utxos (if any) is unchanged — re-run /routstr unlock to authorize."
+             Staged spend/rbf/cpfp/utxos/topup-local-pay/mint/melt (if any) is unchanged — re-run /routstr unlock to authorize."
         ),
     );
     true
@@ -374,11 +383,80 @@ fn clear_pending_routstr_utxos(app: &mut AppView, reason: &str) -> bool {
     true
 }
 
+/// Cancel a staged topup local-pay if present; notify the staging agent.
+///
+/// Does **not** cancel invoice poll (P0 external path stays armed).
+/// Returns `true` when a pending topup local-pay was cleared.
+fn clear_pending_routstr_topup_local_pay(app: &mut AppView, reason: &str) -> bool {
+    let Some(pending) = app.pending_routstr_topup_local_pay.take() else {
+        return false;
+    };
+    push_system_to_agent(
+        app,
+        pending.agent_id,
+        format!(
+            "Cancelled staged local Lightning pay for invoice {} ({reason}). \
+             Background invoice poll continues — pay the BOLT11 with any Lightning wallet.",
+            pending.invoice_id
+        ),
+    );
+    true
+}
+
+/// Cancel a staged Cashu mint quote if present; notify the staging agent.
+fn clear_pending_routstr_mint_quote(app: &mut AppView, reason: &str) -> bool {
+    let Some(pending) = app.pending_routstr_mint_quote.take() else {
+        return false;
+    };
+    push_system_to_agent(
+        app,
+        pending.agent_id,
+        format!("Cancelled staged Cashu mint quote ({reason})."),
+    );
+    true
+}
+
+/// Cancel a staged Cashu mint after-pay if present; notify the staging agent.
+fn clear_pending_routstr_mint_after_pay(app: &mut AppView, reason: &str) -> bool {
+    let Some(pending) = app.pending_routstr_mint_after_pay.take() else {
+        return false;
+    };
+    push_system_to_agent(
+        app,
+        pending.agent_id,
+        format!(
+            "Cancelled staged Cashu mint after-pay for quote {} ({reason}). \
+             Resume with: grok routstr mint --complete {}",
+            pending.quote_id, pending.quote_id
+        ),
+    );
+    true
+}
+
+/// Cancel a staged Cashu melt if present; zeroize token via SensitiveString Drop.
+fn clear_pending_routstr_melt(app: &mut AppView, reason: &str) -> bool {
+    let Some(pending) = app.pending_routstr_melt.take() else {
+        return false;
+    };
+    // pending.token drops here → zeroize.
+    let _ = pending.token;
+    push_system_to_agent(
+        app,
+        pending.agent_id,
+        format!(
+            "Cancelled staged Cashu melt ({reason}). Token was not spent. \
+             No Routstr float was claimed."
+        ),
+    );
+    true
+}
+
 /// `/routstr fund` — probe vault (async); never mint on keyring errors.
 ///
 /// Also cancels any staged `/routstr spend`, `/routstr rbf`, `/routstr cpfp`,
-/// or `/routstr utxos` so unlock cannot authorize a stale (possibly broadcast)
-/// money path or a leftover observational stage after the user switched to fund.
+/// `/routstr utxos`, topup local-pay, or Cashu mint stages so unlock cannot
+/// authorize a stale money path after the user switched to fund. Invoice poll
+/// is independent and is not cancelled here.
 pub(super) fn dispatch_routstr_fund(app: &mut AppView) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         // No agent view: cannot show system block either.
@@ -389,6 +467,10 @@ pub(super) fn dispatch_routstr_fund(app: &mut AppView) -> Vec<Effect> {
     let _ = clear_pending_routstr_rbf(app, "running /routstr fund");
     let _ = clear_pending_routstr_cpfp(app, "running /routstr fund");
     let _ = clear_pending_routstr_utxos(app, "running /routstr fund");
+    let _ = clear_pending_routstr_topup_local_pay(app, "running /routstr fund");
+    let _ = clear_pending_routstr_mint_quote(app, "running /routstr fund");
+    let _ = clear_pending_routstr_mint_after_pay(app, "running /routstr fund");
+    let _ = clear_pending_routstr_melt(app, "running /routstr fund");
     push_system_to_agent(
         app,
         id,
@@ -402,18 +484,17 @@ pub(super) fn dispatch_routstr_fund(app: &mut AppView) -> Vec<Effect> {
 
 /// Complete re-entry after `/routstr unlock <phrase>` (optional `pass` modal).
 ///
-/// If a pending spend, rbf, cpfp, or utxos was staged, unlock authorizes that
-/// path (not fund). BIP-39 never enters chat history — only the unlock path
-/// carries [`SensitiveString`] into a blocking task.
+/// If a pending spend, rbf, cpfp, utxos, or topup local-pay was staged, unlock
+/// authorizes that path (not fund). BIP-39 never enters chat history — only the
+/// unlock path carries [`SensitiveString`] into a blocking task.
 ///
 /// When `request_passphrase_prompt` is true, opens the private masked modal
-/// and leaves staged spend/rbf/cpfp/utxos paths intact until submit/cancel. Env
-/// passphrase is used only when the flag is false (`bip39_passphrase: None` on
-/// effects).
+/// and leaves staged money paths intact until submit/cancel. Env passphrase is
+/// used only when the flag is false (`bip39_passphrase: None` on effects).
 ///
 /// Completion is bound to the **staging** agent (`pending.agent_id`), not merely
 /// the current active view, so switching agents cannot mis-route a staged path.
-/// Spend, rbf, cpfp, and utxos are mutually exclusive pending states.
+/// Spend, rbf, cpfp, utxos, and topup local-pay are mutually exclusive pendings.
 pub(super) fn dispatch_routstr_fund_reentry(
     app: &mut AppView,
     phrase: crate::app::actions::SensitiveString,
@@ -440,7 +521,7 @@ pub(super) fn dispatch_routstr_fund_reentry(
             id,
             "Private BIP-39 passphrase entry open (masked; not stored in chat). \
              Enter empty for default path, or type your passphrase then Enter. \
-             Esc cancels unlock and keeps any staged spend/rbf/cpfp/utxos. \
+             Esc cancels unlock and keeps any staged spend/rbf/cpfp/utxos/topup-local-pay/mint/melt. \
              Env GROK_BITCOIN_BIP39_PASSPHRASE is ignored for this unlock while the modal is used.",
         );
         return vec![];
@@ -683,6 +764,144 @@ fn complete_routstr_unlock_with_secrets(
             network: pending.network,
         }];
     }
+    if let Some(pending) = app.pending_routstr_topup_local_pay.take() {
+        if pending.agent_id != id {
+            let staging = pending.agent_id;
+            app.pending_routstr_topup_local_pay = Some(pending);
+            push_system_to_agent(
+                app,
+                id,
+                format!(
+                    "Staged topup local pay belongs to another agent session (agent {staging:?}). \
+                     Switch back to that agent and run /routstr unlock there, or cancel \
+                     with /routstr fund on the staging agent (invoice poll continues either way)."
+                ),
+            );
+            return vec![];
+        }
+        let auth_msg = if pending.mint_quote_pay {
+            format!(
+                "Authorizing local Lightning pay of Cashu mint quote BOLT11 ({}) from SeedVault. \
+                 This pays the mint only — not Routstr prepaid float. Recovery phrase is not \
+                 stored in chat. On failure, pay the mint BOLT11 externally, then unlock again \
+                 for proofs + redeem.",
+                pending.invoice_id
+            )
+        } else {
+            format!(
+                "Authorizing local Lightning pay of Routstr invoice {} from SeedVault. \
+                 Recovery phrase is not stored in chat. On failure, pay the BOLT11 with any \
+                 Lightning wallet (background poll continues).",
+                pending.invoice_id
+            )
+        };
+        push_system_to_agent(app, pending.agent_id, auth_msg);
+        return vec![Effect::RoutstrTopupLocalPayComplete {
+            agent_id: pending.agent_id,
+            grok_home: grok_home(),
+            phrase,
+            password,
+            bip39_passphrase,
+            bolt11: pending.bolt11,
+            invoice_id: pending.invoice_id,
+        }];
+    }
+    if let Some(pending) = app.pending_routstr_mint_after_pay.take() {
+        if pending.agent_id != id {
+            let staging = pending.agent_id;
+            app.pending_routstr_mint_after_pay = Some(pending);
+            push_system_to_agent(
+                app,
+                id,
+                format!(
+                    "Staged Cashu mint after-pay belongs to another agent session (agent {staging:?}). \
+                     Switch back to that agent and run /routstr unlock there, or cancel with /routstr fund."
+                ),
+            );
+            return vec![];
+        }
+        push_system_to_agent(
+            app,
+            pending.agent_id,
+            format!(
+                "Authorizing Cashu proofs mint + redeem for quote {} (SeedVault). \
+                 Recovery phrase is not stored in chat. Token is never written to scrollback. \
+                 Routstr float is credited only if redeem succeeds.",
+                pending.quote_id
+            ),
+        );
+        return vec![Effect::RoutstrMintAfterPayComplete {
+            agent_id: pending.agent_id,
+            grok_home: grok_home(),
+            phrase,
+            password,
+            bip39_passphrase,
+            quote_id: pending.quote_id,
+            amount_sats: pending.amount_sats,
+        }];
+    }
+    if let Some(pending) = app.pending_routstr_mint_quote.take() {
+        if pending.agent_id != id {
+            let staging = pending.agent_id;
+            app.pending_routstr_mint_quote = Some(pending);
+            push_system_to_agent(
+                app,
+                id,
+                format!(
+                    "Staged Cashu mint quote belongs to another agent session (agent {staging:?}). \
+                     Switch back to that agent and run /routstr unlock there, or cancel with /routstr fund."
+                ),
+            );
+            return vec![];
+        }
+        push_system_to_agent(
+            app,
+            pending.agent_id,
+            "Authorizing Cashu mint quote (NUT-04) from SeedVault. \
+             Recovery phrase is not stored in chat. Mint BOLT11 is not Routstr float."
+                .to_owned(),
+        );
+        return vec![Effect::RoutstrMintQuoteComplete {
+            agent_id: pending.agent_id,
+            grok_home: grok_home(),
+            phrase,
+            password,
+            bip39_passphrase,
+            amount_sats: pending.amount_sats,
+        }];
+    }
+    if let Some(pending) = app.pending_routstr_melt.take() {
+        if pending.agent_id != id {
+            let staging = pending.agent_id;
+            app.pending_routstr_melt = Some(pending);
+            push_system_to_agent(
+                app,
+                id,
+                format!(
+                    "Staged Cashu melt belongs to another agent session (agent {staging:?}). \
+                     Switch back to that agent and run /routstr unlock there, or cancel with /routstr fund."
+                ),
+            );
+            return vec![];
+        }
+        push_system_to_agent(
+            app,
+            pending.agent_id,
+            "Authorizing Cashu melt (token → destination BOLT11) from SeedVault. \
+             Recovery phrase is not stored in chat. Token is never written to scrollback. \
+             Melt spends Cashu to Lightning — never credits Routstr sk- float."
+                .to_owned(),
+        );
+        return vec![Effect::RoutstrMeltComplete {
+            agent_id: pending.agent_id,
+            grok_home: grok_home(),
+            phrase,
+            password,
+            bip39_passphrase,
+            token: pending.token,
+            bolt11: pending.bolt11,
+        }];
+    }
     push_system_to_agent(
         app,
         id,
@@ -702,7 +921,7 @@ fn complete_routstr_unlock_with_secrets(
 /// `fee_rate_sat_vb`: `Some(n)` is an explicit user rate; `None` is resolved
 /// later in the spend effect (explorer halfHour or default 5) — not here.
 ///
-/// Staging spend cancels any pending rbf/cpfp/utxos (and supersedes a prior spend).
+/// Staging spend cancels any pending rbf/cpfp/utxos/topup-local-pay (and supersedes a prior spend).
 pub(super) fn dispatch_routstr_spend(
     app: &mut AppView,
     address: String,
@@ -727,6 +946,18 @@ pub(super) fn dispatch_routstr_spend(
     }
     if app.pending_routstr_utxos.is_some() {
         let _ = clear_pending_routstr_utxos(app, "superseded by /routstr spend");
+    }
+    if app.pending_routstr_topup_local_pay.is_some() {
+        let _ = clear_pending_routstr_topup_local_pay(app, "superseded by /routstr spend");
+    }
+    if app.pending_routstr_mint_quote.is_some() {
+        let _ = clear_pending_routstr_mint_quote(app, "superseded by /routstr spend");
+    }
+    if app.pending_routstr_mint_after_pay.is_some() {
+        let _ = clear_pending_routstr_mint_after_pay(app, "superseded by /routstr spend");
+    }
+    if app.pending_routstr_melt.is_some() {
+        let _ = clear_pending_routstr_melt(app, "superseded by /routstr spend");
     }
     app.pending_routstr_spend = Some(crate::app::app_view::PendingRoutstrSpend {
         agent_id: id,
@@ -766,7 +997,7 @@ pub(super) fn dispatch_routstr_spend(
 ///
 /// Same-input BIP-125 only: `input_specs` are `txid:vout:amount:address` from
 /// prior spend dry-run meta. Fee resolve only at authorize when not explicit.
-/// Staging rbf cancels any pending spend/cpfp/utxos (and supersedes a prior rbf).
+/// Staging rbf cancels any pending spend/cpfp/utxos/topup-local-pay (and supersedes a prior rbf).
 ///
 /// Argument count mirrors [`crate::app::actions::Action::RoutstrRbf`] fields
 /// plus `app` (same pattern as spend dispatch; keep flat for router matching).
@@ -798,6 +1029,18 @@ pub(super) fn dispatch_routstr_rbf(
     }
     if app.pending_routstr_utxos.is_some() {
         let _ = clear_pending_routstr_utxos(app, "superseded by /routstr rbf");
+    }
+    if app.pending_routstr_topup_local_pay.is_some() {
+        let _ = clear_pending_routstr_topup_local_pay(app, "superseded by /routstr rbf");
+    }
+    if app.pending_routstr_mint_quote.is_some() {
+        let _ = clear_pending_routstr_mint_quote(app, "superseded by /routstr rbf");
+    }
+    if app.pending_routstr_mint_after_pay.is_some() {
+        let _ = clear_pending_routstr_mint_after_pay(app, "superseded by /routstr rbf");
+    }
+    if app.pending_routstr_melt.is_some() {
+        let _ = clear_pending_routstr_melt(app, "superseded by /routstr rbf");
     }
     let n_inputs = input_specs.len();
     app.pending_routstr_rbf = Some(crate::app::app_view::PendingRoutstrRbf {
@@ -843,7 +1086,7 @@ pub(super) fn dispatch_routstr_rbf(
 ///
 /// CPFP **child** only: `parent_specs` (and optional `extra_input_specs`) are
 /// `txid:vout:amount:address`. Fee resolve only at authorize when not explicit.
-/// Staging cpfp cancels any pending spend/rbf/utxos (and supersedes a prior cpfp).
+/// Staging cpfp cancels any pending spend/rbf/utxos/topup-local-pay (and supersedes a prior cpfp).
 /// Never claims the parent was replaced.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_routstr_cpfp(
@@ -874,6 +1117,18 @@ pub(super) fn dispatch_routstr_cpfp(
     }
     if app.pending_routstr_utxos.is_some() {
         let _ = clear_pending_routstr_utxos(app, "superseded by /routstr cpfp");
+    }
+    if app.pending_routstr_topup_local_pay.is_some() {
+        let _ = clear_pending_routstr_topup_local_pay(app, "superseded by /routstr cpfp");
+    }
+    if app.pending_routstr_mint_quote.is_some() {
+        let _ = clear_pending_routstr_mint_quote(app, "superseded by /routstr cpfp");
+    }
+    if app.pending_routstr_mint_after_pay.is_some() {
+        let _ = clear_pending_routstr_mint_after_pay(app, "superseded by /routstr cpfp");
+    }
+    if app.pending_routstr_melt.is_some() {
+        let _ = clear_pending_routstr_melt(app, "superseded by /routstr cpfp");
     }
     let n_parents = parent_specs.len();
     let n_extras = extra_input_specs.len();
@@ -927,8 +1182,8 @@ pub(super) fn dispatch_routstr_cpfp(
 ///
 /// Observational only — gap-limit ChainSource UTXO list / on-chain balance.
 /// Optional `network` mirrors CLI `--network` (already validated at slash parse
-/// via the product resolver). Staging utxos cancels any pending spend/rbf/cpfp
-/// (and supersedes a prior utxos). Never broadcasts.
+/// via the product resolver). Staging utxos cancels any pending spend/rbf/cpfp/
+/// topup-local-pay (and supersedes a prior utxos). Never broadcasts.
 pub(super) fn dispatch_routstr_utxos(app: &mut AppView, network: Option<String>) -> Vec<Effect> {
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
@@ -947,6 +1202,18 @@ pub(super) fn dispatch_routstr_utxos(app: &mut AppView, network: Option<String>)
     }
     if app.pending_routstr_cpfp.is_some() {
         let _ = clear_pending_routstr_cpfp(app, "superseded by /routstr utxos");
+    }
+    if app.pending_routstr_topup_local_pay.is_some() {
+        let _ = clear_pending_routstr_topup_local_pay(app, "superseded by /routstr utxos");
+    }
+    if app.pending_routstr_mint_quote.is_some() {
+        let _ = clear_pending_routstr_mint_quote(app, "superseded by /routstr utxos");
+    }
+    if app.pending_routstr_mint_after_pay.is_some() {
+        let _ = clear_pending_routstr_mint_after_pay(app, "superseded by /routstr utxos");
+    }
+    if app.pending_routstr_melt.is_some() {
+        let _ = clear_pending_routstr_melt(app, "superseded by /routstr utxos");
     }
     app.pending_routstr_utxos = Some(crate::app::app_view::PendingRoutstrUtxos {
         agent_id: id,
@@ -1074,41 +1341,897 @@ pub(super) fn handle_routstr_utxos_completed(
     vec![]
 }
 
-/// Honest top-up stub (shared copy with CLI).
+/// Live top-up: create Routstr node BOLT11, show QR, start background status poll.
+///
+/// Does **not** auto-change the selected model. On paid: store key + toast +
+/// optional balance refresh when Routstr model is active.
+///
+/// When local Lightning reports `bolt11_pay_live` (feature `ldk` →
+/// `LdkLightning` + `grok-bitcoin-ldk-node` helper): also stages a pending local
+/// pay and prompts `/routstr unlock` (SeedVault + phrase re-entry, same gates as
+/// spend/utxos). Invoice poll always arms immediately so external QR remains
+/// the P0 fallback on unlock cancel / pay fail / not-live. Never stores seed in
+/// CredentialsStore / watch_session.
 pub(super) fn dispatch_routstr_topup(app: &mut AppView, sats: Option<u64>) -> Vec<Effect> {
-    // TUI: try live create without long poll (user can `/routstr topup` again or CLI --status).
-    let lines = match xai_grok_shell::auth::create_routstr_lightning_invoice(
-        grok_bitcoin_wallet::routstr_invoice::resolve_topup_amount_sats(sats).unwrap_or(
-            grok_bitcoin_wallet::routstr_invoice::ROUTSTR_INVOICE_DEFAULT_SATS,
-        ),
-    ) {
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        return vec![];
+    };
+    let amount = grok_bitcoin_wallet::routstr_invoice::resolve_topup_amount_sats(sats)
+        .unwrap_or(grok_bitcoin_wallet::routstr_invoice::ROUTSTR_INVOICE_DEFAULT_SATS);
+    match xai_grok_shell::auth::create_routstr_lightning_invoice(amount) {
         Ok(created) => {
+            use grok_bitcoin_wallet::lightning::{
+                LightningCapability, LocalBolt11PayPath, decide_local_bolt11_pay_path,
+            };
+
             let mut lines =
                 grok_bitcoin_wallet::routstr_invoice::live_invoice_display_lines(&created, true);
+
+            // Phase C: when bolt11_pay_live, stage SeedVault auto-pay (unlock).
+            // Always keep P0 QR + poll regardless of live flag.
+            let ln = grok_bitcoin_wallet::lightning::default_lightning_backend();
+            let auto_pay = decide_local_bolt11_pay_path(ln.capabilities())
+                == LocalBolt11PayPath::AutoPayFromSeedVault;
+
+            if auto_pay {
+                // Supersede other money paths so unlock cannot authorize a stale spend.
+                if app.routstr_passphrase_modal.is_some() {
+                    let _ = clear_routstr_passphrase_modal(app, "superseded by /routstr topup");
+                }
+                if app.pending_routstr_spend.is_some() {
+                    let _ = clear_pending_routstr_spend(app, "superseded by /routstr topup");
+                }
+                if app.pending_routstr_rbf.is_some() {
+                    let _ = clear_pending_routstr_rbf(app, "superseded by /routstr topup");
+                }
+                if app.pending_routstr_cpfp.is_some() {
+                    let _ = clear_pending_routstr_cpfp(app, "superseded by /routstr topup");
+                }
+                if app.pending_routstr_utxos.is_some() {
+                    let _ = clear_pending_routstr_utxos(app, "superseded by /routstr topup");
+                }
+                if app.pending_routstr_topup_local_pay.is_some() {
+                    let _ = clear_pending_routstr_topup_local_pay(
+                        app,
+                        "superseded by a new /routstr topup",
+                    );
+                }
+                if app.pending_routstr_mint_quote.is_some() {
+                    let _ = clear_pending_routstr_mint_quote(app, "superseded by /routstr topup");
+                }
+                if app.pending_routstr_mint_after_pay.is_some() {
+                    let _ =
+                        clear_pending_routstr_mint_after_pay(app, "superseded by /routstr topup");
+                }
+                if app.pending_routstr_melt.is_some() {
+                    let _ = clear_pending_routstr_melt(app, "superseded by /routstr topup");
+                }
+                app.pending_routstr_topup_local_pay =
+                    Some(crate::app::app_view::PendingRoutstrTopupLocalPay {
+                        agent_id,
+                        bolt11: created.bolt11.clone(),
+                        invoice_id: created.invoice_id.clone(),
+                        mint_quote_pay: false,
+                    });
+                lines.push(
+                    "Local Lightning pay is live — authorize SeedVault auto-pay with:\n\
+                     /routstr unlock <recovery phrase words…>\n\
+                     Optional private BIP-39 passphrase: /routstr unlock pass <phrase…>\n\
+                     Optional AEAD password: /routstr unlock [pass] pw:<password> <phrase…>\n\
+                     Env GROK_BITCOIN_BIP39_PASSPHRASE still applies without the pass flag.\n\
+                     Recovery words are never stored in chat history. Cancel with /routstr fund \
+                     (poll continues) or pay the BOLT11 with any Lightning wallet."
+                        .to_owned(),
+                );
+            }
+
+            lines.push(
+                "Polling payment status in the background… (pay the BOLT11 with any Lightning wallet)."
+                    .to_owned(),
+            );
             lines.push(format!(
-                "After paying, run CLI: grok routstr topup --status {}",
+                "Or re-check later: grok routstr topup --status {}",
                 created.invoice_id
             ));
-            lines
+            push_system_lines_active(app, &lines);
+            // Supersede any prior invoice poll (generation bump).
+            app.routstr_invoice_poll_generation =
+                app.routstr_invoice_poll_generation.saturating_add(1);
+            let generation = app.routstr_invoice_poll_generation;
+            app.routstr_invoice_poll_id = Some(created.invoice_id.clone());
+            app.routstr_invoice_poll_agent_id = Some(agent_id);
+            app.routstr_invoice_poll_error_streak = 0;
+            app.routstr_invoice_poll_started = Some(std::time::Instant::now());
+            persist_pending_routstr_invoice(&created.invoice_id, generation);
+            vec![Effect::RoutstrInvoicePoll {
+                agent_id,
+                invoice_id: created.invoice_id,
+                generation,
+                skip_sleep: true,
+            }]
         }
         Err(e) => {
+            // Create failed — do not leave a stale local-pay pending from a prior topup.
+            if app.pending_routstr_topup_local_pay.is_some() {
+                let _ = clear_pending_routstr_topup_local_pay(
+                    app,
+                    "prior local pay cancelled; invoice create failed",
+                );
+            }
             let mut lines = vec![
                 format!("Routstr live invoice create failed: {e}"),
                 "Falling back to residual next-steps (no fabricated invoice).".to_owned(),
             ];
-            lines.extend(grok_bitcoin_wallet::funding_cli::topup_next_steps_lines(sats));
+            lines.extend(grok_bitcoin_wallet::funding_cli::topup_next_steps_lines(
+                sats,
+            ));
+            push_system_lines_active(app, &lines);
+            vec![]
+        }
+    }
+}
+
+/// Handle topup local-pay task result (system block only; no secrets).
+///
+/// Does **not** clear `pending_routstr_topup_local_pay` (same non-clear rule as
+/// spend: unlock already `take()`s into the effect). Does **not** stop invoice
+/// poll — success or fail, external QR + poll remain until paid / timeout.
+pub(super) fn handle_routstr_topup_local_pay_completed(
+    app: &mut AppView,
+    agent_id: AgentId,
+    result: Result<xai_grok_shell::auth::RoutstrTopupLocalPaySuccess, String>,
+) -> Vec<Effect> {
+    // Mint quote local pay: no Routstr invoice poll / no float claim on pay alone.
+    let mint_quote_pay = app
+        .pending_routstr_mint_after_pay
+        .as_ref()
+        .is_some_and(|p| p.agent_id == agent_id);
+    match result {
+        Ok(success) => {
+            let mut text = success.lines.join("\n");
+            if mint_quote_pay {
+                if success.local_paid {
+                    text.push_str(
+                        "\nMint quote BOLT11 local pay reported success (pays the mint only — \
+                         not Routstr float). Authorize proofs + redeem with /routstr unlock.",
+                    );
+                } else {
+                    text.push_str(
+                        "\nPay the mint BOLT11 with any Lightning wallet, then /routstr unlock \
+                         for proofs + redeem. Successful mint pay is never Routstr float credit.",
+                    );
+                }
+            } else if success.local_paid {
+                text.push_str(
+                    "\nLocal pay reported success; background poll will store the api_key when Routstr confirms.",
+                );
+            } else {
+                text.push_str(
+                    "\nBackground invoice poll continues — pay the BOLT11 QR with any Lightning wallet if needed.",
+                );
+            }
+            push_system_to_agent(app, agent_id, text);
+        }
+        Err(message) => {
+            let fallback = if mint_quote_pay {
+                "Pay the mint BOLT11 with any Lightning wallet, then /routstr unlock for proofs + redeem \
+                 (or P0: /routstr topup for a Routstr node invoice)."
+            } else {
+                "Background invoice poll continues — pay the BOLT11 with any Lightning wallet."
+            };
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!("Local Lightning pay failed before complete:\n{message}\n{fallback}"),
+            );
+        }
+    }
+    vec![]
+}
+
+/// `/routstr mint` — Cashu NUT-04 quote → pay → proofs → redeem when live.
+///
+/// When `proofs_mint_live`: stage mint quote + prompt unlock (SeedVault). After
+/// quote success, stages after-pay pending for a second unlock. When not live:
+/// residual lines + P0 topup fall-through (no fabricated invoice / float claim).
+pub(super) fn dispatch_routstr_mint(app: &mut AppView, sats: Option<u64>) -> Vec<Effect> {
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        return vec![];
+    };
+    use grok_bitcoin_wallet::cashu::{
+        CashuBackend, CashuMintProductPath, cashu_mint_residual_lines,
+        decide_cashu_mint_product_path,
+    };
+
+    let cashu = grok_bitcoin_wallet::cashu::default_cashu_backend();
+    let path = decide_cashu_mint_product_path(cashu.capabilities());
+    if path != CashuMintProductPath::LiveProofs {
+        let mut lines = cashu_mint_residual_lines(sats, path);
+        lines.extend(grok_bitcoin_wallet::funding_cli::topup_next_steps_lines(
+            sats,
+        ));
+        push_system_lines_active(app, &lines);
+        return vec![];
+    }
+
+    // Live path: supersede other money pendings, stage mint quote unlock.
+    if app.routstr_passphrase_modal.is_some() {
+        let _ = clear_routstr_passphrase_modal(app, "superseded by /routstr mint");
+    }
+    if app.pending_routstr_spend.is_some() {
+        let _ = clear_pending_routstr_spend(app, "superseded by /routstr mint");
+    }
+    if app.pending_routstr_rbf.is_some() {
+        let _ = clear_pending_routstr_rbf(app, "superseded by /routstr mint");
+    }
+    if app.pending_routstr_cpfp.is_some() {
+        let _ = clear_pending_routstr_cpfp(app, "superseded by /routstr mint");
+    }
+    if app.pending_routstr_utxos.is_some() {
+        let _ = clear_pending_routstr_utxos(app, "superseded by /routstr mint");
+    }
+    if app.pending_routstr_topup_local_pay.is_some() {
+        let _ = clear_pending_routstr_topup_local_pay(app, "superseded by /routstr mint");
+    }
+    if app.pending_routstr_mint_quote.is_some() {
+        let _ = clear_pending_routstr_mint_quote(app, "superseded by a new /routstr mint");
+    }
+    if app.pending_routstr_mint_after_pay.is_some() {
+        let _ = clear_pending_routstr_mint_after_pay(app, "superseded by a new /routstr mint");
+    }
+    if app.pending_routstr_melt.is_some() {
+        let _ = clear_pending_routstr_melt(app, "superseded by /routstr mint");
+    }
+
+    app.pending_routstr_mint_quote = Some(crate::app::app_view::PendingRoutstrMintQuote {
+        agent_id,
+        amount_sats: sats,
+    });
+    let amount_line = match sats {
+        Some(s) => format!("{s} sats"),
+        None => "default amount".to_owned(),
+    };
+    push_system_to_agent(
+        app,
+        agent_id,
+        format!(
+            "Staged Cashu mint quote ({amount_line}) — pays the mint only, not Routstr float.\n\
+             Authorize with: /routstr unlock <recovery phrase words…>\n\
+             Optional private BIP-39 passphrase: /routstr unlock pass <phrase…>\n\
+             Optional AEAD password: /routstr unlock [pass] pw:<password> <phrase…>\n\
+             After pay of the mint BOLT11, re-run /routstr unlock to complete proofs + redeem.\n\
+             Float is credited only when redeem succeeds. Cancel with /routstr fund."
+        ),
+    );
+    vec![]
+}
+
+/// Handle mint quote task result: show lines; stage after-pay when quote succeeded.
+pub(super) fn handle_routstr_mint_quote_completed(
+    app: &mut AppView,
+    agent_id: AgentId,
+    result: Result<xai_grok_shell::auth::RoutstrMintQuoteSuccess, String>,
+) -> Vec<Effect> {
+    match result {
+        Ok(success) => {
+            push_system_to_agent(app, agent_id, success.lines.join("\n"));
+            if let (Some(quote_id), Some(bolt11)) = (success.quote_id, success.bolt11) {
+                // Stage after-pay for second unlock (supersede leftover quote staging).
+                if app.pending_routstr_mint_quote.is_some() {
+                    let _ =
+                        clear_pending_routstr_mint_quote(app, "quote complete; staging after-pay");
+                }
+                if app.pending_routstr_mint_after_pay.is_some() {
+                    let _ = clear_pending_routstr_mint_after_pay(
+                        app,
+                        "superseded by new mint quote result",
+                    );
+                }
+                let bolt11_for_pay = bolt11.clone();
+                app.pending_routstr_mint_after_pay =
+                    Some(crate::app::app_view::PendingRoutstrMintAfterPay {
+                        agent_id,
+                        quote_id: quote_id.clone(),
+                        bolt11,
+                        amount_sats: success.amount_sats,
+                    });
+
+                // CLI parity: when LDK bolt11_pay_live, stage SeedVault local pay
+                // for the **mint** BOLT11 (settles mint quote only — never float).
+                // Unlock prefers topup_local_pay over mint_after_pay so pay runs
+                // first; after-pay remains staged for a second unlock.
+                use grok_bitcoin_wallet::lightning::{
+                    LightningCapability, LocalBolt11PayPath, decide_local_bolt11_pay_path,
+                };
+                let ln = grok_bitcoin_wallet::lightning::default_lightning_backend();
+                let auto_pay = decide_local_bolt11_pay_path(ln.capabilities())
+                    == LocalBolt11PayPath::AutoPayFromSeedVault;
+                let mut stage_msg = format!(
+                    "Staged Cashu mint after-pay for quote {quote_id}.\n\
+                     Pay the mint BOLT11 (not Routstr float), then authorize proofs + redeem with:\n\
+                     /routstr unlock <recovery phrase words…>\n\
+                     Token is never stored in scrollback; float only after redeem succeeds."
+                );
+                if auto_pay {
+                    if app.pending_routstr_topup_local_pay.is_some() {
+                        let _ = clear_pending_routstr_topup_local_pay(
+                            app,
+                            "superseded by mint quote local pay",
+                        );
+                    }
+                    app.pending_routstr_topup_local_pay =
+                        Some(crate::app::app_view::PendingRoutstrTopupLocalPay {
+                            agent_id,
+                            bolt11: bolt11_for_pay,
+                            invoice_id: quote_id.clone(),
+                            mint_quote_pay: true,
+                        });
+                    stage_msg.push_str(
+                        "\nLocal Lightning pay is live — first /routstr unlock pays the mint \
+                         BOLT11 from SeedVault (still not Routstr float). Second unlock \
+                         completes proofs + redeem after the mint marks the quote paid.",
+                    );
+                }
+                push_system_to_agent(app, agent_id, stage_msg);
+            }
+        }
+        Err(message) => {
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!(
+                    "Cashu mint quote failed before complete:\n{message}\n\
+                     Falling through to P0: use /routstr topup for Routstr node BOLT11."
+                ),
+            );
+        }
+    }
+    vec![]
+}
+
+/// Handle mint after-pay task result (clipboard token only when redeem failed).
+pub(super) fn handle_routstr_mint_after_pay_completed(
+    app: &mut AppView,
+    agent_id: AgentId,
+    result: Result<xai_grok_shell::auth::RoutstrMintAfterPaySuccess, String>,
+) -> Vec<Effect> {
+    match result {
+        Ok(mut success) => {
+            // Clipboard full token only when obtained but not redeemed — never scrollback.
+            if let Some(token) = success.token_for_clipboard.take() {
+                if let Some(agent) = app.agents.get_mut(&agent_id) {
+                    let _ = agent.copy_to_clipboard(&token);
+                }
+                // Drop token immediately after copy attempt (zeroize via overwrite).
+                let mut t = token;
+                grok_bitcoin_wallet::mnemonic::zeroize_phrase(&mut t);
+            }
+            let mut text = success.lines.join("\n");
+            if success.float_credited {
+                text.push_str("\nRun /routstr balance to confirm prepaid float.");
+            } else if success.token_obtained {
+                text.push_str(
+                    "\nToken (if any) was offered to clipboard only — not stored in scrollback.",
+                );
+            }
+            push_system_to_agent(app, agent_id, text);
+        }
+        Err(message) => {
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!(
+                    "Cashu mint after-pay failed before complete:\n{message}\n\
+                     No float credit was claimed. Resume with grok routstr mint --complete <quote_id> \
+                     or use /routstr topup (P0)."
+                ),
+            );
+        }
+    }
+    vec![]
+}
+
+/// Live node refund, or stage local Cashu melt when token+invoice are provided.
+///
+/// Full Cashu token is **never** written into session scrollback (persisted /
+/// searchable). Node path: clipboard + redacted preview. Melt path: stage
+/// [`PendingRoutstrMelt`] (SensitiveString token) + unlock; never claims sk- float.
+pub(super) fn dispatch_routstr_refund(
+    app: &mut AppView,
+    token: Option<crate::app::actions::SensitiveString>,
+    invoice: Option<String>,
+) -> Vec<Effect> {
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        return vec![];
+    };
+
+    let has_token = token
+        .as_ref()
+        .is_some_and(|t| !t.as_str().trim().is_empty());
+    let has_invoice = invoice.as_ref().is_some_and(|i| !i.trim().is_empty());
+
+    match (has_token, has_invoice) {
+        (true, true) => {
+            let token = token.expect("has_token");
+            let bolt11 = invoice.expect("has_invoice").trim().to_owned();
+            return dispatch_routstr_melt_stage(app, agent_id, token, bolt11);
+        }
+        (false, false) => {}
+        _ => {
+            push_system_to_agent(
+                app,
+                agent_id,
+                "Melt requires both token=… and invoice=… \
+                 (or omit both for node float refund).\n\
+                 Usage: /routstr refund\n\
+                 Usage: /routstr refund token=<cashuA…> invoice=<BOLT11>\n\
+                 Melt never credits Routstr sk- float."
+                    .to_owned(),
+            );
+            return vec![];
+        }
+    }
+
+    let key = xai_grok_shell::auth::load_routstr_api_key_default()
+        .ok()
+        .flatten()
+        .filter(|k| !k.trim().is_empty());
+    let lines = match key {
+        Some(k) => match xai_grok_shell::auth::refund_routstr_balance_live(&k) {
+            Ok(Some(token)) => {
+                let redacted = xai_grok_shell::auth::redact_secret_preview(&token);
+                // Clipboard + toast only — not scrollback (session-visible).
+                if let Some(agent) = app.agents.get_mut(&agent_id) {
+                    let _ = agent.copy_to_clipboard(&token);
+                }
+                vec![
+                    "Routstr refund succeeded (Cashu token returned once).".to_owned(),
+                    format!("Redacted preview: {redacted}"),
+                    "Full token copied to clipboard when available (not stored in scrollback). \
+                     Paste offline now if you need a backup."
+                        .to_owned(),
+                    "Hot float on the node may now be zero.".to_owned(),
+                ]
+            }
+            Ok(None) => vec![
+                "Routstr refund HTTP succeeded but no Cashu token field was found.".to_owned(),
+                "Run /routstr balance to check remaining float.".to_owned(),
+            ],
+            Err(e) => {
+                let mut lines = vec![
+                    format!("Routstr live refund failed: {e}"),
+                    "Falling back to residual next-steps (no fabricated token).".to_owned(),
+                ];
+                lines.extend(grok_bitcoin_wallet::funding_cli::refund_next_steps_lines());
+                lines
+            }
+        },
+        None => {
+            let mut lines = vec!["No Routstr API key — cannot call live refund.".to_owned()];
+            lines.extend(grok_bitcoin_wallet::funding_cli::refund_next_steps_lines());
             lines
         }
     };
     push_system_lines_active(app, &lines);
+    // Refresh balance chrome after refund attempt.
+    vec![Effect::FetchAppBilling]
+}
+
+/// Stage local melt + unlock when live; residual copy when not.
+fn dispatch_routstr_melt_stage(
+    app: &mut AppView,
+    agent_id: AgentId,
+    token: crate::app::actions::SensitiveString,
+    bolt11: String,
+) -> Vec<Effect> {
+    use grok_bitcoin_wallet::cashu::{
+        CashuBackend, CashuMeltProductPath, cashu_melt_residual_lines,
+        decide_cashu_melt_product_path,
+    };
+
+    // Validate shapes before staging (token stays in SensitiveString).
+    if grok_bitcoin_wallet::cashu::CashuToken::parse(token.as_str()).is_err() {
+        push_system_to_agent(
+            app,
+            agent_id,
+            "token failed CashuToken::parse (need cashuA…/cashuB…). No melt staged.\n\
+             No Routstr float was claimed."
+                .to_owned(),
+        );
+        return vec![];
+    }
+    if !grok_bitcoin_wallet::routstr_invoice::looks_like_bolt11(&bolt11) {
+        push_system_to_agent(
+            app,
+            agent_id,
+            "invoice failed looks_like_bolt11 (lnurl rejected). No melt staged.\n\
+             No Routstr float was claimed."
+                .to_owned(),
+        );
+        return vec![];
+    }
+
+    let cashu = grok_bitcoin_wallet::cashu::default_cashu_backend();
+    let path = decide_cashu_melt_product_path(cashu.capabilities());
+    if path != CashuMeltProductPath::LiveMelt {
+        let mut lines = cashu_melt_residual_lines();
+        lines.extend(grok_bitcoin_wallet::funding_cli::refund_next_steps_lines());
+        push_system_lines_active(app, &lines);
+        // Drop token without staging (zeroize via SensitiveString Drop).
+        drop(token);
+        return vec![];
+    }
+
+    // Live path: supersede other money pendings, stage melt unlock.
+    if app.routstr_passphrase_modal.is_some() {
+        let _ = clear_routstr_passphrase_modal(app, "superseded by /routstr refund melt");
+    }
+    if app.pending_routstr_spend.is_some() {
+        let _ = clear_pending_routstr_spend(app, "superseded by /routstr refund melt");
+    }
+    if app.pending_routstr_rbf.is_some() {
+        let _ = clear_pending_routstr_rbf(app, "superseded by /routstr refund melt");
+    }
+    if app.pending_routstr_cpfp.is_some() {
+        let _ = clear_pending_routstr_cpfp(app, "superseded by /routstr refund melt");
+    }
+    if app.pending_routstr_utxos.is_some() {
+        let _ = clear_pending_routstr_utxos(app, "superseded by /routstr refund melt");
+    }
+    if app.pending_routstr_topup_local_pay.is_some() {
+        let _ = clear_pending_routstr_topup_local_pay(app, "superseded by /routstr refund melt");
+    }
+    if app.pending_routstr_mint_quote.is_some() {
+        let _ = clear_pending_routstr_mint_quote(app, "superseded by /routstr refund melt");
+    }
+    if app.pending_routstr_mint_after_pay.is_some() {
+        let _ = clear_pending_routstr_mint_after_pay(app, "superseded by /routstr refund melt");
+    }
+    if app.pending_routstr_melt.is_some() {
+        let _ = clear_pending_routstr_melt(app, "superseded by a new /routstr refund melt");
+    }
+
+    let bolt11_preview = if bolt11.len() > 24 {
+        format!("{}…", &bolt11[..24])
+    } else {
+        bolt11.clone()
+    };
+    app.pending_routstr_melt = Some(crate::app::app_view::PendingRoutstrMelt {
+        agent_id,
+        token,
+        bolt11,
+    });
+    push_system_to_agent(
+        app,
+        agent_id,
+        format!(
+            "Staged Cashu melt to destination BOLT11 ({bolt11_preview}).\n\
+             Token is held only until unlock (not stored in scrollback).\n\
+             Authorize with: /routstr unlock <recovery phrase words…>\n\
+             Optional private BIP-39 passphrase: /routstr unlock pass <phrase…>\n\
+             Optional AEAD password: /routstr unlock [pass] pw:<password> <phrase…>\n\
+             Melt spends Cashu to Lightning — never credits Routstr sk- float.\n\
+             Cancel with /routstr fund."
+        ),
+    );
     vec![]
 }
 
-/// Honest refund stub (shared copy with CLI).
-pub(super) fn dispatch_routstr_refund(app: &mut AppView) -> Vec<Effect> {
-    let lines = grok_bitcoin_wallet::funding_cli::refund_next_steps_lines();
-    push_system_lines_active(app, &lines);
+/// Handle melt task result (never claims float; no full token in lines).
+pub(super) fn handle_routstr_melt_completed(
+    app: &mut AppView,
+    agent_id: AgentId,
+    result: Result<xai_grok_shell::auth::RoutstrMeltSuccess, String>,
+) -> Vec<Effect> {
+    match result {
+        Ok(success) => {
+            let mut text = success.lines.join("\n");
+            if success.melted {
+                text.push_str(
+                    "\nLocal melt Paid only — node sk- float unchanged. \
+                     Run /routstr balance to check prepaid float.",
+                );
+            }
+            push_system_to_agent(app, agent_id, text);
+        }
+        Err(message) => {
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!(
+                    "Cashu melt failed before complete:\n{message}\n\
+                     No Routstr float was claimed. Use bare /routstr refund for node float \
+                     residual, or re-stage /routstr refund token=… invoice=…."
+                ),
+            );
+        }
+    }
     vec![]
+}
+
+/// Best-effort pending invoice id for resume (no secrets; invoice id only).
+fn persist_pending_routstr_invoice(invoice_id: &str, generation: u64) {
+    let id = invoice_id.trim();
+    if id.is_empty() {
+        return;
+    }
+    if grok_bitcoin_wallet::routstr_invoice::validate_invoice_id(id).is_err() {
+        return;
+    }
+    let path = pending_invoice_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = serde_json::json!({
+        "invoice_id": id,
+        "generation": generation,
+        "running": true,
+    });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&body) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+fn clear_pending_routstr_invoice() {
+    let path = pending_invoice_path();
+    let _ = std::fs::remove_file(path);
+}
+
+fn pending_invoice_path() -> std::path::PathBuf {
+    grok_home()
+        .join("bitcoin")
+        .join("pending_routstr_invoice.json")
+}
+
+/// Resume a pending invoice poll after pager restart (if durable id exists).
+pub(crate) fn try_resume_pending_routstr_invoice(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        return vec![];
+    };
+    if app.routstr_invoice_poll_id.is_some() {
+        return vec![];
+    }
+    let path = pending_invoice_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        return vec![];
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return vec![];
+    };
+    if v.get("running").and_then(|r| r.as_bool()) != Some(true) {
+        return vec![];
+    }
+    let Some(id) = v
+        .get("invoice_id")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return vec![];
+    };
+    if grok_bitcoin_wallet::routstr_invoice::validate_invoice_id(id).is_err() {
+        return vec![];
+    }
+    app.routstr_invoice_poll_generation = app.routstr_invoice_poll_generation.saturating_add(1);
+    let generation = app.routstr_invoice_poll_generation;
+    app.routstr_invoice_poll_id = Some(id.to_owned());
+    app.routstr_invoice_poll_agent_id = Some(agent_id);
+    app.routstr_invoice_poll_error_streak = 0;
+    app.routstr_invoice_poll_started = Some(std::time::Instant::now());
+    push_system_to_agent(
+        app,
+        agent_id,
+        format!("Resuming Routstr invoice payment poll for {id}…"),
+    );
+    vec![Effect::RoutstrInvoicePoll {
+        agent_id,
+        invoice_id: id.to_owned(),
+        generation,
+        skip_sleep: true,
+    }]
+}
+
+fn invoice_poll_accepts(app: &AppView, generation: u64, invoice_id: &str) -> bool {
+    app.routstr_invoice_poll_id.is_some()
+        && app.routstr_invoice_poll_generation > 0
+        && generation == app.routstr_invoice_poll_generation
+        && app.routstr_invoice_poll_id.as_deref() == Some(invoice_id)
+}
+
+/// Clear invoice poll state and durable pending file; bump generation.
+fn stop_routstr_invoice_poll(app: &mut AppView) {
+    app.routstr_invoice_poll_id = None;
+    app.routstr_invoice_poll_agent_id = None;
+    app.routstr_invoice_poll_error_streak = 0;
+    app.routstr_invoice_poll_started = None;
+    app.routstr_invoice_poll_generation = app.routstr_invoice_poll_generation.saturating_add(1);
+    clear_pending_routstr_invoice();
+}
+
+/// Permanent poll failures (do not re-arm).
+fn invoice_poll_error_is_terminal(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("invoice id must")
+        || e.contains("invoice id too long")
+        || e.contains("http 400")
+        || e.contains("http 401")
+        || e.contains("http 403")
+        || e.contains("http 404")
+        || e.contains("http 422")
+        || e.contains("ended unpaid")
+        || e.contains("expired")
+}
+
+/// Apply one invoice status tick if generation is still current.
+#[allow(clippy::too_many_arguments)] // Mirrors watch_tick: generation + status payload fields.
+pub(super) fn handle_routstr_invoice_tick(
+    app: &mut AppView,
+    agent_id: AgentId,
+    generation: u64,
+    invoice_id: String,
+    status: String,
+    api_key: Option<crate::app::actions::SensitiveString>,
+    paid: bool,
+    expires_at: Option<i64>,
+    error: Option<String>,
+) -> Vec<Effect> {
+    if !invoice_poll_accepts(app, generation, &invoice_id) {
+        return vec![];
+    }
+    if let Some(err) = error {
+        app.routstr_invoice_poll_error_streak =
+            app.routstr_invoice_poll_error_streak.saturating_add(1);
+        let streak = app.routstr_invoice_poll_error_streak;
+        let terminal =
+            invoice_poll_error_is_terminal(&err) || streak >= INVOICE_POLL_ERROR_STOP_CAP;
+        if streak <= INVOICE_POLL_ERROR_SCROLLBACK_CAP {
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!("Invoice poll error for {invoice_id}: {err}"),
+            );
+        }
+        if terminal {
+            stop_routstr_invoice_poll(app);
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!(
+                    "Stopped invoice poll for {invoice_id} after errors. \
+                     Re-run `/routstr topup`, `grok routstr topup --status {invoice_id}`, \
+                     or `grok routstr topup --recover <bolt11>`."
+                ),
+            );
+            return vec![];
+        }
+        // Quiet re-arm after scrollback cap (do not clear pending).
+        return vec![Effect::RoutstrInvoicePoll {
+            agent_id,
+            invoice_id,
+            generation,
+            skip_sleep: false,
+        }];
+    }
+    // Successful status body resets error streak.
+    app.routstr_invoice_poll_error_streak = 0;
+
+    if paid {
+        // Clear poll state before store so a concurrent topup cannot be cleared wrongly.
+        stop_routstr_invoice_poll(app);
+        let mut effects = Vec::new();
+        if let Some(key_ss) = api_key {
+            let key = key_ss.into_inner();
+            let key_trim = key.trim();
+            if !key_trim.is_empty() {
+                match xai_grok_shell::auth::store_paid_routstr_key(key_trim) {
+                    Ok(()) => {
+                        push_system_to_agent(
+                            app,
+                            agent_id,
+                            format!(
+                                "Routstr payment confirmed for invoice {invoice_id}. API key stored \
+                                 (or env already set). Model is not auto-switched."
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        push_system_to_agent(
+                            app,
+                            agent_id,
+                            format!(
+                                "Payment paid for {invoice_id} but storing key failed: {e}. \
+                                 Set ROUTSTR_API_KEY or run grok login --routstr."
+                            ),
+                        );
+                    }
+                }
+            } else {
+                push_system_to_agent(
+                    app,
+                    agent_id,
+                    format!(
+                        "Invoice {invoice_id} is paid but no api_key in status body. \
+                         Try: grok routstr topup --recover <bolt11>"
+                    ),
+                );
+            }
+        } else {
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!(
+                    "Invoice {invoice_id} is paid but no api_key in status body. \
+                     Try: grok routstr topup --recover <bolt11>"
+                ),
+            );
+        }
+        // Hint only when not already on a Routstr model — never auto-switch.
+        let on_routstr = app
+            .agents
+            .get(&agent_id)
+            .and_then(|a| a.session.models.current.as_ref())
+            .is_some_and(|id| xai_grok_shell::auth::is_routstr_catalog_id(id.0.as_ref()));
+        if !on_routstr {
+            push_system_to_agent(
+                app,
+                agent_id,
+                format!(
+                    "Select Routstr Grok 4.5 in the model picker (`/model {}`) to use this float.",
+                    xai_grok_shell::auth::ROUTSTR_GROK_45_CATALOG_ID
+                ),
+            );
+        }
+        // Refresh balance chrome (harmless when not on Routstr model).
+        effects.push(Effect::FetchAppBilling);
+        return effects;
+    }
+
+    // Terminal unpaid statuses or wall-clock expiry.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let terminal_unpaid = grok_bitcoin_wallet::routstr_invoice::is_terminal_unpaid_status(&status)
+        || expires_at.is_some_and(|exp| exp > 0 && now_unix >= exp);
+    if terminal_unpaid {
+        stop_routstr_invoice_poll(app);
+        push_system_to_agent(
+            app,
+            agent_id,
+            format!(
+                "Invoice {invoice_id} is no longer payable (status={status}). \
+                 Create a new invoice with `/routstr topup`."
+            ),
+        );
+        return vec![];
+    }
+
+    // Soft wall-clock timeout (process-lifetime poll must not run forever).
+    if app
+        .routstr_invoice_poll_started
+        .is_some_and(|t| t.elapsed() >= INVOICE_POLL_SOFT_TIMEOUT)
+    {
+        stop_routstr_invoice_poll(app);
+        push_system_to_agent(
+            app,
+            agent_id,
+            format!(
+                "Stopped invoice poll for {invoice_id} after soft timeout. \
+                 If you paid, run `grok routstr topup --status {invoice_id}` or \
+                 `grok routstr topup --recover <bolt11>`; otherwise `/routstr topup` again."
+            ),
+        );
+        return vec![];
+    }
+
+    // Still pending — re-arm quietly (avoid scrollback spam).
+    let _ = status;
+    vec![Effect::RoutstrInvoicePoll {
+        agent_id,
+        invoice_id,
+        generation,
+        skip_sleep: false,
+    }]
 }
 
 /// Start background watch for `address` on the **active** agent (slash path).
@@ -1501,25 +2624,207 @@ mod tests {
     #[test]
     fn topup_and_refund_push_honest_copy() {
         let mut app = test_app_with_agent();
-        let _ = dispatch(Action::RoutstrTopup { sats: Some(1000) }, &mut app);
-        let _ = dispatch(Action::RoutstrRefund, &mut app);
+        let effects = dispatch(Action::RoutstrTopup { sats: Some(1000) }, &mut app);
+        let _ = dispatch(
+            Action::RoutstrRefund {
+                token: None,
+                invoice: None,
+            },
+            &mut app,
+        );
         let agent = app.agents.values().next().unwrap();
         let text: String = (0..agent.scrollback.len())
             .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
             .collect();
         let lower = text.to_ascii_lowercase();
-        // Live create may succeed (invoice ready) or fail to residual (not wired).
+        // Live create may succeed (invoice ready + poll effect) or fail to residual.
         // Never claim a completed payment without status poll + api_key store.
         assert!(
-            lower.contains("not wired")
-                || lower.contains("not available")
-                || lower.contains("invoice ready")
+            lower.contains("invoice ready")
                 || lower.contains("bolt11")
-                || lower.contains("live invoice create failed"),
+                || lower.contains("live invoice create failed")
+                || lower.contains("grok routstr topup")
+                || lower.contains("no website"),
             "expected topup residual or live invoice wording: {text}"
         );
+        assert!(!lower.contains("docs.routstr.com"));
         assert!(!lower.contains("payment sent"));
         assert!(!lower.contains("refund completed"));
+        // When create succeeds, a background invoice poll is armed.
+        if lower.contains("invoice ready") || lower.contains("bolt11") {
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RoutstrInvoicePoll { .. })),
+                "expected RoutstrInvoicePoll after successful create: {effects:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invoice_poll_generation_drops_stale_ticks() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let id = *app.agents.keys().next().unwrap();
+        app.routstr_invoice_poll_generation = 2;
+        app.routstr_invoice_poll_id = Some("inv-1".into());
+        app.routstr_invoice_poll_agent_id = Some(id);
+        // Stale generation must be a no-op.
+        let effects = handle_routstr_invoice_tick(
+            &mut app,
+            id,
+            1,
+            "inv-1".into(),
+            "paid".into(),
+            Some(SensitiveString::new("sk-test")),
+            true,
+            None,
+            None,
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.routstr_invoice_poll_id.as_deref(), Some("inv-1"));
+    }
+
+    #[test]
+    fn invoice_tick_debug_redacts_api_key() {
+        use crate::app::actions::{SensitiveString, TaskResult};
+        let tick = TaskResult::RoutstrInvoiceTick {
+            agent_id: AgentId(0),
+            generation: 1,
+            invoice_id: "inv-1".into(),
+            status: "paid".into(),
+            api_key: Some(SensitiveString::new("sk-supersecret-key-value")),
+            paid: true,
+            expires_at: Some(99),
+            error: None,
+        };
+        let dbg = format!("{tick:?}");
+        assert!(
+            !dbg.contains("sk-supersecret-key-value"),
+            "TaskResult Debug leaked api_key: {dbg}"
+        );
+        assert!(
+            dbg.contains("***"),
+            "expected redacted SensitiveString: {dbg}"
+        );
+    }
+
+    #[test]
+    fn invoice_poll_stops_on_terminal_error_and_caps_scrollback() {
+        let mut app = test_app_with_agent();
+        let id = *app.agents.keys().next().unwrap();
+        app.routstr_invoice_poll_generation = 1;
+        app.routstr_invoice_poll_id = Some("inv-bad".into());
+        app.routstr_invoice_poll_agent_id = Some(id);
+        app.routstr_invoice_poll_error_streak = 0;
+        app.routstr_invoice_poll_started = Some(std::time::Instant::now());
+
+        // Terminal HTTP 404 stops immediately.
+        let effects = handle_routstr_invoice_tick(
+            &mut app,
+            id,
+            1,
+            "inv-bad".into(),
+            "error".into(),
+            None,
+            false,
+            None,
+            Some("invoice status HTTP 404: not found".into()),
+        );
+        assert!(effects.is_empty());
+        assert!(app.routstr_invoice_poll_id.is_none());
+
+        // Cap: non-terminal errors re-arm until STOP_CAP.
+        app.routstr_invoice_poll_generation = 2;
+        app.routstr_invoice_poll_id = Some("inv-2".into());
+        app.routstr_invoice_poll_agent_id = Some(id);
+        app.routstr_invoice_poll_error_streak = 0;
+        app.routstr_invoice_poll_started = Some(std::time::Instant::now());
+        let len0 = app.agents.get(&id).unwrap().scrollback.len();
+        for i in 0..INVOICE_POLL_ERROR_STOP_CAP {
+            let poll_gen = app.routstr_invoice_poll_generation;
+            let effects = handle_routstr_invoice_tick(
+                &mut app,
+                id,
+                poll_gen,
+                "inv-2".into(),
+                "error".into(),
+                None,
+                false,
+                None,
+                Some(format!("network blip {i}")),
+            );
+            if i + 1 < INVOICE_POLL_ERROR_STOP_CAP {
+                assert!(
+                    effects
+                        .iter()
+                        .any(|e| matches!(e, Effect::RoutstrInvoicePoll { .. })),
+                    "expected re-arm on error {i}: {effects:?}"
+                );
+            } else {
+                assert!(effects.is_empty(), "stop after cap: {effects:?}");
+                assert!(app.routstr_invoice_poll_id.is_none());
+            }
+        }
+        let agent = app.agents.get(&id).unwrap();
+        let error_lines: usize = (len0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .filter(|t| t.contains("Invoice poll error"))
+            .count();
+        assert!(
+            error_lines <= INVOICE_POLL_ERROR_SCROLLBACK_CAP as usize + 1,
+            // +1 for the "Stopped invoice poll" system line is ok; error lines capped
+            "error scrollback should be capped; got {error_lines}"
+        );
+    }
+
+    #[test]
+    fn invoice_poll_stops_on_expired_status() {
+        let mut app = test_app_with_agent();
+        let id = *app.agents.keys().next().unwrap();
+        app.routstr_invoice_poll_generation = 1;
+        app.routstr_invoice_poll_id = Some("inv-exp".into());
+        app.routstr_invoice_poll_agent_id = Some(id);
+        app.routstr_invoice_poll_started = Some(std::time::Instant::now());
+        let effects = handle_routstr_invoice_tick(
+            &mut app,
+            id,
+            1,
+            "inv-exp".into(),
+            "expired".into(),
+            None,
+            false,
+            Some(1),
+            None,
+        );
+        assert!(effects.is_empty());
+        assert!(app.routstr_invoice_poll_id.is_none());
+        let agent = app.agents.get(&id).unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        assert!(
+            text.to_ascii_lowercase().contains("no longer payable")
+                || text.to_ascii_lowercase().contains("expired"),
+            "expected terminal unpaid message: {text}"
+        );
+    }
+
+    #[test]
+    fn refund_scrollback_never_embeds_full_cashu_token() {
+        // Pure hygiene of the system lines we build for a successful refund.
+        // Live HTTP is not invoked; we only assert the redaction contract used
+        // by dispatch_routstr_refund (redacted preview + no raw token in block).
+        let token = "cashuAthisisalongtokenvalueforrefundhygienetest";
+        let redacted = xai_grok_shell::auth::redact_secret_preview(token);
+        let lines = [
+            "Routstr refund succeeded (Cashu token returned once).".to_owned(),
+            format!("Redacted preview: {redacted}"),
+            "Full token copied to clipboard when available (not stored in scrollback).".to_owned(),
+        ];
+        let joined = lines.join("\n");
+        assert!(!joined.contains(token));
+        assert!(joined.contains(&redacted));
     }
 
     #[test]
@@ -1719,6 +3024,412 @@ mod tests {
             lower.contains("another agent") || lower.contains("staged utxo"),
             "expected cross-agent notice: {text}"
         );
+    }
+
+    /// Topup local-pay pending (bolt11_pay_live path) routes unlock to local-pay
+    /// complete, never fund, and never stores BIP-39 on the effect Debug dump.
+    #[test]
+    fn topup_local_pay_pending_unlock_routes_to_local_pay() {
+        use crate::app::actions::SensitiveString;
+        use crate::app::app_view::PendingRoutstrTopupLocalPay;
+        let mut app = test_app_with_agent();
+        // Invoice poll may already be armed independently of unlock.
+        app.routstr_invoice_poll_generation = 1;
+        app.routstr_invoice_poll_id = Some("inv-topup-1".into());
+        app.routstr_invoice_poll_agent_id = Some(AgentId(0));
+        app.pending_routstr_topup_local_pay = Some(PendingRoutstrTopupLocalPay {
+            agent_id: AgentId(0),
+            bolt11: "lnbc1testinvoiceforlocalpay".into(),
+            invoice_id: "inv-topup-1".into(),
+            mint_quote_pay: false,
+        });
+
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::RoutstrTopupLocalPayComplete {
+                    agent_id: AgentId(0),
+                    invoice_id,
+                    bolt11,
+                    ..
+                }) if invoice_id == "inv-topup-1" && bolt11 == "lnbc1testinvoiceforlocalpay"
+            ),
+            "unlock with pending topup local-pay must complete local pay, not fund: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_topup_local_pay.is_none(),
+            "pending consumed into effect"
+        );
+        // Invoice poll must remain armed (P0 independent of unlock).
+        assert_eq!(app.routstr_invoice_poll_id.as_deref(), Some("inv-topup-1"));
+        assert_eq!(app.routstr_invoice_poll_generation, 1);
+        let dbg = format!("{:?}", effects.first());
+        assert!(!dbg.contains("abandon"), "Debug leaked phrase: {dbg}");
+        assert!(
+            !matches!(effects.first(), Some(Effect::RoutstrFundComplete { .. })),
+            "must not fall through to fund"
+        );
+    }
+
+    #[test]
+    fn fund_clears_pending_topup_local_pay_poll_stays() {
+        use crate::app::app_view::PendingRoutstrTopupLocalPay;
+        let mut app = test_app_with_agent();
+        app.routstr_invoice_poll_generation = 3;
+        app.routstr_invoice_poll_id = Some("inv-keep".into());
+        app.routstr_invoice_poll_agent_id = Some(AgentId(0));
+        app.pending_routstr_topup_local_pay = Some(PendingRoutstrTopupLocalPay {
+            agent_id: AgentId(0),
+            bolt11: "lnbc1x".into(),
+            invoice_id: "inv-keep".into(),
+            mint_quote_pay: false,
+        });
+        let effects = dispatch(Action::RoutstrFund, &mut app);
+        assert!(
+            matches!(effects.first(), Some(Effect::RoutstrFundProbe { .. })),
+            "expected fund probe: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_topup_local_pay.is_none(),
+            "fund must cancel staged topup local-pay"
+        );
+        // Poll is independent of staged unlock.
+        assert_eq!(app.routstr_invoice_poll_id.as_deref(), Some("inv-keep"));
+        assert_eq!(app.routstr_invoice_poll_generation, 3);
+    }
+
+    #[test]
+    fn spend_clears_pending_topup_local_pay() {
+        use crate::app::app_view::PendingRoutstrTopupLocalPay;
+        let mut app = test_app_with_agent();
+        app.pending_routstr_topup_local_pay = Some(PendingRoutstrTopupLocalPay {
+            agent_id: AgentId(0),
+            bolt11: "lnbc1stale".into(),
+            invoice_id: "inv-stale".into(),
+            mint_quote_pay: false,
+        });
+        let _ = dispatch(
+            Action::RoutstrSpend {
+                address: "bc1qtest".into(),
+                amount_sats: 1000,
+                broadcast: false,
+                fee_rate_sat_vb: Some(5),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_spend.is_some());
+        assert!(
+            app.pending_routstr_topup_local_pay.is_none(),
+            "staging spend must cancel topup local-pay"
+        );
+    }
+
+    #[test]
+    fn rbf_clears_pending_topup_local_pay_poll_stays() {
+        use crate::app::app_view::PendingRoutstrTopupLocalPay;
+        let mut app = test_app_with_agent();
+        app.routstr_invoice_poll_generation = 7;
+        app.routstr_invoice_poll_id = Some("inv-rbf-poll".into());
+        app.routstr_invoice_poll_agent_id = Some(AgentId(0));
+        app.pending_routstr_topup_local_pay = Some(PendingRoutstrTopupLocalPay {
+            agent_id: AgentId(0),
+            bolt11: "lnbc1rbf".into(),
+            invoice_id: "inv-rbf-poll".into(),
+            mint_quote_pay: false,
+        });
+        let _ = dispatch(
+            Action::RoutstrRbf {
+                address: "bc1qdest".into(),
+                amount_sats: 21_000,
+                original_fee_sats: 705,
+                original_vbytes: 141,
+                input_specs: vec![sample_rbf_input_spec()],
+                broadcast: false,
+                fee_rate_sat_vb: Some(10),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_rbf.is_some());
+        assert!(
+            app.pending_routstr_topup_local_pay.is_none(),
+            "staging rbf must cancel topup local-pay"
+        );
+        assert_eq!(app.routstr_invoice_poll_id.as_deref(), Some("inv-rbf-poll"));
+        assert_eq!(app.routstr_invoice_poll_generation, 7);
+    }
+
+    #[test]
+    fn cpfp_clears_pending_topup_local_pay_poll_stays() {
+        use crate::app::app_view::PendingRoutstrTopupLocalPay;
+        let mut app = test_app_with_agent();
+        app.routstr_invoice_poll_generation = 8;
+        app.routstr_invoice_poll_id = Some("inv-cpfp-poll".into());
+        app.routstr_invoice_poll_agent_id = Some(AgentId(0));
+        app.pending_routstr_topup_local_pay = Some(PendingRoutstrTopupLocalPay {
+            agent_id: AgentId(0),
+            bolt11: "lnbc1cpfp".into(),
+            invoice_id: "inv-cpfp-poll".into(),
+            mint_quote_pay: false,
+        });
+        let _ = dispatch(
+            Action::RoutstrCpfp {
+                address: "bc1qdest".into(),
+                amount_sats: 10_000,
+                parent_fee_sats: 500,
+                parent_vbytes: 141,
+                parent_specs: vec![sample_cpfp_parent_spec()],
+                extra_input_specs: vec![],
+                broadcast: false,
+                fee_rate_sat_vb: Some(12),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_cpfp.is_some());
+        assert!(
+            app.pending_routstr_topup_local_pay.is_none(),
+            "staging cpfp must cancel topup local-pay"
+        );
+        assert_eq!(
+            app.routstr_invoice_poll_id.as_deref(),
+            Some("inv-cpfp-poll")
+        );
+        assert_eq!(app.routstr_invoice_poll_generation, 8);
+    }
+
+    #[test]
+    fn utxos_clears_pending_topup_local_pay_poll_stays() {
+        use crate::app::app_view::PendingRoutstrTopupLocalPay;
+        let mut app = test_app_with_agent();
+        app.routstr_invoice_poll_generation = 9;
+        app.routstr_invoice_poll_id = Some("inv-utxos-poll".into());
+        app.routstr_invoice_poll_agent_id = Some(AgentId(0));
+        app.pending_routstr_topup_local_pay = Some(PendingRoutstrTopupLocalPay {
+            agent_id: AgentId(0),
+            bolt11: "lnbc1utxos".into(),
+            invoice_id: "inv-utxos-poll".into(),
+            mint_quote_pay: false,
+        });
+        let _ = dispatch(
+            Action::RoutstrUtxos {
+                network: Some("signet".into()),
+            },
+            &mut app,
+        );
+        assert!(app.pending_routstr_utxos.is_some());
+        assert!(
+            app.pending_routstr_topup_local_pay.is_none(),
+            "staging utxos must cancel topup local-pay"
+        );
+        assert_eq!(
+            app.routstr_invoice_poll_id.as_deref(),
+            Some("inv-utxos-poll")
+        );
+        assert_eq!(app.routstr_invoice_poll_generation, 9);
+    }
+
+    /// Empty unlock cancel must not consume staged topup local-pay (retry allowed)
+    /// and must not stop the independent invoice poll.
+    #[test]
+    fn empty_unlock_keeps_pending_topup_local_pay_and_poll() {
+        use crate::app::actions::SensitiveString;
+        use crate::app::app_view::PendingRoutstrTopupLocalPay;
+        let mut app = test_app_with_agent();
+        app.routstr_invoice_poll_generation = 4;
+        app.routstr_invoice_poll_id = Some("inv-cancel".into());
+        app.routstr_invoice_poll_agent_id = Some(AgentId(0));
+        app.pending_routstr_topup_local_pay = Some(PendingRoutstrTopupLocalPay {
+            agent_id: AgentId(0),
+            bolt11: "lnbc1keep".into(),
+            invoice_id: "inv-cancel".into(),
+            mint_quote_pay: false,
+        });
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("   "),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            effects.is_empty(),
+            "empty unlock must not emit complete effect: {effects:?}"
+        );
+        assert!(
+            !matches!(
+                effects.first(),
+                Some(Effect::RoutstrTopupLocalPayComplete { .. })
+            ),
+            "empty unlock must not consume topup local-pay"
+        );
+        let pending = app
+            .pending_routstr_topup_local_pay
+            .as_ref()
+            .expect("pending must remain for retry");
+        assert_eq!(pending.invoice_id, "inv-cancel");
+        assert_eq!(pending.bolt11, "lnbc1keep");
+        assert_eq!(pending.agent_id, AgentId(0));
+        assert_eq!(app.routstr_invoice_poll_id.as_deref(), Some("inv-cancel"));
+        assert_eq!(app.routstr_invoice_poll_generation, 4);
+    }
+
+    #[test]
+    fn unlock_rejects_topup_local_pay_when_active_agent_differs() {
+        use crate::app::actions::SensitiveString;
+        use crate::app::app_view::PendingRoutstrTopupLocalPay;
+        let mut app = test_app_with_agent();
+        crate::app::dispatch::tests::insert_placeholder_agent(&mut app, AgentId(1));
+        app.pending_routstr_topup_local_pay = Some(PendingRoutstrTopupLocalPay {
+            agent_id: AgentId(0),
+            bolt11: "lnbc1x".into(),
+            invoice_id: "inv-a0".into(),
+            mint_quote_pay: false,
+        });
+        app.active_view = ActiveView::Agent(AgentId(1));
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            effects.is_empty(),
+            "cross-agent unlock must not authorize topup local-pay: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_topup_local_pay.is_some(),
+            "pending must remain for the staging agent"
+        );
+        assert_eq!(
+            app.pending_routstr_topup_local_pay
+                .as_ref()
+                .map(|p| p.agent_id),
+            Some(AgentId(0))
+        );
+        let agent1 = app.agents.get(&AgentId(1)).expect("agent 1");
+        let text: String = (0..agent1.scrollback.len())
+            .filter_map(|i| agent1.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("another agent")
+                || lower.contains("topup")
+                || lower.contains("local pay"),
+            "expected cross-agent notice: {text}"
+        );
+    }
+
+    #[test]
+    fn handle_topup_local_pay_completed_prints_lines_and_keeps_poll() {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        app.routstr_invoice_poll_generation = 2;
+        app.routstr_invoice_poll_id = Some("inv-poll".into());
+        app.routstr_invoice_poll_agent_id = Some(id);
+
+        let _ = handle_routstr_topup_local_pay_completed(
+            &mut app,
+            id,
+            Ok(xai_grok_shell::auth::RoutstrTopupLocalPaySuccess {
+                lines: vec![
+                    "Local Lightning pay submitted successfully.".into(),
+                    "Polling Routstr invoice status for the API key…".into(),
+                ],
+                local_paid: true,
+            }),
+        );
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("success") || lower.contains("submitted") || lower.contains("local"),
+            "expected success lines: {text}"
+        );
+        assert_eq!(app.routstr_invoice_poll_id.as_deref(), Some("inv-poll"));
+
+        let _ = handle_routstr_topup_local_pay_completed(
+            &mut app,
+            id,
+            Ok(xai_grok_shell::auth::RoutstrTopupLocalPaySuccess {
+                lines: vec![
+                    "Could not unlock SeedVault for local Lightning pay; falling back to external wallet."
+                        .into(),
+                    "Detail: no local wallet".into(),
+                ],
+                local_paid: false,
+            }),
+        );
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("unlock") || lower.contains("external") || lower.contains("seedvault"),
+            "expected unlock-fail fallback: {text}"
+        );
+        // Unlock-fail path must not invent liquidity copy in the handler itself;
+        // shell lines already omit it for unlock fail.
+        assert!(
+            !lower.contains("outbound liquidity"),
+            "handler must not invent liquidity honesty: {text}"
+        );
+        assert_eq!(app.routstr_invoice_poll_id.as_deref(), Some("inv-poll"));
+
+        let _ = handle_routstr_topup_local_pay_completed(&mut app, id, Err("spawn failed".into()));
+        let agent = app.agents.values().next().unwrap();
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect();
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("failed") && lower.contains("poll"),
+            "expected hard-fail + poll continues: {text}"
+        );
+    }
+
+    /// Default CI (no `ldk`): topup after create success must not stage local-pay;
+    /// with `ldk` feature it may stage when create succeeds.
+    #[test]
+    fn topup_local_pay_staging_matches_bolt11_pay_live_capability() {
+        use grok_bitcoin_wallet::lightning::{
+            LightningCapability, LocalBolt11PayPath, decide_local_bolt11_pay_path,
+        };
+        let ln = grok_bitcoin_wallet::lightning::default_lightning_backend();
+        let path = decide_local_bolt11_pay_path(ln.capabilities());
+        let mut app = test_app_with_agent();
+        // Clear any accidental pending.
+        app.pending_routstr_topup_local_pay = None;
+        let _effects = dispatch(Action::RoutstrTopup { sats: Some(1000) }, &mut app);
+        match path {
+            LocalBolt11PayPath::ExternalWalletQr => {
+                assert!(
+                    app.pending_routstr_topup_local_pay.is_none(),
+                    "not-live builds must never stage topup local-pay pending"
+                );
+            }
+            LocalBolt11PayPath::AutoPayFromSeedVault => {
+                // Create may still fail offline; only assert stage when invoice ready.
+                if app.routstr_invoice_poll_id.is_some() {
+                    assert!(
+                        app.pending_routstr_topup_local_pay.is_some(),
+                        "live bolt11_pay must stage local-pay when invoice create succeeded"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -3262,7 +4973,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(GROK_BITCOIN_NETWORK)]
     fn watch_start_and_stop_bump_generation() {
+        // Brand-new watch reads GROK_BITCOIN_NETWORK — serial + unset so parallel
+        // regtest/typo serial tests cannot fail-close this bump/generation pin.
+        let _env = xai_grok_test_support::EnvGuard::unset("GROK_BITCOIN_NETWORK");
         let mut app = test_app_with_agent();
         let effects = dispatch(
             Action::RoutstrWatch {
@@ -3293,16 +5008,21 @@ mod tests {
         crate::app::dispatch::tests::insert_placeholder_agent(&mut app, AgentId(1));
         let id0 = AgentId(0);
         let id1 = AgentId(1);
-        let _ = start_routstr_watch_for_agent(
+        // Explicit network: brand-new env path fails closed on poisoned
+        // `GROK_BITCOIN_NETWORK` (e.g. parallel `regtest`/`typo` serial tests
+        // or a developer shell). Supersede messaging is network-independent.
+        let _ = start_routstr_watch_for_agent_on_network(
             &mut app,
             id0,
             "bc1qfirst0000000000000000000000000".into(),
+            Some("mainnet".into()),
             true,
         );
-        let _ = start_routstr_watch_for_agent(
+        let _ = start_routstr_watch_for_agent_on_network(
             &mut app,
             id1,
             "bc1qsecond000000000000000000000000".into(),
+            Some("mainnet".into()),
             true,
         );
         assert_eq!(app.routstr_watch_agent_id, Some(id1));
@@ -3464,6 +5184,8 @@ mod tests {
         let id = AgentId(0);
         app.routstr_watch_generation = 1;
         app.routstr_watch_address = Some("bc1q".into());
+        // In-memory network so re-arm does not depend on GROK_BITCOIN_NETWORK env.
+        app.routstr_watch_network = Some("mainnet".into());
         let status = "Watching bc1q: waiting for payment".to_string();
         let e1 = handle_routstr_watch_tick(&mut app, id, 1, status.clone(), false, "bc1q".into());
         assert!(matches!(
@@ -3488,6 +5210,9 @@ mod tests {
         let id = AgentId(0);
         app.routstr_watch_generation = 1;
         app.routstr_watch_address = Some("bc1q".into());
+        // In-memory network so re-arm does not depend on GROK_BITCOIN_NETWORK env
+        // (fail-closed env must not overwrite status with "re-arm aborted").
+        app.routstr_watch_network = Some("mainnet".into());
         let len0 = app.agents.get(&id).unwrap().scrollback.len();
 
         for i in 0..(WATCH_ERROR_SCROLLBACK_CAP + 2) {
@@ -3650,8 +5375,19 @@ mod tests {
 
         with_watch_session_path_for_test(path.clone(), || {
             let mut app = test_app_with_agent();
-            let _ = start_routstr_watch_for_agent(&mut app, AgentId(0), addr.into(), true);
-            assert!(path.exists());
+            // Explicit network: parallel suite tests may poison GROK_BITCOIN_NETWORK
+            // (regtest/typo fail-closed), which would skip persist and fail path.exists().
+            let _ = start_routstr_watch_for_agent_on_network(
+                &mut app,
+                AgentId(0),
+                addr.into(),
+                Some("mainnet".into()),
+                true,
+            );
+            assert!(
+                path.exists(),
+                "explicit mainnet watch must persist durable session"
+            );
             let generation = app.routstr_watch_generation;
             let effects = handle_routstr_watch_tick(
                 &mut app,
@@ -3887,5 +5623,289 @@ mod tests {
         let _env = xai_grok_test_support::EnvGuard::set("GROK_BITCOIN_NETWORK", "regtest");
         let err = network_from_env().unwrap_err().to_ascii_lowercase();
         assert!(err.contains("unknown") && err.contains("regtest"), "{err}");
+    }
+
+    /// Default CI (no cashu-cdk): `/routstr mint` residual only — no pending stage, no float claim.
+    #[test]
+    fn mint_residual_when_not_live_no_pending() {
+        let mut app = test_app_with_agent();
+        let effects = dispatch(Action::RoutstrMint { sats: Some(500) }, &mut app);
+        assert!(
+            effects.is_empty(),
+            "residual mint is sync-only: {effects:?}"
+        );
+        assert!(app.pending_routstr_mint_quote.is_none());
+        assert!(app.pending_routstr_mint_after_pay.is_none());
+        let agent = app.agents.get(&AgentId(0)).expect("agent");
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+        assert!(
+            text.contains("not live")
+                || text.contains("topup")
+                || text.contains("cashu")
+                || text.contains("mint"),
+            "expected residual mint copy: {text}"
+        );
+        assert!(!text.contains("float credited"));
+        assert!(!text.contains("lnbc"));
+    }
+
+    /// Stage mint quote manually → unlock routes to mint quote complete effect.
+    #[test]
+    fn mint_quote_pending_unlock_routes_to_mint_quote_effect() {
+        use crate::app::actions::SensitiveString;
+        use crate::app::app_view::PendingRoutstrMintQuote;
+        let mut app = test_app_with_agent();
+        app.pending_routstr_mint_quote = Some(PendingRoutstrMintQuote {
+            agent_id: AgentId(0),
+            amount_sats: Some(210),
+        });
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::RoutstrMintQuoteComplete {
+                    amount_sats: Some(210),
+                    ..
+                }]
+            ),
+            "expected mint quote complete effect: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_mint_quote.is_none(),
+            "unlock consumes mint quote pending"
+        );
+    }
+
+    /// Fund cancels staged mint quote / after-pay.
+    #[test]
+    fn fund_clears_pending_mint_stages() {
+        use crate::app::app_view::{PendingRoutstrMintAfterPay, PendingRoutstrMintQuote};
+        let mut app = test_app_with_agent();
+        app.pending_routstr_mint_quote = Some(PendingRoutstrMintQuote {
+            agent_id: AgentId(0),
+            amount_sats: Some(1),
+        });
+        app.pending_routstr_mint_after_pay = Some(PendingRoutstrMintAfterPay {
+            agent_id: AgentId(0),
+            quote_id: "q-1".into(),
+            bolt11: "lnbc1x".into(),
+            amount_sats: Some(1),
+        });
+        let _ = dispatch(Action::RoutstrFund, &mut app);
+        assert!(app.pending_routstr_mint_quote.is_none());
+        assert!(app.pending_routstr_mint_after_pay.is_none());
+    }
+
+    /// After-pay pending unlock carries amount_sats hint into the effect.
+    #[test]
+    fn mint_after_pay_unlock_routes_amount_hint() {
+        use crate::app::actions::SensitiveString;
+        use crate::app::app_view::PendingRoutstrMintAfterPay;
+        let mut app = test_app_with_agent();
+        app.pending_routstr_mint_after_pay = Some(PendingRoutstrMintAfterPay {
+            agent_id: AgentId(0),
+            quote_id: "q-amt".into(),
+            bolt11: "lnbc1mintquote".into(),
+            amount_sats: Some(777),
+        });
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::RoutstrMintAfterPayComplete {
+                    quote_id,
+                    amount_sats: Some(777),
+                    ..
+                }] if quote_id == "q-amt"
+            ),
+            "expected after-pay effect with amount hint: {effects:?}"
+        );
+        assert!(app.pending_routstr_mint_after_pay.is_none());
+    }
+
+    /// Default CI (no cashu-cdk): melt residual only — no pending stage, no float claim.
+    #[test]
+    fn melt_residual_when_not_live_no_pending() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let token = "cashuAabcdefghijklmnopqrstuvwxyz012345";
+        let effects = dispatch(
+            Action::RoutstrRefund {
+                token: Some(SensitiveString::new(token)),
+                invoice: Some("lnbc1mockmeltdest0000000000000000000000000000".into()),
+            },
+            &mut app,
+        );
+        assert!(
+            effects.is_empty(),
+            "residual melt is sync-only: {effects:?}"
+        );
+        assert!(app.pending_routstr_melt.is_none());
+        let agent = app.agents.get(&AgentId(0)).expect("agent");
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+        assert!(
+            text.contains("not live")
+                || text.contains("refund")
+                || text.contains("melt")
+                || text.contains("cashu"),
+            "expected residual melt copy: {text}"
+        );
+        assert!(!text.contains("float credited"));
+        assert!(
+            !text.contains(token),
+            "full token must not enter scrollback: {text}"
+        );
+    }
+
+    /// Stage melt manually → unlock routes to melt complete effect.
+    #[test]
+    fn melt_pending_unlock_routes_to_melt_effect() {
+        use crate::app::actions::SensitiveString;
+        use crate::app::app_view::PendingRoutstrMelt;
+        let mut app = test_app_with_agent();
+        app.pending_routstr_melt = Some(PendingRoutstrMelt {
+            agent_id: AgentId(0),
+            token: SensitiveString::new("cashuAabcdefghijklmnopqrstuvwxyz012345"),
+            bolt11: "lnbc1mockdest".into(),
+        });
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::RoutstrMeltComplete {
+                    bolt11,
+                    ..
+                }] if bolt11 == "lnbc1mockdest"
+            ),
+            "expected melt complete effect: {effects:?}"
+        );
+        assert!(
+            app.pending_routstr_melt.is_none(),
+            "unlock consumes melt pending"
+        );
+    }
+
+    /// Fund cancels staged melt.
+    #[test]
+    fn fund_clears_pending_melt() {
+        use crate::app::actions::SensitiveString;
+        use crate::app::app_view::PendingRoutstrMelt;
+        let mut app = test_app_with_agent();
+        app.pending_routstr_melt = Some(PendingRoutstrMelt {
+            agent_id: AgentId(0),
+            token: SensitiveString::new("cashuAabcdefghijklmnopqrstuvwxyz012345"),
+            bolt11: "lnbc1x".into(),
+        });
+        let _ = dispatch(Action::RoutstrFund, &mut app);
+        assert!(app.pending_routstr_melt.is_none());
+    }
+
+    /// Partial melt args: usage error, no stage, no float claim.
+    #[test]
+    fn melt_partial_args_usage_error() {
+        use crate::app::actions::SensitiveString;
+        let mut app = test_app_with_agent();
+        let effects = dispatch(
+            Action::RoutstrRefund {
+                token: Some(SensitiveString::new("cashuAabc")),
+                invoice: None,
+            },
+            &mut app,
+        );
+        assert!(effects.is_empty());
+        assert!(app.pending_routstr_melt.is_none());
+        let agent = app.agents.get(&AgentId(0)).expect("agent");
+        let text: String = (0..agent.scrollback.len())
+            .filter_map(|i| agent.scrollback.entry(i).map(|e| format!("{:?}", e.block)))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+        assert!(
+            text.contains("both") || text.contains("requires") || text.contains("token"),
+            "expected usage: {text}"
+        );
+        assert!(!text.contains("float credited"));
+    }
+
+    /// Pending melt Debug never dumps full token.
+    #[test]
+    fn pending_melt_debug_redacts_token() {
+        use crate::app::actions::SensitiveString;
+        use crate::app::app_view::PendingRoutstrMelt;
+        let pending = PendingRoutstrMelt {
+            agent_id: AgentId(0),
+            token: SensitiveString::new("cashuAabcdefghijklmnopqrstuvwxyz012345"),
+            bolt11: "lnbc1x".into(),
+        };
+        let dbg = format!("{pending:?}");
+        assert!(dbg.contains("REDACTED") || dbg.contains("***"));
+        assert!(!dbg.contains("abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    /// When mint after-pay is staged, local-pay unlock is preferred (CLI LDK pay parity).
+    #[test]
+    fn mint_local_pay_preferred_over_after_pay_on_unlock() {
+        use crate::app::actions::SensitiveString;
+        use crate::app::app_view::{PendingRoutstrMintAfterPay, PendingRoutstrTopupLocalPay};
+        let mut app = test_app_with_agent();
+        app.pending_routstr_mint_after_pay = Some(PendingRoutstrMintAfterPay {
+            agent_id: AgentId(0),
+            quote_id: "q-pay".into(),
+            bolt11: "lnbc1mint".into(),
+            amount_sats: Some(100),
+        });
+        app.pending_routstr_topup_local_pay = Some(PendingRoutstrTopupLocalPay {
+            agent_id: AgentId(0),
+            bolt11: "lnbc1mint".into(),
+            invoice_id: "q-pay".into(),
+            mint_quote_pay: true,
+        });
+        let effects = dispatch(
+            Action::RoutstrFundReentry {
+                phrase: SensitiveString::new("abandon abandon abandon"),
+                password: None,
+                request_passphrase_prompt: false,
+            },
+            &mut app,
+        );
+        assert!(
+            matches!(
+                effects.first(),
+                Some(Effect::RoutstrTopupLocalPayComplete { .. })
+            ),
+            "mint local pay must run before after-pay: {effects:?}"
+        );
+        // After-pay remains for second unlock.
+        assert!(app.pending_routstr_mint_after_pay.is_some());
+        assert!(app.pending_routstr_topup_local_pay.is_none());
     }
 }

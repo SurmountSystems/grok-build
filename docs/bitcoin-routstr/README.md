@@ -1,9 +1,14 @@
 # Bitcoin-native Routstr inference (Grok OSS)
 
-**Status:** design / pre-implementation reasoning.  
-**Product goal:** pay for **Routstr Grok 4.5** inference using **locally generated
-keys**, with a seamless out-of-the-box path from on-chain deposit → Lightning →
-Cashu (Chaumian eCash) → chat completions.
+**Status:** design + **invoice-first automatic funding implemented** (Phase A/B);
+Phase C **landed** (isolated `ldk-node` helper + `bolt11_pay_live=true` with
+feature `ldk`; CLI + TUI SeedVault auto-pay when live; default CI stub remains
+invoice-first). Helper ships via Nix (`nix build .#grok-bitcoin-ldk-node`);
+default monorepo CI stays off `ldk`.  
+**Product goal:** pay for **Routstr Grok 4.5** inference without a website.
+**v1 path:** live Routstr Lightning invoice APIs → store `sk-` → pick model in
+picker (like OpenRouter/xAI). **Long-term:** on-chain deposit → Lightning →
+Cashu (Chaumian eCash) → chat with local keys (LDK live pay / CDK residual).
 
 This is **real money**. Read [`THREAT_MODEL.md`](./THREAT_MODEL.md) and the
 crate docs under `crates/codegen/grok-bitcoin-wallet/` before changing custody
@@ -42,8 +47,9 @@ on-chain remain mandatory.
 
 | Doc | Contents |
 |-----|----------|
+| [AUTOMATIC_FUNDING.md](./AUTOMATIC_FUNDING.md) | **Approved plan:** invoice-first automation, PR sequence, secret stores |
 | [THREAT_MODEL.md](./THREAT_MODEL.md) | Assets, adversaries, commitments, non-claims |
-| [FUNDING_FLOW.md](./FUNDING_FLOW.md) | Deposit → channel → CDK → inference; fees; watchers |
+| [FUNDING_FLOW.md](./FUNDING_FLOW.md) | Long-term deposit → channel → CDK; fees; watchers |
 | [ADDRESS_UX.md](./ADDRESS_UX.md) | Every address: QR + copy; mempool.space links |
 | [SEED_AND_DERIVATION.md](./SEED_AND_DERIVATION.md) | BIP-39, BDK, LDK, NIP-06 single seed |
 | [ROUTSTR_INFERENCE.md](./ROUTSTR_INFERENCE.md) | OpenAI-compatible path, Grok 4.5, 402 |
@@ -61,13 +67,21 @@ on-chain remain mandatory.
 
 ## Implementation phases (summary)
 
-0. **Reasoning docs** (this tree) + SeedVault design (*in progress*)  
-1. SeedVault + BIP-39 + NIP-06 (no plaintext seed on disk)  
+0. Reasoning docs + SeedVault design  
+1. SeedVault + BIP-39 + NIP-06 (no plaintext seed in CredentialsStore JSON)  
 2. Routstr HTTP inference + catalog Grok 4.5 + default-on toggle  
-3. BDK receive + QR/copy + mempool watchers  
-4. LDK BOLT11; channel to Routstr-recommended peer; BOLT12 deferred if needed  
-5. CDK Cashu mint/spend for inference  
-6. Glue wizard + hardening + local-node backends  
+3. On-chain receive + QR/copy + mempool watchers + spend/RBF/CPFP (*shipped*)  
+4. **Invoice-first automatic float** (node APIs; no website) — **done** (see AUTOMATIC_FUNDING)  
+5. LDK BOLT11 pay of node invoice — **done via out-of-process helper**
+   (`grok-bitcoin-ldk-node`; feature `ldk`; CLI + TUI SeedVault auto-pay when
+   `bolt11_pay_live`; see AUTOMATIC_FUNDING Phase C). Nix package shipped;
+   AUR/distro residual.  
+6. CDK Cashu mint/spend (local) — node refund API already live  
+7. Hardening + local-node backends  
 
-Do not advertise “pay from Grok” until phases 1–3 meet the acceptance criteria
-in the plan file.
+Claim local auto-pay only with feature `ldk` + helper installed + outbound
+liquidity. Default builds: invoice QR + external LN pay (P0).
+
+Helper install: `nix build .#grok-bitcoin-ldk-node` / `nix shell .#grok-bitcoin-ldk-node`
+(or cargo; see `crates/codegen/grok-bitcoin-ldk-node/README.md`).
+Env: `GROK_BITCOIN_LDK_NODE_BIN`.

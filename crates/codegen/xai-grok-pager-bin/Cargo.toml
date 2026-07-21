@@ -106,6 +106,21 @@ release-dist = ["xai-grok-pager/release-dist"]
 # UTXO list + broadcast share GROK_BITCOIN_CHAIN_SOURCE when the feature is built.
 esplora = ["xai-grok-shell/esplora", "xai-grok-pager/esplora"]
 electrum = ["xai-grok-shell/electrum", "xai-grok-pager/electrum"]
+# Optional Cashu CDK mint (`grok routstr mint` / TUI `/routstr mint`). Not default CI.
+# Forwards shell → wallet Nut04MintCashu + proofs_mint_live when helper resolvable.
+#   cargo build -p xai-grok-pager-bin --features cashu-cdk
+#   export GROK_BITCOIN_CASHU_MINT_URL=… GROK_BITCOIN_CDK_MINT_BIN=…
+# Helper: cargo build --manifest-path crates/codegen/grok-bitcoin-cdk-mint/Cargo.toml
+# Without feature / not live: residual + P0 `grok routstr topup` fall-through.
+cashu-cdk = ["xai-grok-shell/cashu-cdk", "xai-grok-pager/cashu-cdk"]
+# Optional prefer-BDK UTXO discovery (not default CI). Compose with chain feature:
+#   cargo build -p xai-grok-pager-bin --features bdk,esplora
+#   GROK_BITCOIN_UTXO_SYNC=bdk GROK_BITCOIN_CHAIN_SOURCE=esplora \
+#     GROK_BITCOIN_ESPLORA_URL=https://blockstream.info/api
+#   # or: --features bdk,electrum + GROK_BITCOIN_CHAIN_SOURCE=electrum …
+# Default: gap-limit (GROK_BITCOIN_UTXO_SYNC unset/gap). Mempool+bdk → residual.
+# Prefer-BDK without feature → structured residual (not hang / invent Success).
+bdk = ["xai-grok-shell/bdk", "xai-grok-pager/bdk"]
 
 [lints]
 workspace = true

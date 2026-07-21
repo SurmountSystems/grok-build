@@ -25,9 +25,42 @@ nsec-only import may exist later as an escape hatch.
 
 | Allowed | Forbidden |
 |---------|-----------|
-| OS keyring (`grok-build` / dedicated service label for seed) | Plaintext in `provider_credentials.json` |
-| Password-wrapped AEAD blob (Argon2id + XChaCha20-Poly1305) with warning UX | `config.toml`, session JSON, chat transcripts |
-| In-memory unlock with TTL + zeroize | Debug-printing mnemonic |
+| OS keyring with **dedicated** SeedVault service label (not Bearer `grok-build`) | Plaintext in `provider_credentials.json` |
+| Password-wrapped AEAD blob (Argon2id + XChaCha20-Poly1305) with warning UX | `CredentialsStore` (mirrors API keys to JSON) |
+| In-memory unlock with TTL + zeroize | Zed keyring / Dev credentials files |
+| Payload = **BIP-39 seed material only** (phrase and/or entropy bytes) | `watch_session.json` (watch progress only; SeedVault refuses this filename) |
+| | `config.toml`, session JSON, chat transcripts |
+| | BIP-39 **passphrase** at rest (unlock env/API only) |
+| | Debug-printing mnemonic / entropy |
+
+**Path guard (offline-enforced):** `assert_allowed_seed_storage_path` refuses
+AEAD paths whose final component is `provider_credentials.json`,
+`watch_session.json`, or `config.toml` (constructor + `store_aead` /
+`store_aead_entropy` / `load_aead` / `delete_aead`). Legacy alias:
+`assert_not_credentials_store_path`.
+
+**Not the same as OpenRouter/Zed keys:** Grok’s `CredentialsStore` uses service
+`grok-build` and always mirrors secrets into `provider_credentials.json`. Zed
+OpenRouter keys are **read-only** probed under a different schema
+(`harness_secrets`). Seed must not use either path. See
+[AUTOMATIC_FUNDING.md](./AUTOMATIC_FUNDING.md) “Secret stores.”
+
+**AEAD encoding (landed):** BIP-39 words are a human backup encoding of
+~128-bit (12-word) or ~256-bit (24-word) entropy.
+
+| Version | Store API | Plaintext under AEAD |
+|---------|-----------|----------------------|
+| **v1** (legacy / default `store_aead`) | phrase UTF-8 string | space-separated English words |
+| **v2** (`store_aead_entropy`) | raw entropy bytes | 16 bytes (12-word) or 32 bytes (24-word) |
+
+`load_aead` accepts **both** v1 and v2 and reconstructs `MnemonicSecret` via
+bip39. New AEAD writes bind format version as **AEAD AAD** (`v` little-endian)
+so envelope `v` cannot be flipped without failing the tag. Pre-AAD **v1**
+blobs still load (AAD decrypt first, then unbound fallback for `v == 1`
+only). **v2** always requires AAD. Keyring remains **phrase string** for OS
+password-field UX (entropy bytes would be opaque/binary). Neither encoding
+embeds a BIP-39 passphrase field. Still **never** CredentialsStore /
+`watch_session` / `provider_credentials`.
 
 See crate `SECURITY.md` for API rules.
 
@@ -63,5 +96,9 @@ process env **`GROK_BITCOIN_BIP39_PASSPHRASE`** at unlock/sign time only
 (library `prepare_*` / `*_from_selection` and product prepares take
 `passphrase: &str`). TUI private re-entry: `/routstr unlock pass …` opens a
 masked modal (empty Enter = default path for that unlock; never chat history).
-It is **never** stored in SeedVault, CredentialsStore, `watch_session.json`,
-or chat. Missing/empty env (and no modal override) → default path.
+It is **never** stored in SeedVault (AEAD/keyring payload is seed material
+only — phrase v1 or entropy v2; **no** passphrase field), CredentialsStore,
+`watch_session.json`, or chat. Unit tests cover AEAD plaintext = phrase or
+entropy bytes (never passphrase JSON) and watch-session JSON without
+mnemonic/passphrase keys. Missing/empty env (and no modal override) → default
+path.

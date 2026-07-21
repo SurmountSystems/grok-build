@@ -238,12 +238,84 @@ pub struct PendingRoutstrCpfp {
 ///
 /// Observational only (gap-limit UTXO list / balance). Never BIP-39. Mutually
 /// exclusive with [`PendingRoutstrSpend`] / [`PendingRoutstrRbf`] /
-/// [`PendingRoutstrCpfp`] (staging one cancels the others).
+/// [`PendingRoutstrCpfp`] / [`PendingRoutstrTopupLocalPay`] (staging one cancels
+/// the others).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRoutstrUtxos {
     pub agent_id: crate::app::agent::AgentId,
     /// Explicit network from slash `--network`, or `None` → env / mainnet.
     pub network: Option<String>,
+}
+
+/// Pending `/routstr topup` local BOLT11 pay awaiting `/routstr unlock` re-entry.
+///
+/// Staged when local Lightning reports `bolt11_pay_live` after a successful
+/// Routstr invoice create **or** after a Cashu mint quote (mint BOLT11 only).
+/// Holds BOLT11 + invoice id only — never BIP-39. For Routstr topup, invoice poll
+/// runs independently (P0 external QR fallback). For mint quote pay, poll is
+/// **not** armed — pay settles the mint quote only (never Routstr float).
+/// Mutually exclusive with spend/rbf/cpfp/utxos pendings (staging one cancels
+/// the others). Mint after-pay may coexist so unlock pays first, then proofs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRoutstrTopupLocalPay {
+    pub agent_id: crate::app::agent::AgentId,
+    /// BOLT11 to pay from SeedVault (Routstr invoice or mint quote — not a seed).
+    pub bolt11: String,
+    /// Invoice id for status re-check copy (poll is already armed separately for
+    /// Routstr topup). For mint quote pay, may be the mint `quote_id`.
+    pub invoice_id: String,
+    /// When true, this pays a **Cashu mint** quote BOLT11 (not Routstr prepaid
+    /// float). Success must not claim float or imply invoice-poll api_key store.
+    pub mint_quote_pay: bool,
+}
+
+/// Pending `/routstr mint` quote stage awaiting `/routstr unlock` re-entry.
+///
+/// Staged when Cashu reports `proofs_mint_live`. Amount only — never BIP-39.
+/// Mutually exclusive with other money-path pendings (staging one cancels others).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRoutstrMintQuote {
+    pub agent_id: crate::app::agent::AgentId,
+    /// Requested mint amount in sats (product default when `None` at complete).
+    pub amount_sats: Option<u64>,
+}
+
+/// Pending Cashu mint **after-pay** (proofs → redeem) awaiting `/routstr unlock`.
+///
+/// Staged after a live mint quote succeeds. Holds quote_id + mint BOLT11 only —
+/// never BIP-39 / token. Token (if any) is never written to scrollback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRoutstrMintAfterPay {
+    pub agent_id: crate::app::agent::AgentId,
+    pub quote_id: String,
+    /// Mint quote BOLT11 (for display / optional local pay; not a seed).
+    pub bolt11: String,
+    pub amount_sats: Option<u64>,
+}
+
+/// Pending local Cashu melt (token → destination BOLT11) awaiting `/routstr unlock`.
+///
+/// Staged by `/routstr refund token=… invoice=…` when melt is live. Token uses
+/// [`SensitiveString`] so Debug never dumps the full bearer. Never BIP-39.
+/// Mutually exclusive with other money-path pendings. Melt success never claims
+/// Routstr sk- float.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PendingRoutstrMelt {
+    pub agent_id: crate::app::agent::AgentId,
+    /// Bearer Cashu token — zeroized on drop / clear; never scrollback.
+    pub token: crate::app::actions::SensitiveString,
+    /// Destination BOLT11 (not a seed).
+    pub bolt11: String,
+}
+
+impl std::fmt::Debug for PendingRoutstrMelt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRoutstrMelt")
+            .field("agent_id", &self.agent_id)
+            .field("token", &"cashuA…[REDACTED]")
+            .field("bolt11", &self.bolt11)
+            .finish()
+    }
 }
 
 /// State for the "New Worktree" popup dialog on the welcome screen.
@@ -916,6 +988,19 @@ pub struct AppView {
     pub routstr_watch_last_scrollback: Option<String>,
     /// Consecutive watch poll errors (cap scrollback spam).
     pub routstr_watch_error_streak: u32,
+    /// Generation for in-flight Routstr Lightning invoice payment poll.
+    ///
+    /// **Singleton** (one process-wide invoice poll). Stale ticks drop when
+    /// generation mismatches (stop / new topup supersedes).
+    pub routstr_invoice_poll_generation: u64,
+    /// Invoice id currently polled after `/routstr topup` create.
+    pub routstr_invoice_poll_id: Option<String>,
+    /// Agent that owns the invoice poll (toast / system messages).
+    pub routstr_invoice_poll_agent_id: Option<crate::app::agent::AgentId>,
+    /// Consecutive invoice poll errors (cap scrollback; stop after max).
+    pub routstr_invoice_poll_error_streak: u32,
+    /// When the current invoice poll generation was armed (soft wall timeout).
+    pub routstr_invoice_poll_started: Option<std::time::Instant>,
     /// Pending on-chain spend waiting for `/routstr unlock` re-entry.
     ///
     /// Set by `/routstr spend`; cleared on cancel (`/routstr fund`), supersede
@@ -945,10 +1030,36 @@ pub struct AppView {
     /// Pending UTXO list waiting for `/routstr unlock` re-entry.
     ///
     /// Set by `/routstr utxos`; cleared on cancel (`/routstr fund`), supersede
-    /// (re-stage utxos or stage spend/rbf/cpfp), or unlock consumption into the
-    /// utxos effect. **Not** cleared when an in-flight utxos task completes.
-    /// Never stores BIP-39. Mutually exclusive with spend/rbf/cpfp pendings.
+    /// (re-stage utxos or stage spend/rbf/cpfp/topup-local-pay), or unlock
+    /// consumption into the utxos effect. **Not** cleared when an in-flight
+    /// utxos task completes. Never stores BIP-39. Mutually exclusive with
+    /// spend/rbf/cpfp/topup-local-pay pendings.
     pub pending_routstr_utxos: Option<PendingRoutstrUtxos>,
+    /// Pending topup local BOLT11 pay waiting for `/routstr unlock` re-entry.
+    ///
+    /// Set by `/routstr topup` when `bolt11_pay_live`; cleared on cancel
+    /// (`/routstr fund`), supersede (stage spend/rbf/cpfp/utxos or new topup),
+    /// or unlock consumption into the local-pay effect. **Not** cleared when an
+    /// in-flight local-pay task completes. Never stores BIP-39. Invoice poll is
+    /// independent (not cancelled by this pending). Mutually exclusive with
+    /// spend/rbf/cpfp/utxos pendings.
+    pub pending_routstr_topup_local_pay: Option<PendingRoutstrTopupLocalPay>,
+    /// Pending Cashu mint quote waiting for `/routstr unlock` re-entry.
+    ///
+    /// Set by `/routstr mint` when `proofs_mint_live`; cleared on cancel/supersede
+    /// or unlock consumption into the mint-quote effect. Never stores BIP-39.
+    pub pending_routstr_mint_quote: Option<PendingRoutstrMintQuote>,
+    /// Pending Cashu mint after-pay (proofs+redeem) waiting for `/routstr unlock`.
+    ///
+    /// Set after a successful mint quote; cleared on cancel/supersede or unlock
+    /// consumption into the after-pay effect. Never stores BIP-39 or full token.
+    pub pending_routstr_mint_after_pay: Option<PendingRoutstrMintAfterPay>,
+    /// Pending local Cashu melt waiting for `/routstr unlock`.
+    ///
+    /// Set by `/routstr refund token=… invoice=…` when melt live; cleared on
+    /// cancel/supersede or unlock consumption. Token is SensitiveString only
+    /// (never scrollback / CredentialsStore). Melt never claims sk- float.
+    pub pending_routstr_melt: Option<PendingRoutstrMelt>,
     /// Open private BIP-39 passphrase modal (`/routstr unlock pass …`).
     ///
     /// Holds phrase (+ optional AEAD password) only while open. Debug redacts
@@ -1653,10 +1764,19 @@ impl AppView {
             routstr_watch_status: None,
             routstr_watch_last_scrollback: None,
             routstr_watch_error_streak: 0,
+            routstr_invoice_poll_generation: 0,
+            routstr_invoice_poll_id: None,
+            routstr_invoice_poll_agent_id: None,
+            routstr_invoice_poll_error_streak: 0,
+            routstr_invoice_poll_started: None,
             pending_routstr_spend: None,
             pending_routstr_rbf: None,
             pending_routstr_cpfp: None,
             pending_routstr_utxos: None,
+            pending_routstr_topup_local_pay: None,
+            pending_routstr_mint_quote: None,
+            pending_routstr_mint_after_pay: None,
+            pending_routstr_melt: None,
             routstr_passphrase_modal: None,
             billing_poll_wanted: false,
             leader_roster: Vec::new(),
@@ -5700,10 +5820,19 @@ pub(crate) mod tests {
             routstr_watch_status: None,
             routstr_watch_last_scrollback: None,
             routstr_watch_error_streak: 0,
+            routstr_invoice_poll_generation: 0,
+            routstr_invoice_poll_id: None,
+            routstr_invoice_poll_agent_id: None,
+            routstr_invoice_poll_error_streak: 0,
+            routstr_invoice_poll_started: None,
             pending_routstr_spend: None,
             pending_routstr_rbf: None,
             pending_routstr_cpfp: None,
             pending_routstr_utxos: None,
+            pending_routstr_topup_local_pay: None,
+            pending_routstr_mint_quote: None,
+            pending_routstr_mint_after_pay: None,
+            pending_routstr_melt: None,
             routstr_passphrase_modal: None,
             billing_poll_wanted: false,
             leader_roster: Vec::new(),

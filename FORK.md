@@ -111,10 +111,21 @@ Keep diffs **small and product-facing** so merges stay tractable:
 ```bash
 nix develop
 nix build .#grok-oss
-nix flake check   # runs packages + checks (long)
+nix flake check   # runs packages + checks (long; includes heavy LDK helper unit-test check)
 just ci           # same steps as GitHub Actions (preferred before push)
 just ci-quick     # faster cargo-only path inside nix develop
+just mem-guard    # optional pure-nix cargo-mem-guard package + tests
+just ldk-node     # optional pure-nix grok-bitcoin-ldk-node package + tests (very long)
+just cdk-mint     # optional pure-nix grok-bitcoin-cdk-mint package + tests (very long)
 ```
+
+Prefer `just ci` / host cargo for pre-push. Do **not** treat `nix flake check`
+as a casual gate: it still builds monorepo pure packages **and** heavy helper
+unit-test checks (`checks…grok-bitcoin-ldk-node-tests`,
+`checks…grok-bitcoin-cdk-mint-tests`). Helper **install** packages are
+packages-only (not under `checks`) to avoid a second full LDK/CDK install
+under flake check; use `just ldk-node` / `just cdk-mint` when you want both
+package + tests realized.
 
 ## Versioning, releases, and “am I up to date?”
 

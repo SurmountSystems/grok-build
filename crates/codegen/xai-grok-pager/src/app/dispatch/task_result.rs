@@ -26,7 +26,10 @@ use super::rewind::{
 use super::router::{dispatch, dispatch_action_result};
 use super::routstr::{
     handle_routstr_cpfp_completed, handle_routstr_fund_completed, handle_routstr_fund_probed,
-    handle_routstr_rbf_completed, handle_routstr_spend_completed, handle_routstr_utxos_completed,
+    handle_routstr_invoice_tick, handle_routstr_melt_completed,
+    handle_routstr_mint_after_pay_completed, handle_routstr_mint_quote_completed,
+    handle_routstr_rbf_completed, handle_routstr_spend_completed,
+    handle_routstr_topup_local_pay_completed, handle_routstr_utxos_completed,
     handle_routstr_watch_tick,
 };
 use super::session::foreign::{
@@ -295,6 +298,18 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::RoutstrUtxosCompleted { agent_id, result } => {
             handle_routstr_utxos_completed(app, agent_id, result)
         }
+        TaskResult::RoutstrTopupLocalPayCompleted { agent_id, result } => {
+            handle_routstr_topup_local_pay_completed(app, agent_id, result)
+        }
+        TaskResult::RoutstrMintQuoteCompleted { agent_id, result } => {
+            handle_routstr_mint_quote_completed(app, agent_id, result)
+        }
+        TaskResult::RoutstrMintAfterPayCompleted { agent_id, result } => {
+            handle_routstr_mint_after_pay_completed(app, agent_id, result)
+        }
+        TaskResult::RoutstrMeltCompleted { agent_id, result } => {
+            handle_routstr_melt_completed(app, agent_id, result)
+        }
         TaskResult::RoutstrFundProbed { agent_id, probe } => {
             handle_routstr_fund_probed(app, agent_id, probe)
         }
@@ -308,6 +323,18 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             confirmed,
             address,
         } => handle_routstr_watch_tick(app, agent_id, generation, status_line, confirmed, address),
+        TaskResult::RoutstrInvoiceTick {
+            agent_id,
+            generation,
+            invoice_id,
+            status,
+            api_key,
+            paid,
+            expires_at,
+            error,
+        } => handle_routstr_invoice_tick(
+            app, agent_id, generation, invoice_id, status, api_key, paid, expires_at, error,
+        ),
         TaskResult::GateRefreshed { settings } => handle_gate_refreshed(app, settings),
         TaskResult::SessionLoaded {
             agent_id,

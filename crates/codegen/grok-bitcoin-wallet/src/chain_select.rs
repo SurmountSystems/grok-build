@@ -14,12 +14,19 @@
 //! | [`ESPLORA_URL_ENV`] (`GROK_BITCOIN_ESPLORA_URL`) | Esplora REST base URL when kind is esplora (required) |
 //! | [`ELECTRUM_ADDR_ENV`] (`GROK_BITCOIN_ELECTRUM_ADDR`) | `host:port` or `ssl://host:port` when kind is electrum (required) |
 //! | [`ELECTRUM_TLS_ENV`] (`GROK_BITCOIN_ELECTRUM_TLS`) | `1`/`true`/`yes` enables TLS for bare `host:port` (default off = plaintext) |
+//! | [`UTXO_SYNC_ENV`] (`GROK_BITCOIN_UTXO_SYNC`) | `gap` \| `bdk` (case-insensitive; empty/unset → **gap**) |
 //!
-//! Default product behavior is **mempool** (unchanged when env is unset). UTXO list and
-//! `--broadcast` share this config so spend uses a matching push path when features
-//! are compiled in (mempool `POST /api/tx`, Esplora `POST /tx`, Electrum
-//! `blockchain.transaction.broadcast`). Electrum default transport is **plaintext TCP**
-//! (local/regtest); TLS is opt-in via env or `ssl://` scheme.
+//! Default product behavior is **mempool** chain source + **gap-limit** UTXO sync
+//! (unchanged when env is unset). UTXO list and `--broadcast` share chain config so
+//! spend uses a matching push path when features are compiled in (mempool
+//! `POST /api/tx`, Esplora `POST /tx`, Electrum `blockchain.transaction.broadcast`).
+//! Electrum default transport is **plaintext TCP** (local/regtest); TLS is opt-in
+//! via env or `ssl://` scheme.
+//!
+//! Prefer-BDK (`GROK_BITCOIN_UTXO_SYNC=bdk`) requires feature `bdk` (not default CI)
+//! and a chain source that maps to a BDK full_scan transport (`esplora` or
+//! `electrum`). Mempool-only does not map — fail closed with residual guidance
+//! (use gap-limit, or set esplora/electrum).
 
 use crate::address_ux::BitcoinNetwork;
 use crate::descriptor_wallet::ChainSource;
@@ -39,6 +46,100 @@ pub const ELECTRUM_ADDR_ENV: &str = "GROK_BITCOIN_ELECTRUM_ADDR";
 /// (`1` / `true` / `yes`, case-insensitive). Default unset/false = plaintext TCP.
 /// `ssl://` in [`ELECTRUM_ADDR_ENV`] always forces TLS regardless of this flag.
 pub const ELECTRUM_TLS_ENV: &str = "GROK_BITCOIN_ELECTRUM_TLS";
+
+/// `GROK_BITCOIN_UTXO_SYNC` — product UTXO discovery engine.
+///
+/// `gap` (default): gap-limit [`ChainSource`](crate::descriptor_wallet::ChainSource)
+/// sync. `bdk`: prefer feature-gated `bdk_wallet` full_scan path (requires feature
+/// `bdk` + esplora/electrum chain source). Empty/unset → **gap**.
+pub const UTXO_SYNC_ENV: &str = "GROK_BITCOIN_UTXO_SYNC";
+
+/// Product UTXO discovery engine selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtxoSyncMode {
+    /// Default gap-limit ChainSource sync (`MAX_ADDRESS_GAP`).
+    Gap,
+    /// Prefer BDK full_scan (`bdk_sync`; feature `bdk`, not default CI).
+    Bdk,
+}
+
+impl UtxoSyncMode {
+    /// Stable env / CLI token for this mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gap => "gap",
+            Self::Bdk => "bdk",
+        }
+    }
+}
+
+/// Parse a UTXO-sync mode name. Empty / whitespace → [`UtxoSyncMode::Gap`].
+///
+/// Case-insensitive: `gap`, `bdk`. Unknown values error (fail-closed; single
+/// parser — do not re-implement acceptance elsewhere).
+pub fn parse_utxo_sync_mode(s: &str) -> Result<UtxoSyncMode> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(UtxoSyncMode::Gap);
+    }
+    match t.to_ascii_lowercase().as_str() {
+        "gap" => Ok(UtxoSyncMode::Gap),
+        "bdk" => Ok(UtxoSyncMode::Bdk),
+        other => Err(WalletError::Onchain(format!(
+            "unknown {UTXO_SYNC_ENV} value {other:?}; use gap or bdk \
+             (empty/unset defaults to gap)"
+        ))),
+    }
+}
+
+/// Read product UTXO-sync mode via an injectable env lookup (no network).
+///
+/// `get(key)` returns `None` when unset; `Some("")` for empty. Unset/empty
+/// [`UTXO_SYNC_ENV`] → gap. Prefer this in unit tests.
+pub fn product_utxo_sync_mode_from_env_reader(
+    mut get: impl FnMut(&str) -> Option<String>,
+) -> Result<UtxoSyncMode> {
+    match get(UTXO_SYNC_ENV) {
+        None => Ok(UtxoSyncMode::Gap),
+        Some(raw) => parse_utxo_sync_mode(&raw),
+    }
+}
+
+/// Read product UTXO-sync mode from process env (pure parse; no network).
+///
+/// Unset [`UTXO_SYNC_ENV`] → gap. Does not read BIP-39 or passphrase env.
+pub fn product_utxo_sync_mode_from_env() -> Result<UtxoSyncMode> {
+    product_utxo_sync_mode_from_env_reader(|k| std::env::var(k).ok())
+}
+
+/// Structured residual when prefer-BDK is selected but feature `bdk` is off.
+///
+/// Always available (no network). Shell/CLI map this to product error copy —
+/// never hang, never invent Success, never fall through to gap silently when
+/// the user explicitly requested `bdk`.
+pub fn bdk_utxo_sync_feature_missing_error() -> WalletError {
+    WalletError::Onchain(format!(
+        "utxo sync mode 'bdk' requires feature `bdk` \
+         (not compiled into this build; rebuild with --features bdk and \
+         esplora or electrum for live BDK full_scan, \
+         or use {UTXO_SYNC_ENV}=gap for default gap-limit ChainSource)"
+    ))
+}
+
+/// Structured residual when prefer-BDK is selected with mempool-only chain source.
+///
+/// Mempool.space address-UTXO REST does not map to a BDK full_scan transport.
+/// Fail closed with guidance (gap-limit default, or set esplora/electrum).
+pub fn bdk_utxo_sync_mempool_unsupported_error() -> WalletError {
+    WalletError::Onchain(format!(
+        "utxo sync mode 'bdk' does not support chain source 'mempool' \
+         (no BDK full_scan transport for mempool.space address UTXOs). \
+         Use {UTXO_SYNC_ENV}=gap (default gap-limit ChainSource), or set \
+         {CHAIN_SOURCE_ENV}=esplora|electrum with {ESPLORA_URL_ENV} / \
+         {ELECTRUM_ADDR_ENV} and rebuild with features bdk+esplora or \
+         bdk+electrum (not default CI)"
+    ))
+}
 
 /// Named product chain backends for UTXO discovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,9 +582,9 @@ pub fn open_product_tx_broadcaster(
 
 /// Extract + offline-shape-validate Esplora base URL from a product config.
 ///
-/// Shared by chain open and broadcaster open so hand-built configs cannot
-/// bypass [`validate_esplora_base_url`].
-fn validated_esplora_url_from_config(config: &ProductChainSourceConfig) -> Result<&str> {
+/// Shared by chain open, broadcaster open, and BDK full_scan open so hand-built
+/// configs cannot bypass [`validate_esplora_base_url`].
+pub(crate) fn validated_esplora_url_from_config(config: &ProductChainSourceConfig) -> Result<&str> {
     let url = config
         .esplora_url
         .as_deref()
@@ -503,8 +604,8 @@ fn validated_esplora_url_from_config(config: &ProductChainSourceConfig) -> Resul
 ///
 /// Returns `(host:port, use_tls)`. Accepts bare `host:port` or `ssl://host:port`
 /// still left in hand-built configs; ORs scheme TLS with [`ProductChainSourceConfig::electrum_tls`].
-/// Shared by chain open and broadcaster open.
-fn validated_electrum_endpoint_from_config(
+/// Shared by chain open, broadcaster open, and BDK full_scan open.
+pub(crate) fn validated_electrum_endpoint_from_config(
     config: &ProductChainSourceConfig,
 ) -> Result<(String, bool)> {
     let raw = config
@@ -665,6 +766,82 @@ fn open_electrum_tx_broadcaster(addr: &str, tls: bool) -> Result<Box<dyn TxBroad
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_utxo_sync_mode_empty_and_default_gap() {
+        assert_eq!(parse_utxo_sync_mode("").unwrap(), UtxoSyncMode::Gap);
+        assert_eq!(parse_utxo_sync_mode("   ").unwrap(), UtxoSyncMode::Gap);
+        assert_eq!(parse_utxo_sync_mode("gap").unwrap(), UtxoSyncMode::Gap);
+        assert_eq!(parse_utxo_sync_mode("GAP").unwrap(), UtxoSyncMode::Gap);
+        assert_eq!(UtxoSyncMode::Gap.as_str(), "gap");
+    }
+
+    #[test]
+    fn parse_utxo_sync_mode_bdk_case_insensitive() {
+        assert_eq!(parse_utxo_sync_mode("bdk").unwrap(), UtxoSyncMode::Bdk);
+        assert_eq!(parse_utxo_sync_mode("BDK").unwrap(), UtxoSyncMode::Bdk);
+        assert_eq!(parse_utxo_sync_mode(" Bdk ").unwrap(), UtxoSyncMode::Bdk);
+        assert_eq!(UtxoSyncMode::Bdk.as_str(), "bdk");
+    }
+
+    #[test]
+    fn parse_utxo_sync_mode_unknown_fail_closed() {
+        let err = parse_utxo_sync_mode("full").unwrap_err().to_string();
+        assert!(
+            err.contains("unknown") && err.contains(UTXO_SYNC_ENV),
+            "err={err}"
+        );
+        assert!(err.contains("gap") && err.contains("bdk"), "err={err}");
+        // Reject aliases that would create dual-parser drift.
+        for bad in ["auto", "default", "chain", "gap-limit", "bdk_wallet"] {
+            assert!(parse_utxo_sync_mode(bad).is_err(), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn product_utxo_sync_mode_from_env_reader_defaults_and_parses() {
+        use std::collections::HashMap;
+        let empty: HashMap<&str, String> = HashMap::new();
+        let mode = product_utxo_sync_mode_from_env_reader(|k| empty.get(k).cloned()).unwrap();
+        assert_eq!(mode, UtxoSyncMode::Gap);
+
+        let mut map: HashMap<&str, String> = HashMap::new();
+        map.insert(UTXO_SYNC_ENV, "".into());
+        let mode = product_utxo_sync_mode_from_env_reader(|k| map.get(k).cloned()).unwrap();
+        assert_eq!(mode, UtxoSyncMode::Gap);
+
+        map.insert(UTXO_SYNC_ENV, "BDK".into());
+        let mode = product_utxo_sync_mode_from_env_reader(|k| map.get(k).cloned()).unwrap();
+        assert_eq!(mode, UtxoSyncMode::Bdk);
+
+        map.insert(UTXO_SYNC_ENV, "nope".into());
+        let err = product_utxo_sync_mode_from_env_reader(|k| map.get(k).cloned())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(UTXO_SYNC_ENV), "err={err}");
+    }
+
+    #[test]
+    fn bdk_feature_missing_and_mempool_errors_are_honest() {
+        let missing = bdk_utxo_sync_feature_missing_error().to_string();
+        assert!(missing.contains("feature `bdk`"), "err={missing}");
+        assert!(missing.contains(UTXO_SYNC_ENV), "err={missing}");
+        assert!(missing.contains("gap"), "err={missing}");
+        assert!(!missing.to_ascii_lowercase().contains("crypto"));
+
+        let mempool = bdk_utxo_sync_mempool_unsupported_error().to_string();
+        assert!(mempool.contains("mempool"), "err={mempool}");
+        assert!(mempool.contains("bdk"), "err={mempool}");
+        assert!(
+            mempool.contains("esplora") && mempool.contains("electrum"),
+            "err={mempool}"
+        );
+        assert!(
+            mempool.contains(UTXO_SYNC_ENV) || mempool.contains("gap"),
+            "err={mempool}"
+        );
+        assert!(!mempool.to_ascii_lowercase().contains("crypto"));
+    }
 
     #[test]
     fn parse_kind_empty_and_default_mempool() {

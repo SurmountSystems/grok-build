@@ -47,6 +47,10 @@ pub enum WalletError {
     #[error("NIP-06 derivation failed: {0}")]
     Nip06(String),
 
+    /// NIP-98 HTTP Auth pure helpers (Authorization build/parse). Not product Routstr wire.
+    #[error("NIP-98 HTTP auth: {0}")]
+    Nip98(String),
+
     #[error("on-chain derivation failed: {0}")]
     Onchain(String),
 
@@ -64,6 +68,9 @@ pub enum WalletError {
 
     #[error("BOLT12 is not supported in this build")]
     Bolt12Unsupported,
+
+    #[error("lightning: {0}")]
+    Lightning(String),
 
     #[error("explorer HTTP: {0}")]
     Explorer(String),

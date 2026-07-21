@@ -76,9 +76,15 @@ grok routstr balance          # requires key; fetches /v1/balance/info
 grok routstr topup --sats N   # live POST /lightning/invoice (default N=1000; min 1 max 1e6)
 grok routstr topup --status ID  # after pay: store sk- when status returns api_key
 grok routstr topup --no-poll  # print BOLT11+QR only (no wait)
-grok routstr refund           # guidance until CDK refund path
+grok routstr refund           # guidance until live refund / CDK path
 grok routstr fund             # backup gate + unlock → BIP84 receive address (BIP21 QR)
 ```
+
+**Model:** pick **Grok 4.5 on Routstr** in the model picker / `/model routstr-grok-4.5`
+(same pattern as OpenRouter and xAI). Do not auto-switch after topup.
+
+**Automatic funding (approved, implement gated):** invoice-first path, no website —
+see [AUTOMATIC_FUNDING.md](./AUTOMATIC_FUNDING.md).
 
 ### Mainnet top-up amounts (live OpenAPI 2026-07-19)
 

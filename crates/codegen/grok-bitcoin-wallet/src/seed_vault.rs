@@ -3,11 +3,36 @@
 //! ## Backends
 //!
 //! 1. **OS keyring** (preferred): service [`SEED_VAULT_SERVICE`], user
-//!    [`SEED_VAULT_USER`].
+//!    [`SEED_VAULT_USER`]. Payload is the **phrase string** (human-readable
+//!    OS UX; entropy bytes would be opaque/binary in many keyrings).
 //! 2. **Password AEAD file**: Argon2id + XChaCha20-Poly1305 blob under a path
-//!    the caller chooses (never `provider_credentials.json`).
+//!    the caller chooses. Path must pass [`assert_allowed_seed_storage_path`]
+//!    (never `provider_credentials.json`, `watch_session.json`, or
+//!    `config.toml`; match is ASCII case-insensitive).
 //!
-//! Types holding secrets never `Debug`-print mnemonic material.
+//! ## What is stored (seed material only — never passphrase)
+//!
+//! AEAD and keyring payloads hold **BIP-39 seed material only**. They are
+//! **not** a JSON object and do **not** embed a BIP-39 **passphrase** field.
+//!
+//! | Channel | Encoding |
+//! |---------|----------|
+//! | Keyring | Phrase string (v1-equivalent; OS password field UX) |
+//! | AEAD `store_aead` | Format **v1**: UTF-8 phrase string (legacy / default) |
+//! | AEAD `store_aead_entropy` | Format **v2**: raw entropy bytes (16 / 32) |
+//! | AEAD `load_aead` | Accepts **v1 and v2** |
+//!
+//! New AEAD writes bind the format version as AEAD AAD (`v` little-endian).
+//! Legacy **v1** blobs written before AAD binding still load (decrypt tries
+//! AAD first, then unbound for `v == 1` only). **v2** always requires AAD.
+//!
+//! Optional BIP-39 passphrase (unlock-time only via env
+//! `GROK_BITCOIN_BIP39_PASSPHRASE` / library `&str`) is **never** a SeedVault
+//! payload field, never written to AEAD, keyring, CredentialsStore, or
+//! `watch_session.json`. Missing/empty → default derivation path.
+//!
+//! Types holding secrets never `Debug`-print mnemonic or entropy material
+//! ([`crate::mnemonic::EntropyBytes`] is redacted).
 
 use std::fmt;
 use std::fs;
@@ -16,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -31,8 +56,12 @@ pub const SEED_VAULT_SERVICE: &str = "grok-bitcoin-seed";
 /// Keyring account / user label for the primary mnemonic.
 pub const SEED_VAULT_USER: &str = "bip39-mnemonic";
 
-/// File format version for password-wrapped AEAD blobs.
-const AEAD_FORMAT_VERSION: u32 = 1;
+/// AEAD envelope **v1**: ciphertext plaintext = UTF-8 BIP-39 phrase string.
+const AEAD_FORMAT_VERSION_PHRASE: u32 = 1;
+
+/// AEAD envelope **v2**: ciphertext plaintext = raw BIP-39 entropy bytes
+/// (16 for 12-word, 32 for 24-word). No passphrase field.
+const AEAD_FORMAT_VERSION_ENTROPY: u32 = 2;
 
 /// Argon2id salt length.
 const SALT_LEN: usize = 16;
@@ -109,11 +138,11 @@ impl SeedVault {
 
     /// Vault that may use an AEAD file at `path` when password is provided.
     ///
-    /// Returns [`WalletError::SeedVault`] if `path` is the forbidden
-    /// `provider_credentials.json` filename.
+    /// Returns [`WalletError::SeedVault`] if `path` is a forbidden seed-storage
+    /// filename (see [`assert_allowed_seed_storage_path`]).
     pub fn with_aead_path(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        assert_not_credentials_store_path(&path)?;
+        assert_allowed_seed_storage_path(&path)?;
         Ok(Self {
             aead_path: Some(path),
         })
@@ -173,12 +202,65 @@ impl SeedVault {
     }
 
     /// Store mnemonic as password-wrapped AEAD at the configured path.
+    ///
+    /// Writes format **v1** (UTF-8 phrase string). Prefer
+    /// [`Self::store_aead_entropy`] for new installs that want compact entropy
+    /// encoding. Does **not** accept or persist a BIP-39 passphrase.
     pub fn store_aead(&self, mnemonic: &MnemonicSecret, password: &VaultPassword) -> Result<()> {
+        self.write_aead_blob(encrypt_payload(
+            mnemonic.expose().as_bytes(),
+            password.expose(),
+            AEAD_FORMAT_VERSION_PHRASE,
+        )?)
+    }
+
+    /// Store mnemonic as password-wrapped AEAD using **entropy-bytes** encoding
+    /// (format **v2**: 16 bytes for 12-word, 32 for 24-word).
+    ///
+    /// Load via [`Self::load_aead`] (accepts v1 phrase and v2 entropy). Keyring
+    /// paths still store the phrase string for OS UX. Does **not** accept or
+    /// persist a BIP-39 passphrase.
+    pub fn store_aead_entropy(
+        &self,
+        mnemonic: &MnemonicSecret,
+        password: &VaultPassword,
+    ) -> Result<()> {
+        let entropy = mnemonic.to_entropy()?;
+        let blob = encrypt_payload(
+            entropy.as_ref(),
+            password.expose(),
+            AEAD_FORMAT_VERSION_ENTROPY,
+        )?;
+        // `entropy` zeroizes on drop after encrypt copies plaintext into AEAD.
+        drop(entropy);
+        self.write_aead_blob(blob)
+    }
+
+    /// Load mnemonic from password-wrapped AEAD file.
+    ///
+    /// Accepts format **v1** (phrase UTF-8) and **v2** (raw entropy bytes).
+    /// Reconstructs [`MnemonicSecret`] via bip39; does **not** recover or store
+    /// a BIP-39 passphrase (unlock env/API only).
+    pub fn load_aead(&self, password: &VaultPassword) -> Result<MnemonicSecret> {
         let path = self.aead_path.as_ref().ok_or_else(|| {
             WalletError::SeedVault("no AEAD path configured (use SeedVault::with_aead_path)".into())
         })?;
-        assert_not_credentials_store_path(path)?;
-        let blob = encrypt_mnemonic(mnemonic.expose(), password.expose())?;
+        assert_allowed_seed_storage_path(path)?;
+        if !path.exists() {
+            return Err(WalletError::NotFound);
+        }
+        let bytes = fs::read(path).map_err(|e| WalletError::SeedVault(e.to_string()))?;
+        let blob: AeadBlob =
+            serde_json::from_slice(&bytes).map_err(|e| WalletError::SeedVault(e.to_string()))?;
+        decrypt_to_mnemonic(&blob, password.expose())
+    }
+
+    /// Write an encrypted envelope to the configured AEAD path (path guards).
+    fn write_aead_blob(&self, blob: AeadBlob) -> Result<()> {
+        let path = self.aead_path.as_ref().ok_or_else(|| {
+            WalletError::SeedVault("no AEAD path configured (use SeedVault::with_aead_path)".into())
+        })?;
+        assert_allowed_seed_storage_path(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| WalletError::SeedVault(e.to_string()))?;
         }
@@ -188,28 +270,16 @@ impl SeedVault {
         Ok(())
     }
 
-    /// Load mnemonic from password-wrapped AEAD file.
-    pub fn load_aead(&self, password: &VaultPassword) -> Result<MnemonicSecret> {
-        let path = self.aead_path.as_ref().ok_or_else(|| {
-            WalletError::SeedVault("no AEAD path configured (use SeedVault::with_aead_path)".into())
-        })?;
-        assert_not_credentials_store_path(path)?;
-        if !path.exists() {
-            return Err(WalletError::NotFound);
-        }
-        let bytes = fs::read(path).map_err(|e| WalletError::SeedVault(e.to_string()))?;
-        let blob: AeadBlob =
-            serde_json::from_slice(&bytes).map_err(|e| WalletError::SeedVault(e.to_string()))?;
-        let phrase = decrypt_mnemonic(&blob, password.expose())?;
-        // Only long-lived holder is MnemonicSecret (secrecy/zeroize on drop).
-        import_mnemonic(phrase.as_str())
-    }
-
     /// Delete AEAD file if present.
+    ///
+    /// Refuses forbidden seed-storage path filenames (same guard as store/load)
+    /// so a same-crate struct-literal bypass cannot unlink product files such
+    /// as `watch_session.json` or `provider_credentials.json`.
     pub fn delete_aead(&self) -> Result<()> {
         let Some(path) = self.aead_path.as_ref() else {
             return Ok(());
         };
+        assert_allowed_seed_storage_path(path)?;
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -523,42 +593,64 @@ impl MnemonicBackupGate {
     }
 }
 
-fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
+/// Derive AEAD key material; buffer is always zeroized on drop (incl. Err paths).
+fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
     // Moderate params for interactive unlock (not a KDF benchmark).
     let params = Params::new(19_456, 2, 1, Some(KEY_LEN))
         .map_err(|e| WalletError::Aead(format!("argon2 params: {e}")))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = [0u8; KEY_LEN];
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .hash_password_into(password.as_bytes(), salt, key.as_mut())
         .map_err(|e| WalletError::Aead(format!("argon2 derive: {e}")))?;
     Ok(key)
 }
 
-fn encrypt_mnemonic(phrase: &str, password: &str) -> Result<AeadBlob> {
+/// AAD for format-version binding: little-endian `v` (authenticated, not secret).
+fn version_aad(version: u32) -> [u8; 4] {
+    version.to_le_bytes()
+}
+
+/// Encrypt `plaintext` under Argon2id + XChaCha20-Poly1305 with format `version`.
+///
+/// Binds `version` as AEAD AAD so envelope `v` cannot be flipped without
+/// invalidating the Poly1305 tag.
+fn encrypt_payload(plaintext: &[u8], password: &str, version: u32) -> Result<AeadBlob> {
     let mut salt = [0u8; SALT_LEN];
     let mut nonce_bytes = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut salt).map_err(|e| WalletError::Entropy(format!("salt: {e}")))?;
     getrandom::getrandom(&mut nonce_bytes)
         .map_err(|e| WalletError::Entropy(format!("nonce: {e}")))?;
 
-    let key_bytes = Zeroizing::new(derive_key(password, &salt)?);
+    let key_bytes = derive_key(password, &salt)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key_bytes.as_ref()));
     let nonce = XNonce::from_slice(&nonce_bytes);
+    let aad = version_aad(version);
     let ct = cipher
-        .encrypt(nonce, phrase.as_bytes())
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
         .map_err(|e| WalletError::Aead(format!("encrypt: {e}")))?;
 
     Ok(AeadBlob {
-        v: AEAD_FORMAT_VERSION,
+        v: version,
         salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, salt),
         nonce: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes),
         ct: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ct),
     })
 }
 
-fn decrypt_mnemonic(blob: &AeadBlob, password: &str) -> Result<Zeroizing<String>> {
-    if blob.v != AEAD_FORMAT_VERSION {
+/// Decrypt AEAD ciphertext to zeroizing plaintext bytes (version-checked).
+///
+/// New writes bind `v` as AAD. Legacy **v1** blobs (pre-AAD) still load via a
+/// single no-AAD fallback when AAD decrypt fails and `v == 1` only. **v2**
+/// always requires matching AAD (fail closed if version is flipped).
+fn decrypt_payload(blob: &AeadBlob, password: &str) -> Result<Zeroizing<Vec<u8>>> {
+    if blob.v != AEAD_FORMAT_VERSION_PHRASE && blob.v != AEAD_FORMAT_VERSION_ENTROPY {
         return Err(WalletError::Aead(format!(
             "unsupported AEAD format version {}",
             blob.v
@@ -576,16 +668,92 @@ fn decrypt_mnemonic(blob: &AeadBlob, password: &str) -> Result<Zeroizing<String>
         return Err(WalletError::Aead("invalid salt/nonce length".into()));
     }
 
-    let key_bytes = Zeroizing::new(derive_key(password, &salt)?);
+    let key_bytes = derive_key(password, &salt)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key_bytes.as_ref()));
     let nonce = XNonce::from_slice(&nonce_bytes);
-    let plain = cipher
-        .decrypt(nonce, ct.as_ref())
-        .map_err(|_| WalletError::Aead("decrypt failed (wrong password or corrupt blob)".into()))?;
-    let plain = Zeroizing::new(plain);
+    let aad = version_aad(blob.v);
+    let plain = match cipher.decrypt(
+        nonce,
+        Payload {
+            msg: ct.as_ref(),
+            aad: &aad,
+        },
+    ) {
+        Ok(p) => p,
+        Err(_) if blob.v == AEAD_FORMAT_VERSION_PHRASE => {
+            // Legacy v1: ciphertext not bound to version (written before AAD).
+            cipher.decrypt(nonce, ct.as_ref()).map_err(|_| {
+                WalletError::Aead("decrypt failed (wrong password or corrupt blob)".into())
+            })?
+        }
+        Err(_) => {
+            return Err(WalletError::Aead(
+                "decrypt failed (wrong password or corrupt blob)".into(),
+            ));
+        }
+    };
+    Ok(Zeroizing::new(plain))
+}
+
+/// Decrypt envelope → [`MnemonicSecret`] (v1 phrase or v2 entropy).
+fn decrypt_to_mnemonic(blob: &AeadBlob, password: &str) -> Result<MnemonicSecret> {
+    let plain = decrypt_payload(blob, password)?;
+    match blob.v {
+        AEAD_FORMAT_VERSION_PHRASE => {
+            let s = std::str::from_utf8(plain.as_ref())
+                .map_err(|e| WalletError::Aead(format!("utf8: {e}")))?;
+            // Only long-lived holder is MnemonicSecret (secrecy/zeroize on drop).
+            import_mnemonic(s)
+        }
+        AEAD_FORMAT_VERSION_ENTROPY => {
+            // Reconstruct phrase from entropy; plain buffer zeroizes on drop.
+            MnemonicSecret::from_entropy(plain.as_ref())
+        }
+        other => Err(WalletError::Aead(format!(
+            "unsupported AEAD format version {other}"
+        ))),
+    }
+}
+
+/// Decrypt v1 phrase plaintext as UTF-8 string (tests / phrase-only probes).
+#[cfg(test)]
+fn decrypt_mnemonic_phrase(blob: &AeadBlob, password: &str) -> Result<Zeroizing<String>> {
+    if blob.v != AEAD_FORMAT_VERSION_PHRASE {
+        return Err(WalletError::Aead(format!(
+            "expected phrase format v{AEAD_FORMAT_VERSION_PHRASE}, got v{}",
+            blob.v
+        )));
+    }
+    let plain = decrypt_payload(blob, password)?;
     let s =
         std::str::from_utf8(plain.as_ref()).map_err(|e| WalletError::Aead(format!("utf8: {e}")))?;
     Ok(Zeroizing::new(s.to_owned()))
+}
+
+/// Test-only: encrypt like pre-AAD v1 writers (no version AAD).
+#[cfg(test)]
+fn encrypt_payload_legacy_no_aad(
+    plaintext: &[u8],
+    password: &str,
+    version: u32,
+) -> Result<AeadBlob> {
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    getrandom::getrandom(&mut salt).map_err(|e| WalletError::Entropy(format!("salt: {e}")))?;
+    getrandom::getrandom(&mut nonce_bytes)
+        .map_err(|e| WalletError::Entropy(format!("nonce: {e}")))?;
+    let key_bytes = derive_key(password, &salt)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key_bytes.as_ref()));
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| WalletError::Aead(format!("encrypt: {e}")))?;
+    Ok(AeadBlob {
+        v: version,
+        salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, salt),
+        nonce: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes),
+        ct: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ct),
+    })
 }
 
 /// Write `bytes` to `path` via temp file created mode 0600, fsync, rename.
@@ -646,31 +814,60 @@ fn write_secret_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Assert a path is not the forbidden CredentialsStore mirror filename.
-pub fn assert_not_credentials_store_path(path: &Path) -> Result<()> {
-    if path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == "provider_credentials.json")
+/// Filenames SeedVault must never use for AEAD (or any on-disk seed) storage.
+///
+/// Kept small and explicit: product hot-key mirror, durable watch progress,
+/// and shell config — not a sprawling denylist.
+const FORBIDDEN_SEED_STORAGE_FILENAMES: &[&str] = &[
+    "provider_credentials.json",
+    "watch_session.json",
+    "config.toml",
+];
+
+/// Assert `path` is allowed for SeedVault AEAD / on-disk seed storage.
+///
+/// Refuses known product files that must never hold BIP-39 (CredentialsStore
+/// mirror, watch-session progress, shell config). Matches on the final path
+/// component only (any directory), with **ASCII case-insensitive** comparison
+/// so case-insensitive filesystems (macOS APFS default, Windows) cannot bypass
+/// the denylist via `Config.toml` / `PROVIDER_CREDENTIALS.JSON` aliases.
+///
+/// Prefer this over ad-hoc filename checks at call sites.
+pub fn assert_allowed_seed_storage_path(path: &Path) -> Result<()> {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(());
+    };
+    if FORBIDDEN_SEED_STORAGE_FILENAMES
+        .iter()
+        .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
     {
-        return Err(WalletError::SeedVault(
-            "refusing to store BIP-39 in provider_credentials.json".into(),
-        ));
+        return Err(WalletError::SeedVault(format!(
+            "refusing to store BIP-39 in forbidden path filename {name}"
+        )));
     }
     Ok(())
+}
+
+/// Legacy alias for [`assert_allowed_seed_storage_path`].
+///
+/// Historically refused only `provider_credentials.json`; the helper now
+/// refuses the full forbidden-filename set. Prefer the new name at call sites.
+#[inline]
+pub fn assert_not_credentials_store_path(path: &Path) -> Result<()> {
+    assert_allowed_seed_storage_path(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mnemonic::generate_mnemonic;
+    use crate::mnemonic::{generate_mnemonic, generate_mnemonic_with_word_count};
     use tempfile::TempDir;
 
     #[test]
     fn aead_roundtrip() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("seed.aead.json");
-        assert_not_credentials_store_path(&path).unwrap();
+        assert_allowed_seed_storage_path(&path).unwrap();
         let vault = SeedVault::with_aead_path(&path).unwrap();
         let m = generate_mnemonic().unwrap();
         let pw = VaultPassword::new("test-password-not-for-prod");
@@ -684,6 +881,238 @@ mod tests {
         }
         let loaded = vault.load_aead(&pw).unwrap();
         assert_eq!(loaded.expose(), m.expose());
+    }
+
+    #[test]
+    fn aead_plaintext_is_mnemonic_phrase_only_not_passphrase_json() {
+        // Policy: AEAD encrypts the BIP-39 word string alone. Decrypt must not
+        // yield JSON (or any structure) that embeds a separate passphrase field.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seed.aead.json");
+        let vault = SeedVault::with_aead_path(&path).unwrap();
+        let m = generate_mnemonic().unwrap();
+        let pw = VaultPassword::new("aead-plain-check");
+        vault.store_aead(&m, &pw).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let blob: AeadBlob = serde_json::from_slice(&bytes).unwrap();
+        // On-disk envelope metadata only — no mnemonic/passphrase keys at rest
+        // in cleartext JSON fields.
+        let envelope = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+        let env_obj = envelope.as_object().expect("envelope object");
+        for forbidden_key in ["mnemonic", "passphrase", "bip39_passphrase", "seed"] {
+            assert!(
+                !env_obj.contains_key(forbidden_key),
+                "AEAD envelope must not have cleartext key {forbidden_key}"
+            );
+        }
+
+        let plain = decrypt_mnemonic_phrase(&blob, pw.expose()).unwrap();
+        let plain_s = plain.as_str();
+        // Plaintext is the phrase string, not a JSON document.
+        assert!(
+            !plain_s.trim_start().starts_with('{'),
+            "AEAD plaintext must not be JSON: {plain_s:?}"
+        );
+        assert!(
+            !plain_s.to_ascii_lowercase().contains("passphrase"),
+            "AEAD plaintext must not embed passphrase field: {plain_s:?}"
+        );
+        assert_eq!(plain_s, m.expose());
+        // Round-trip through BIP-39 import proves it is a phrase, not a bag of keys.
+        let reimported = import_mnemonic(plain_s).unwrap();
+        assert_eq!(reimported.expose(), m.expose());
+        // store_aead has no passphrase parameter — only VaultPassword (wrap KDF).
+        // Documented: BIP-39 passphrase is unlock env/API only, never payload.
+    }
+
+    #[test]
+    fn aead_entropy_encoding_roundtrip_twelve_words() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seed.entropy.aead.json");
+        let vault = SeedVault::with_aead_path(&path).unwrap();
+        let m = generate_mnemonic().unwrap();
+        assert_eq!(m.word_count(), 12);
+        let pw = VaultPassword::new("entropy-encode-pw");
+        vault.store_aead_entropy(&m, &pw).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let blob: AeadBlob = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(blob.v, AEAD_FORMAT_VERSION_ENTROPY);
+
+        let loaded = vault.load_aead(&pw).unwrap();
+        assert_eq!(loaded.expose(), m.expose());
+        assert_eq!(loaded.word_count(), 12);
+    }
+
+    #[test]
+    fn aead_entropy_encoding_roundtrip_twenty_four_words() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seed.entropy24.aead.json");
+        let vault = SeedVault::with_aead_path(&path).unwrap();
+        let m = generate_mnemonic_with_word_count(24).unwrap();
+        assert_eq!(m.word_count(), 24);
+        assert_eq!(m.to_entropy().unwrap().len(), 32);
+        let pw = VaultPassword::new("entropy-24-pw");
+        vault.store_aead_entropy(&m, &pw).unwrap();
+        let loaded = vault.load_aead(&pw).unwrap();
+        assert_eq!(loaded.expose(), m.expose());
+        assert_eq!(loaded.word_count(), 24);
+    }
+
+    #[test]
+    fn aead_entropy_load_via_product_load_fallback() {
+        // Product entry: keyring miss → AEAD; v2 entropy blob via load(Some(pw)).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seed.entropy.product_load.json");
+        let vault = SeedVault::with_aead_path(&path).unwrap();
+        let m = generate_mnemonic().unwrap();
+        let pw = VaultPassword::new("product-load-entropy-pw");
+        vault.store_aead_entropy(&m, &pw).unwrap();
+        let loaded = vault.load(Some(&pw)).unwrap();
+        assert_eq!(loaded.expose(), m.expose());
+    }
+
+    #[test]
+    fn aead_legacy_v1_no_aad_still_loads() {
+        // Pre-AAD v1 blobs must keep working (migration fallback).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seed.legacy_no_aad.json");
+        let vault = SeedVault::with_aead_path(&path).unwrap();
+        let m = generate_mnemonic().unwrap();
+        let pw = VaultPassword::new("legacy-no-aad-pw");
+        let blob = encrypt_payload_legacy_no_aad(
+            m.expose().as_bytes(),
+            pw.expose(),
+            AEAD_FORMAT_VERSION_PHRASE,
+        )
+        .unwrap();
+        vault.write_aead_blob(blob).unwrap();
+        let loaded = vault.load_aead(&pw).unwrap();
+        assert_eq!(loaded.expose(), m.expose());
+    }
+
+    #[test]
+    fn aead_version_aad_rejects_flipped_envelope_v() {
+        // AAD binds format version: flipping cleartext `v` must fail closed.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seed.aad_flip.json");
+        let vault = SeedVault::with_aead_path(&path).unwrap();
+        let m = generate_mnemonic().unwrap();
+        let pw = VaultPassword::new("aad-flip-pw");
+        vault.store_aead_entropy(&m, &pw).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let mut blob: AeadBlob = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(blob.v, AEAD_FORMAT_VERSION_ENTROPY);
+        blob.v = AEAD_FORMAT_VERSION_PHRASE; // attacker flips version
+        let tampered = serde_json::to_vec_pretty(&blob).expect("serialize tampered envelope");
+        write_secret_file_atomic(&path, &tampered).unwrap();
+
+        let err = vault.load_aead(&pw).unwrap_err();
+        assert!(
+            matches!(err, WalletError::Aead(_)),
+            "flipped v must fail closed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn aead_load_legacy_v1_phrase_after_entropy_upgrade() {
+        // v1 phrase blobs written before the encoding upgrade must still load.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seed.legacy.aead.json");
+        let vault = SeedVault::with_aead_path(&path).unwrap();
+        let m = generate_mnemonic().unwrap();
+        let pw = VaultPassword::new("legacy-v1-pw");
+        vault.store_aead(&m, &pw).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let blob: AeadBlob = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(blob.v, AEAD_FORMAT_VERSION_PHRASE);
+
+        let loaded = vault.load_aead(&pw).unwrap();
+        assert_eq!(loaded.expose(), m.expose());
+    }
+
+    #[test]
+    fn aead_entropy_plaintext_is_raw_bytes_not_passphrase_json() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seed.entropy.plain.json");
+        let vault = SeedVault::with_aead_path(&path).unwrap();
+        let m = generate_mnemonic().unwrap();
+        let pw = VaultPassword::new("entropy-plain-check");
+        vault.store_aead_entropy(&m, &pw).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let envelope = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+        let env_obj = envelope.as_object().expect("envelope object");
+        for forbidden_key in ["mnemonic", "passphrase", "bip39_passphrase", "seed"] {
+            assert!(
+                !env_obj.contains_key(forbidden_key),
+                "AEAD envelope must not have cleartext key {forbidden_key}"
+            );
+        }
+        assert_eq!(
+            env_obj.get("v").and_then(|v| v.as_u64()),
+            Some(u64::from(AEAD_FORMAT_VERSION_ENTROPY))
+        );
+
+        let blob: AeadBlob = serde_json::from_slice(&bytes).unwrap();
+        let plain = decrypt_payload(&blob, pw.expose()).unwrap();
+        let plain_bytes: &[u8] = plain.as_ref();
+        // Entropy plaintext is raw bytes (16 for 12-word) — not UTF-8 JSON.
+        assert_eq!(plain_bytes.len(), 16);
+        // Never a JSON object / passphrase field document.
+        if let Ok(s) = std::str::from_utf8(plain_bytes) {
+            assert!(
+                !s.trim_start().starts_with('{'),
+                "entropy plaintext must not be JSON"
+            );
+            assert!(
+                !s.to_ascii_lowercase().contains("passphrase"),
+                "entropy plaintext must not embed passphrase"
+            );
+        }
+        let rebuilt = MnemonicSecret::from_entropy(plain_bytes).unwrap();
+        assert_eq!(rebuilt.expose(), m.expose());
+    }
+
+    #[test]
+    fn aead_entropy_wrong_password_fails() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seed.entropy.wrong.json");
+        let vault = SeedVault::with_aead_path(&path).unwrap();
+        let m = generate_mnemonic().unwrap();
+        vault
+            .store_aead_entropy(&m, &VaultPassword::new("correct-horse"))
+            .unwrap();
+        let err = vault
+            .load_aead(&VaultPassword::new("wrong-password"))
+            .unwrap_err();
+        assert!(matches!(err, WalletError::Aead(_)));
+    }
+
+    #[test]
+    fn aead_entropy_store_refuses_forbidden_paths() {
+        let m = generate_mnemonic().unwrap();
+        let pw = VaultPassword::new("pw");
+        for name in [
+            "provider_credentials.json",
+            "watch_session.json",
+            "config.toml",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join(name);
+            let vault = SeedVault {
+                aead_path: Some(path.clone()),
+            };
+            let err = vault.store_aead_entropy(&m, &pw).unwrap_err();
+            assert!(
+                matches!(err, WalletError::SeedVault(_)),
+                "{name} store_aead_entropy: {err:?}"
+            );
+            assert!(!path.exists(), "{name}: must not create forbidden path");
+        }
     }
 
     #[test]
@@ -702,24 +1131,109 @@ mod tests {
     }
 
     #[test]
-    fn refuse_provider_credentials_filename() {
-        let p = Path::new("/tmp/foo/provider_credentials.json");
-        assert!(assert_not_credentials_store_path(p).is_err());
+    fn refuse_forbidden_seed_storage_filenames() {
+        for name in [
+            "provider_credentials.json",
+            "watch_session.json",
+            "config.toml",
+        ] {
+            let p = Path::new("/tmp/foo").join(name);
+            let err = assert_allowed_seed_storage_path(&p).unwrap_err();
+            assert!(matches!(err, WalletError::SeedVault(_)), "{name}: {err:?}");
+            // Legacy alias must refuse the same set.
+            assert!(assert_not_credentials_store_path(&p).is_err(), "{name}");
+        }
+        // Allowed AEAD-style names still pass.
+        assert_allowed_seed_storage_path(Path::new("/tmp/foo/seed.aead.json")).unwrap();
+        assert_allowed_seed_storage_path(Path::new("/tmp/foo/bip39.aead")).unwrap();
     }
 
     #[test]
-    fn store_aead_refuses_provider_credentials_path() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("provider_credentials.json");
-        assert!(SeedVault::with_aead_path(&path).is_err());
-        // Bypass constructor to prove store_aead also guards.
-        let vault = SeedVault {
-            aead_path: Some(path.clone()),
-        };
+    fn refuse_forbidden_seed_storage_filenames_case_insensitive() {
+        // Case-insensitive FS (macOS/Windows) aliases must not bypass denylist.
+        for name in [
+            "Provider_Credentials.json",
+            "PROVIDER_CREDENTIALS.JSON",
+            "Watch_Session.json",
+            "WATCH_SESSION.JSON",
+            "Config.toml",
+            "CONFIG.TOML",
+            "config.TOML",
+        ] {
+            let p = Path::new("/tmp/foo").join(name);
+            let err = assert_allowed_seed_storage_path(&p).unwrap_err();
+            assert!(
+                matches!(err, WalletError::SeedVault(_)),
+                "{name} must refuse: {err:?}"
+            );
+            assert!(
+                SeedVault::with_aead_path(&p).is_err(),
+                "{name} ctor must refuse"
+            );
+        }
+    }
+
+    /// Ctor + store + planted load + delete all refuse every forbidden basename.
+    #[test]
+    fn aead_ops_refuse_all_forbidden_basenames_including_planted_load() {
         let m = generate_mnemonic().unwrap();
-        let err = vault.store_aead(&m, &VaultPassword::new("pw")).unwrap_err();
-        assert!(matches!(err, WalletError::SeedVault(_)));
-        assert!(!path.exists(), "must not create forbidden path");
+        let pw = VaultPassword::new("pw");
+        for name in [
+            "provider_credentials.json",
+            "watch_session.json",
+            "config.toml",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = if name == "watch_session.json" {
+                dir.path().join("bitcoin").join(name)
+            } else {
+                dir.path().join(name)
+            };
+
+            let ctor_err = SeedVault::with_aead_path(&path).unwrap_err();
+            assert!(
+                matches!(ctor_err, WalletError::SeedVault(_)),
+                "{name} ctor: {ctor_err:?}"
+            );
+
+            // Same-crate bypass: store / load / delete must still refuse.
+            let vault = SeedVault {
+                aead_path: Some(path.clone()),
+            };
+            let store_err = vault.store_aead(&m, &pw).unwrap_err();
+            assert!(
+                matches!(store_err, WalletError::SeedVault(_)),
+                "{name} store: {store_err:?}"
+            );
+            assert!(
+                !path.exists(),
+                "{name}: store must not create forbidden path"
+            );
+
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, b"{}").unwrap();
+            assert!(path.exists(), "{name}: plant for load/delete");
+
+            let load_err = vault.load_aead(&pw).unwrap_err();
+            assert!(
+                matches!(load_err, WalletError::SeedVault(_)),
+                "{name} planted load: {load_err:?}"
+            );
+
+            let delete_err = vault.delete_aead().unwrap_err();
+            assert!(
+                matches!(delete_err, WalletError::SeedVault(_)),
+                "{name} delete: {delete_err:?}"
+            );
+            // Forbidden delete must not unlink the planted product file.
+            assert!(
+                path.exists(),
+                "{name}: delete_aead must refuse, not remove planted file"
+            );
+            let _ = fs::remove_file(&path);
+        }
     }
 
     #[test]

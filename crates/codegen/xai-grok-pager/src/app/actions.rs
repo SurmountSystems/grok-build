@@ -764,8 +764,23 @@ pub enum Action {
     RoutstrTopup {
         sats: Option<u64>,
     },
-    /// Honest refund next steps (no live CDK return).
-    RoutstrRefund,
+    /// Cashu mint product path (NUT-04 quote → pay → proofs → redeem when live).
+    ///
+    /// Stages unlock re-entry when `proofs_mint_live`; residual + P0 topup copy
+    /// when not live. Never claims float until redeem succeeds.
+    RoutstrMint {
+        sats: Option<u64>,
+    },
+    /// Node float refund, or stage local Cashu melt when token+invoice given.
+    ///
+    /// - No token/invoice: live node refund (or residual) — same as before.
+    /// - Both token + invoice: stage [`PendingRoutstrMelt`] when melt live, else
+    ///   residual. Token uses [`SensitiveString`] (never Debug dump / scrollback).
+    ///   Unlock → melt; **never** claims sk- float.
+    RoutstrRefund {
+        token: Option<SensitiveString>,
+        invoice: Option<String>,
+    },
     /// Start background address watch after fund (or explicit address).
     RoutstrWatch {
         address: String,
@@ -2259,6 +2274,55 @@ pub enum Effect {
         bip39_passphrase: Option<SensitiveString>,
         network: Option<String>,
     },
+    /// Complete pending topup local BOLT11 pay after unlock re-entry (no BIP-39).
+    ///
+    /// SeedVault path only when product Lightning reports `bolt11_pay_live`.
+    /// Invoice poll is armed separately (P0); this effect does not cancel poll.
+    /// `bip39_passphrase`: `Some` from private modal; `None` → env.
+    RoutstrTopupLocalPayComplete {
+        agent_id: AgentId,
+        grok_home: std::path::PathBuf,
+        phrase: SensitiveString,
+        password: Option<SensitiveString>,
+        bip39_passphrase: Option<SensitiveString>,
+        bolt11: String,
+        invoice_id: String,
+    },
+    /// Complete pending Cashu mint quote after unlock re-entry (no BIP-39).
+    RoutstrMintQuoteComplete {
+        agent_id: AgentId,
+        grok_home: std::path::PathBuf,
+        phrase: SensitiveString,
+        password: Option<SensitiveString>,
+        bip39_passphrase: Option<SensitiveString>,
+        amount_sats: Option<u64>,
+    },
+    /// Complete pending Cashu mint after-pay (proofs → redeem) after unlock.
+    ///
+    /// Never puts full token in TaskResult scrollback lines (clipboard only).
+    /// `amount_sats` is a display hint when the helper reports zero amount.
+    RoutstrMintAfterPayComplete {
+        agent_id: AgentId,
+        grok_home: std::path::PathBuf,
+        phrase: SensitiveString,
+        password: Option<SensitiveString>,
+        bip39_passphrase: Option<SensitiveString>,
+        quote_id: String,
+        amount_sats: Option<u64>,
+    },
+    /// Complete pending Cashu melt (token → destination BOLT11) after unlock.
+    ///
+    /// Token held only as [`SensitiveString`] through the effect worker; zeroized
+    /// after melt. Success (`melted`) never means Routstr sk- float credit.
+    RoutstrMeltComplete {
+        agent_id: AgentId,
+        grok_home: std::path::PathBuf,
+        phrase: SensitiveString,
+        password: Option<SensitiveString>,
+        bip39_passphrase: Option<SensitiveString>,
+        token: SensitiveString,
+        bolt11: String,
+    },
     /// Background address watch: rate-limited poll loop until stop or confirmed.
     ///
     /// When `skip_sleep` is true, the first poll runs immediately (fund auto-watch
@@ -2269,6 +2333,16 @@ pub enum Effect {
         address: String,
         generation: u64,
         network: String,
+        skip_sleep: bool,
+    },
+    /// Background poll for a Routstr Lightning invoice payment (node status).
+    ///
+    /// When `skip_sleep` is true, the first status check runs immediately after
+    /// topup create. Subsequent re-arms sleep first (~5s). Drop stale generations.
+    RoutstrInvoicePoll {
+        agent_id: AgentId,
+        invoice_id: String,
+        generation: u64,
         skip_sleep: bool,
     },
     /// Fetch billing data at the app level (no agent required).
@@ -2980,6 +3054,29 @@ pub enum TaskResult {
         agent_id: AgentId,
         result: Result<xai_grok_shell::auth::RoutstrUtxosSuccess, String>,
     },
+    /// TUI topup local BOLT11 pay completed or failed (no BIP-39 in payload).
+    ///
+    /// Ok includes fallback lines when unlock/pay did not succeed; invoice poll
+    /// continues either way.
+    RoutstrTopupLocalPayCompleted {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::auth::RoutstrTopupLocalPaySuccess, String>,
+    },
+    /// TUI Cashu mint quote completed (no BIP-39; no full token).
+    RoutstrMintQuoteCompleted {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::auth::RoutstrMintQuoteSuccess, String>,
+    },
+    /// TUI Cashu mint after-pay completed (no BIP-39; token clipboard-only).
+    RoutstrMintAfterPayCompleted {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::auth::RoutstrMintAfterPaySuccess, String>,
+    },
+    /// TUI Cashu melt completed (no BIP-39; no full token; melted ≠ float).
+    RoutstrMeltCompleted {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::auth::RoutstrMeltSuccess, String>,
+    },
     /// One address-watch poll snapshot (drop if generation stale).
     RoutstrWatchTick {
         agent_id: AgentId,
@@ -2987,6 +3084,20 @@ pub enum TaskResult {
         status_line: String,
         confirmed: bool,
         address: String,
+    },
+    /// One Routstr invoice status poll (drop if generation stale).
+    RoutstrInvoiceTick {
+        agent_id: AgentId,
+        generation: u64,
+        invoice_id: String,
+        /// Wire status string (`pending`, `paid`, …) or error prefix.
+        status: String,
+        /// Non-empty API key only when paid. [`SensitiveString`] so Debug never dumps `sk-`.
+        api_key: Option<SensitiveString>,
+        paid: bool,
+        /// Unix `expires_at` from status body (0 / None = unknown).
+        expires_at: Option<i64>,
+        error: Option<String>,
     },
     GateRefreshed {
         settings: Option<xai_grok_shell::util::config::RemoteSettings>,

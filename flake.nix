@@ -124,6 +124,178 @@
               cargo-mem-guard-unwrapped;
 
           # ------------------------------------------------------------------
+          # grok-bitcoin-ldk-node
+          #
+          # Standalone excluded helper (owns ldk-node + rusqlite 0.31). Built
+          # with a fileset root so crane never sees the monorepo Cargo.toml and
+          # never links ldk-node into default grok-oss / monorepo cargoArtifacts.
+          # Product: shell/pager with optional feature `ldk` talk to this binary
+          # over stdin/stdout JSON (GROK_BITCOIN_LDK_NODE_BIN).
+          # ------------------------------------------------------------------
+          ldkNodeRoot = ./crates/codegen/grok-bitcoin-ldk-node;
+
+          ldkNodeSrc = lib.fileset.toSource {
+            root = ldkNodeRoot;
+            fileset = lib.fileset.unions [
+              (ldkNodeRoot + /Cargo.toml)
+              (ldkNodeRoot + /Cargo.lock)
+              (ldkNodeRoot + /src)
+            ];
+          };
+
+          ldkNodeCrate = craneLib.crateNameFromCargoToml {
+            cargoToml = ldkNodeRoot + /Cargo.toml;
+          };
+
+          ldkNodeNativeBuildInputs =
+            with pkgs;
+            [
+              pkg-config
+              cmake
+              perl
+            ]
+            ++ lib.optionals stdenv.isLinux [
+              # Faster, leaner final links on Linux (helps free GHA RAM peaks).
+              mold
+            ];
+
+          # No openssl: helper graph is rustls/ring + bundled libsqlite3-sys
+          # (cargo tree has no openssl / openssl-sys). Darwin frameworks for
+          # system TLS / network stack only.
+          ldkNodeBuildInputs =
+            with pkgs;
+            lib.optionals stdenv.isDarwin [
+              darwin.apple_sdk.frameworks.Security
+              darwin.apple_sdk.frameworks.SystemConfiguration
+            ];
+
+          ldkNodeCommonArgs = {
+            inherit (ldkNodeCrate) pname version;
+            src = ldkNodeSrc;
+            strictDeps = true;
+            nativeBuildInputs = ldkNodeNativeBuildInputs;
+            buildInputs = ldkNodeBuildInputs;
+            # Cap cargo fan-out inside the pure sandbox (free GHA ~16GB).
+            CARGO_BUILD_JOBS = "2";
+            RUSTFLAGS = lib.optionalString pkgs.stdenv.isLinux "-C link-arg=-fuse-ld=mold";
+            meta = {
+              description = "Out-of-process LDK BOLT11 pay helper for grok-bitcoin-wallet";
+              homepage = "https://github.com/SurmountSystems/grok-oss";
+              license = lib.licenses.asl20;
+              mainProgram = "grok-bitcoin-ldk-node";
+              platforms = lib.platforms.unix;
+            };
+          };
+
+          # Shared dep closure for package + tests (ldk-node graph is heavy).
+          ldkNodeArtifacts = craneLib.buildDepsOnly ldkNodeCommonArgs;
+
+          # Install package only (no unit tests here). Tests live solely in
+          # checks.grok-bitcoin-ldk-node-tests. Package is packages-only (not
+          # under checks) so `nix flake check` does not pay for a second full
+          # install of the LDK graph — use `just ldk-node` for opt-in pure build.
+          grok-bitcoin-ldk-node = craneLib.buildPackage (
+            ldkNodeCommonArgs
+            // {
+              cargoArtifacts = ldkNodeArtifacts;
+              doCheck = false;
+            }
+          );
+
+          # Unit tests as the single flake check for this crate (still heavy:
+          # full ldk-node pure graph). Prefer `just ldk-node` over casual
+          # `nix flake check` as a pre-push gate.
+          grok-bitcoin-ldk-node-tests = craneLib.cargoTest (
+            ldkNodeCommonArgs
+            // {
+              cargoArtifacts = ldkNodeArtifacts;
+            }
+          );
+
+          # ------------------------------------------------------------------
+          # grok-bitcoin-cdk-mint
+          #
+          # Standalone excluded helper (owns cdk + cdk-sqlite + rusqlite 0.31).
+          # Isolated fileset root so crane never sees the monorepo Cargo.toml
+          # and never links cdk into default grok-oss / monorepo cargoArtifacts.
+          # Product: shell/pager with optional feature `cashu-cdk` talk to this
+          # binary over stdin/stdout JSON (GROK_BITCOIN_CDK_MINT_BIN).
+          # ------------------------------------------------------------------
+          cdkMintRoot = ./crates/codegen/grok-bitcoin-cdk-mint;
+
+          cdkMintSrc = lib.fileset.toSource {
+            root = cdkMintRoot;
+            fileset = lib.fileset.unions [
+              (cdkMintRoot + /Cargo.toml)
+              (cdkMintRoot + /Cargo.lock)
+              (cdkMintRoot + /src)
+            ];
+          };
+
+          cdkMintCrate = craneLib.crateNameFromCargoToml {
+            cargoToml = cdkMintRoot + /Cargo.toml;
+          };
+
+          cdkMintNativeBuildInputs =
+            with pkgs;
+            [
+              pkg-config
+              # cdk-sqlite / libsqlite3-sys bundled build may need cmake/perl
+              # on some platforms (mirror ldk helper for portable pure builds).
+              cmake
+              perl
+            ]
+            ++ lib.optionals stdenv.isLinux [
+              mold
+            ];
+
+          cdkMintBuildInputs =
+            with pkgs;
+            lib.optionals stdenv.isDarwin [
+              darwin.apple_sdk.frameworks.Security
+              darwin.apple_sdk.frameworks.SystemConfiguration
+            ];
+
+          cdkMintCommonArgs = {
+            inherit (cdkMintCrate) pname version;
+            src = cdkMintSrc;
+            strictDeps = true;
+            nativeBuildInputs = cdkMintNativeBuildInputs;
+            buildInputs = cdkMintBuildInputs;
+            CARGO_BUILD_JOBS = "2";
+            RUSTFLAGS = lib.optionalString pkgs.stdenv.isLinux "-C link-arg=-fuse-ld=mold";
+            meta = {
+              description = "Out-of-process Cashu CDK mint-quote + proofs helper for grok-bitcoin-wallet";
+              homepage = "https://github.com/SurmountSystems/grok-oss";
+              license = lib.licenses.asl20;
+              mainProgram = "grok-bitcoin-cdk-mint";
+              platforms = lib.platforms.unix;
+            };
+          };
+
+          # Shared dep closure for package + tests (cdk graph is heavy).
+          cdkMintArtifacts = craneLib.buildDepsOnly cdkMintCommonArgs;
+
+          # Install package only (no unit tests here). Tests live solely in
+          # checks.grok-bitcoin-cdk-mint-tests. Package is packages-only (not
+          # under checks) so `nix flake check` does not pay for a second full
+          # install of the CDK graph — use `just cdk-mint` for opt-in pure build.
+          grok-bitcoin-cdk-mint = craneLib.buildPackage (
+            cdkMintCommonArgs
+            // {
+              cargoArtifacts = cdkMintArtifacts;
+              doCheck = false;
+            }
+          );
+
+          grok-bitcoin-cdk-mint-tests = craneLib.cargoTest (
+            cdkMintCommonArgs
+            // {
+              cargoArtifacts = cdkMintArtifacts;
+            }
+          );
+
+          # ------------------------------------------------------------------
           # grok-oss monorepo (crane)
           # ------------------------------------------------------------------
           src = lib.cleanSourceWith {
@@ -342,6 +514,8 @@
               echo "  nix run .#cargo-mem-guard -- cargo check -p xai-grok-pager-bin --locked"
               echo "  nix build .#grok-oss"
               echo "  nix build .#cargo-mem-guard"
+              echo "  nix build .#grok-bitcoin-ldk-node"
+              echo "  nix build .#grok-bitcoin-cdk-mint"
               echo "  nix shell .#ci-tools"
             '';
           };
@@ -360,6 +534,10 @@
             cargo-mem-guard
             cargo-mem-guard-unwrapped
             cargo-mem-guard-tests
+            grok-bitcoin-ldk-node
+            grok-bitcoin-ldk-node-tests
+            grok-bitcoin-cdk-mint
+            grok-bitcoin-cdk-mint-tests
             cargoCheck
             openrouter-credentials
             justPkg
@@ -385,6 +563,8 @@
             cargo-mem-guard
             ci-tools
             cargo-mem-guard-unwrapped
+            grok-bitcoin-ldk-node
+            grok-bitcoin-cdk-mint
             ;
         }
       );
@@ -401,6 +581,10 @@
             openrouter-credentials
             cargo-mem-guard
             cargo-mem-guard-tests
+            # Helper unit tests only (install package stays packages-only —
+            # LDK/CDK pure graphs are too heavy to double under flake check).
+            grok-bitcoin-ldk-node-tests
+            grok-bitcoin-cdk-mint-tests
             ;
         }
       );
@@ -418,6 +602,14 @@
           cargo-mem-guard = {
             type = "app";
             program = "${p.cargo-mem-guard}/bin/cargo-mem-guard";
+          };
+          grok-bitcoin-ldk-node = {
+            type = "app";
+            program = "${p.grok-bitcoin-ldk-node}/bin/grok-bitcoin-ldk-node";
+          };
+          grok-bitcoin-cdk-mint = {
+            type = "app";
+            program = "${p.grok-bitcoin-cdk-mint}/bin/grok-bitcoin-cdk-mint";
           };
         }
       );

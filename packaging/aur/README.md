@@ -9,8 +9,13 @@ when publishing.
 | Directory | AUR name | Tracks |
 |-----------|----------|--------|
 | [`grok-oss-git/`](grok-oss-git/) | `grok-oss-git` | Git `main` (faithful to latest fork + upstream merges) |
+| [`grok-bitcoin-ldk-node/`](grok-bitcoin-ldk-node/) | `grok-bitcoin-ldk-node-git` | Isolated excluded crate (LDK pay/receive helper; VCS `-git`) |
 
-Installs **`/usr/bin/grok-oss`**. Unofficial Surmount fork of xai-org/grok-build.
+- **`grok-oss-git`:** installs `/usr/bin/grok-oss`. Unofficial Surmount fork of xai-org/grok-build.
+- **`grok-bitcoin-ldk-node-git`:** installs `/usr/bin/grok-bitcoin-ldk-node` (provides/conflicts
+  the non-`-git` name). Point product (feature `ldk`) at it with `GROK_BITCOIN_LDK_NODE_BIN`
+  or PATH. Draft PKGBUILD — publishing to AUR is optional; Nix pure build remains the
+  primary ship path. Pin a commit / tag before AUR upload if not tracking `main`.
 
 ## Local build test
 

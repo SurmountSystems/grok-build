@@ -178,6 +178,25 @@ mem-guard: require_system
     @echo "==> check .#cargo-mem-guard-tests"
     just nix_retry nix build -L {{ nix_low_mem_opts }} ".#checks.{{ system }}.cargo-mem-guard-tests"
 
+# Optional pure-nix build of the excluded LDK helper (not default CI / not
+# `just test`). Full ldk-node graph is heavy — long wall-clock budget.
+# Package is packages-only; tests live under checks (shared cargoArtifacts).
+ldk-node: require_system
+    @echo "==> build .#grok-bitcoin-ldk-node{{ if low_mem == "1" { " (low-mem nix opts)" } else { "" } }}"
+    just nix_retry nix build -L {{ nix_low_mem_opts }} .#grok-bitcoin-ldk-node
+    @echo "==> check .#grok-bitcoin-ldk-node-tests"
+    just nix_retry nix build -L {{ nix_low_mem_opts }} ".#checks.{{ system }}.grok-bitcoin-ldk-node-tests"
+
+# Opt-in pure Nix build + unit tests for the isolated Cashu CDK mint helper
+# (never monorepo default / never under default flake check package install).
+# After install: export GROK_BITCOIN_CDK_MINT_BIN="$(pwd)/result/bin/grok-bitcoin-cdk-mint"
+# Product needs feature cashu-cdk + GROK_BITCOIN_CASHU_MINT_URL.
+cdk-mint: require_system
+    @echo "==> build .#grok-bitcoin-cdk-mint{{ if low_mem == "1" { " (low-mem nix opts)" } else { "" } }}"
+    just nix_retry nix build -L {{ nix_low_mem_opts }} .#grok-bitcoin-cdk-mint
+    @echo "==> check .#grok-bitcoin-cdk-mint-tests"
+    just nix_retry nix build -L {{ nix_low_mem_opts }} ".#checks.{{ system }}.grok-bitcoin-cdk-mint-tests"
+
 # Run a cargo (or other) command; under CI_LOW_MEM=1 wrap with cargo-mem-guard
 # via devShells.ci (mold + pressure defaults). Cargo payloads are never
 # nix_retry'd (permanent compile fails once).

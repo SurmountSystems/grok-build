@@ -17,6 +17,27 @@ default-bazel = []
 # Selecting without the feature → structured error (not a network hang).
 esplora = ["grok-bitcoin-wallet/esplora"]
 electrum = ["grok-bitcoin-wallet/electrum"]
+# Optional LDK BOLT11 auto-pay (SeedVault path via isolated helper).
+# **Not** default CI. Forwards `grok-bitcoin-wallet/ldk` → `LdkLightning` with
+# `bolt11_pay_live=true` (out-of-process `grok-bitcoin-ldk-node`; avoids
+# rusqlite 0.31 vs shell 0.37 `links=sqlite3`). Without feature: stub +
+# invoice-first QR (P0). Helper must be built/installed for product pays:
+#   cargo build --manifest-path crates/codegen/grok-bitcoin-ldk-node/Cargo.toml
+ldk = ["grok-bitcoin-wallet/ldk"]
+# Optional Cashu CDK mint (NUT-04 quote + proofs→cashuA via isolated helper).
+# **Not** default CI. Forwards `grok-bitcoin-wallet/cashu-cdk` → `Nut04MintCashu`
+# with `mint_live` / `proofs_mint_live` when mint URL + helper binary resolvable.
+# Without feature: StubCashu + residual → P0 Routstr invoice-first topup.
+# Helper: cargo build --manifest-path crates/codegen/grok-bitcoin-cdk-mint/Cargo.toml
+# Env: GROK_BITCOIN_CASHU_MINT_URL, GROK_BITCOIN_CDK_MINT_BIN.
+cashu-cdk = ["grok-bitcoin-wallet/cashu-cdk"]
+# Optional prefer-BDK UTXO discovery for `grok routstr utxos` / spend.
+# **Not** default CI. Forwards `grok-bitcoin-wallet/bdk`. Default path remains
+# gap-limit ChainSource. Opt-in: GROK_BITCOIN_UTXO_SYNC=bdk (empty/unset = gap).
+# Live full_scan also needs chain source esplora|electrum + matching features
+# (compose `bdk,esplora` or `bdk,electrum`). Mempool + bdk → structured residual.
+# Prefer-BDK without this feature → structured residual (not a hang / Success).
+bdk = ["grok-bitcoin-wallet/bdk"]
 
 [dependencies]
 dunce = { workspace = true }
@@ -163,6 +184,7 @@ xai-grok-http = { workspace = true }
 # explorer-http: default live UTXO (mempool) + mempool.space broadcast for spend.
 # Optional package features `esplora` / `electrum` forward for alternate ChainSource
 # (electrum: TCP + TLS; TLS via GROK_BITCOIN_ELECTRUM_TLS or ssl://host:port).
+# Optional `bdk` forwards prefer-BDK full_scan (GROK_BITCOIN_UTXO_SYNC=bdk; not default).
 grok-bitcoin-wallet = { workspace = true, features = ["explorer-http"] }
 xai-grok-models = { workspace = true }
 prod-mc-cli-chat-proxy-types = { path = "../../../prod/mc/cli-chat-proxy-types" }

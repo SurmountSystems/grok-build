@@ -1,0 +1,33 @@
+# Standalone helper (NOT a monorepo workspace member).
+#
+# Owns `ldk-node` + its transitive `rusqlite 0.31` / `libsqlite3-sys` so the
+# shell binary can keep `rusqlite 0.37` (FTS5 / sqlite-vec / CVE pins) without
+# Cargo `links = "sqlite3"` conflicts. Parent wallet talks over stdin/stdout
+# JSON; seed material is never written to disk in plaintext.
+#
+# Build: `cargo build --manifest-path crates/codegen/grok-bitcoin-ldk-node/Cargo.toml`
+# Exclude: listed in root workspace `exclude` (see cargo-mem-guard pattern).
+[workspace]
+
+[package]
+name = "grok-bitcoin-ldk-node"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Out-of-process LDK BOLT11 pay/receive helper for grok-bitcoin-wallet (Surmount)"
+authors = ["Surmount"]
+publish = false
+
+[[bin]]
+name = "grok-bitcoin-ldk-node"
+path = "src/main.rs"
+
+[dependencies]
+ldk-node = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = false
+codegen-units = 16
