@@ -26,7 +26,7 @@ pub(crate) const GROK_SCREEN_MODE_ENV: &str = "GROK_SCREEN_MODE";
 ///
 /// Upstream xAI prints `grok`; this fork's binary is `grok-oss`. Resume and
 /// relaunch hints must match what the user can actually type after quit.
-pub(crate) const DEFAULT_CLI_HINT_NAME: &str = "grok-oss";
+pub(crate) const DEFAULT_CLI_HINT_NAME: &str = crate::client_identity::PRODUCT_CLI_NAME;
 
 /// Basename for resume / relaunch command lines shown after quit.
 ///

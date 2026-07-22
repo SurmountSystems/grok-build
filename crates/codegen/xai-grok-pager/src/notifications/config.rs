@@ -178,6 +178,7 @@ session_recap_threshold_secs = 30
 enabled = true
 # Items shown in the title. Options: action-required, spinner, activity,
 # session-name, cwd, model, turn-timer, grok
+# The \"grok\" item is the product brand slot; Grok OSS displays it as grok-oss.
 items = [\"action-required\", \"spinner\", \"activity\", \"session-name\", \"grok\"]
 
 # [[ui.notifications.hooks]]

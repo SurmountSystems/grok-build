@@ -423,6 +423,11 @@ enabled = true
 items = ["action-required", "spinner", "activity", "session-name", "grok"]
 ```
 
+The `grok` entry in `title.items` is the **product brand** slot (config name kept
+for compatibility). In Grok OSS it renders as **`grok-oss`** in the terminal/tab
+title (for example `Thinking - my-session - grok-oss`), matching the install
+binary. Session titles set outside the notifications path use the same suffix.
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `method` | string | `"auto"` | Notification protocol. `auto` picks the best for your terminal. |
@@ -432,7 +437,7 @@ items = ["action-required", "spinner", "activity", "session-name", "grok"]
 | `sleep_prevention` | bool | `true` | Keep the display awake while the agent works (macOS/Linux). |
 | `progress_bar` | bool | `true` | Show a progress indicator in the terminal tab (OSC 9;4). |
 | `title.enabled` | bool | `true` | Set the terminal title to reflect agent state. |
-| `title.items` | array | (see above) | Items shown in the title bar. Options: `action-required`, `spinner`, `activity`, `session-name`, `cwd`, `model`, `turn-timer`, `grok`. |
+| `title.items` | array | (see above) | Items shown in the title bar. Options: `action-required`, `spinner`, `activity`, `session-name`, `cwd`, `model`, `turn-timer`, `grok` (displays as `grok-oss`). |
 
 #### Terminal support matrix
 

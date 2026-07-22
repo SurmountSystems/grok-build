@@ -70,7 +70,7 @@ list when you ship fork work.
 
 ### Product
 
-- [x] **Binary / branding** — `grok-oss` (crate package still `xai-grok-pager-bin`); welcome and docs say Grok OSS
+- [x] **Binary / branding** — `grok-oss` (crate package still `xai-grok-pager-bin`); welcome, terminal/tab titles, resume hints, and docs say Grok OSS / `grok-oss`
 - [x] **OpenRouter** — separate model option (`openrouter-grok-4.5`); login/logout; secret store; optional Zed credential probe (read-only)
 - [x] **Multi-key OpenRouter** — comma lists / failover keys for credit rotation
 - [x] **Economic mode** — soft-cap effective context at the Grok 4.5 long-context price cliff (~200k); `/economic-mode`; settings default on

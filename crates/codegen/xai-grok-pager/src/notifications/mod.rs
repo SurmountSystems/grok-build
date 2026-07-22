@@ -211,8 +211,8 @@ impl NotificationService {
     }
 
     pub fn shutdown(&mut self) {
-        // Reset the tab title back to "grok" so it doesn't linger on the
-        // last activity label after exit.
+        // Reset the tab title back to the product brand so it doesn't linger
+        // on the last activity label after exit.
         let title_esc = self.title_manager.reset();
         xai_grok_shell::util::with_locked_stderr(|stderr| {
             use std::io::Write as _;
