@@ -1,30 +1,36 @@
-# Onto-xAI replay log
+# Onto-xAI stack log
 
-Append-only record of **Surmount history replayed onto** an xAI export tip.
-Each row is a local (or Surmount-remote) `onto-xai/*` branch whose **parent is
-the xAI tip** — so `git log xai-org/main..<onto tip>` shows our work even when
-GitHub’s compare page refuses unrelated histories.
+Record of **Surmount product history stacked on** an xAI export tip so
+`git log xai-org/main..<onto tip>` lists our work when GitHub’s compare page
+refuses unrelated histories.
 
-Surmount `main` remains the product archive. These branches are for
-archaeology, contribution-shaped review, and surviving the next force-export.
+Surmount `main` remains the product archive. `onto-xai/*` branches are for
+surviving force-exports and contribution-shaped review; they still land on
+`main` through normal PRs when appropriate.
 
-| Date (UTC) | xAI tip | xAI tree | Surmount tip | Onto tip | Mode | Notes |
-|------------|---------|----------|--------------|----------|------|-------|
-| 2026-07-18 | `98c3b2438aa922fbbe6178a5c0a4c48f85edc8ce` | `b40a1962cb8061b85c2354850ab4d5707f48414b` | `744c2dd9929135bb1ec47b0017f40a2860ac7692` | `1fa4faa7169da96379f0f1f202a22139ebc01749` | history | 3 first-parent commits via commit-tree; tip tree == Surmount main |
-| 2026-07-18 | `98c3b2438aa922fbbe6178a5c0a4c48f85edc8ce` | `b40a1962cb8061b85c2354850ab4d5707f48414b` | `744c2dd9929135bb1ec47b0017f40a2860ac7692` | `68a053f1ae4325bdf9cc4be9bb8ef4ab97edea95` | overlay | single PR-shaped commit: xAI tree + Surmount seams |
+| Date (UTC) | xAI tip | xAI tree | Surmount tip stacked | Onto tip | Notes |
+|------------|---------|----------|----------------------|----------|-------|
+| 2026-07-18 | `98c3b2438aa922fbbe6178a5c0a4c48f85edc8ce` | `b40a1962cb8061b85c2354850ab4d5707f48414b` | (older) | (local) | Prior tip; historical only |
+| 2026-07-22 | `3af4d5d39897855bdcc74f23e690024a5dc05573` | `e595174931be9bfb490aacf149e2c9cc0ca0ebba` | product commits via cherry-pick | `0bba0743431c84c23e01dd0369307f8d12ab208a` (branch `onto-xai/3af4d5d39897` before later honesty-pass edits) | Real cherry-pick stack: OpenRouter, branding, rate-limit/import, merge-2 tooling, economic mode / impl. Local uncommitted honesty fixes may sit on top. |
+
+## How the script works (current)
+
+**Real `git cherry-pick -x`.** Not commit-tree reparenting. Not `MODE=overlay`
+(removed / never use that flag with the current script).
+
+```bash
+git fetch xai-org main --force
+./scripts/put-history-on-xai.sh
+FORCE=1 SURMOUNT_REF=origin/main ./scripts/put-history-on-xai.sh
+```
+
+Default: leave an existing good `onto-xai/<tip>` alone unless `FORCE=1`.
 
 ## How to append
 
 ```bash
-# values printed by scripts/put-history-on-xai.sh
-echo "| $(date -u +%Y-%m-%d) | \`<xai-sha>\` | \`<xai-tree>\` | \`<surmount-sha>\` | \`<onto-sha>\` | <mode> | <notes> |" \
+echo "| $(date -u +%Y-%m-%d) | \`<xai-sha>\` | \`<xai-tree>\` | \`<surmount-sha>\` | \`<onto-sha>\` | <notes> |" \
   >> docs/upstream-onto-log.md
 ```
 
-## Rebuild after the next force-export
-
-```bash
-git fetch xai-org main --force
-./scripts/put-history-on-xai.sh          # history (default); replaces onto-xai/*
-MODE=overlay ./scripts/put-history-on-xai.sh
-```
+Full process: [`upstream-history.md`](upstream-history.md).

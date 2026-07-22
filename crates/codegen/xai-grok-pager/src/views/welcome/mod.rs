@@ -2188,7 +2188,7 @@ pub(crate) fn render_session_picker(
     // this render disagrees with `handle_welcome_input`'s `build_entry_map`
     // (which receives the effective query) on row indices.
     let filter_query =
-        crate::views::session_picker::effective_filter_query(&ctx.state.query, ctx.entries_query);
+        crate::views::session_picker::effective_filter_query(&ctx.state.query(), ctx.entries_query);
     let filtered_indices =
         crate::app::app_view::filter_session_entries(ctx.sessions, filter_query, ctx.source_filter);
 

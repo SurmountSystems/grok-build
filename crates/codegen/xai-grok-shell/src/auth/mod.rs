@@ -55,11 +55,6 @@ pub use model::{AuthMode, GrokAuth, lookup_auth};
 pub(crate) use model::{
     TOKEN_TTL, UserInfo, default_coding_data_retention_opt_out, is_expired, token_suffix,
 };
-pub(crate) use refresh::DiagnosticUploader;
-pub use harness_secrets::{
-    GROK_ZED_CONFIG_DIR_ENV, SharedKeySource, probe_shared_openrouter_key,
-    probe_shared_openrouter_key_default,
-};
 pub use openrouter::{
     OPENROUTER_API_KEY_ENV, OPENROUTER_API_KEYS_ENV, OPENROUTER_API_URL,
     OPENROUTER_GROK_45_CATALOG_ID, OpenRouterAuthError, OpenRouterCreditsData,

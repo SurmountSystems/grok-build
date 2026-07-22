@@ -30,7 +30,7 @@ pub struct StaticShellSnapshot {
     pub shell: UnixShellKind,
 }
 
-fn shell_binary(shell: UnixShellKind) -> &'static str {
+fn shell_binary(shell: UnixShellKind) -> String {
     xai_grok_config::shell::unix_shell_path(shell)
 }
 
@@ -161,7 +161,7 @@ impl StaticShellSnapshot {
         };
 
         Ok(PreparedStaticCommand {
-            binary: shell_binary(self.shell).to_string(),
+            binary: shell_binary(self.shell),
             args,
             fd_mappings: vec![FdMapping {
                 parent_fd: state_in_read,

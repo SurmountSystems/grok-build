@@ -654,13 +654,13 @@ fn queue_open_workflows_modal_refresh(app: &mut AppView, agent_id: AgentId) {
     };
     let already_pending = app.pending_effects.iter().any(|effect| {
         matches!(
-            effect,
-            Effect::FetchWorkflowsList {
-                agent_id: pending_id,
-                ..
-            }
-if *pending_id == agent_id
-        )
+                    effect,
+                    Effect::FetchWorkflowsList {
+                        agent_id: pending_id,
+                        ..
+                    }
+        if *pending_id == agent_id
+                )
     });
     if !already_pending {
         app.pending_effects.push(Effect::FetchWorkflowsList {

@@ -2362,11 +2362,11 @@ async fn skill_reminder_deferred_while_turn_running_flushed_when_idle() {
             .iter()
             .filter(|item| {
                 matches!(
-                    item, ConversationItem::User(u) if u.content.iter().any(| p |
-                    matches!(p, xai_grok_sampling_types::ContentPart::Text { text }
-if
-                    text.contains("pdf-tools")))
-                )
+                                    item, ConversationItem::User(u) if u.content.iter().any(| p |
+                                    matches!(p, xai_grok_sampling_types::ContentPart::Text { text }
+                if
+                                    text.contains("pdf-tools")))
+                                )
             })
             .count()
     }

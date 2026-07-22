@@ -630,22 +630,22 @@ impl xai_tool_runtime::Tool for ReadFileTool {
             });
         };
         Box::pin(async_stream::stream! {
-            match ReadFileTool::read_with_streamability(& ctx, input). await {
-            Ok((output, streamable)) => { if streamable && let
-            ReadFileOutput::FileContent(fc) = & output && ! fc.content.is_empty() {
-            let content = fc.content.as_bytes(); let mut last_total : u64 = 0; let
-            mut window_start = 0usize; while window_start < content.len() { let mut
-            window_end = (window_start + STREAM_DELTA_TARGET_BYTES).min(content
-            .len()); while window_end > window_start && ! fc.content
-            .is_char_boundary(window_end) { window_end -= 1; }
-if let Some(p) =
-            xai_tool_runtime::stream_chunk(spec, & content[..window_end], window_end
-            as u64, & mut last_total, false,) { yield
-            xai_tool_runtime::ToolStreamItem::Progress(p); } window_start =
-            window_end; } } yield
-            xai_tool_runtime::ToolStreamItem::Terminal(Ok(output)); } Err(e) => yield
-            xai_tool_runtime::ToolStreamItem::Terminal(Err(e)), }
-        })
+                    match ReadFileTool::read_with_streamability(& ctx, input). await {
+                    Ok((output, streamable)) => { if streamable && let
+                    ReadFileOutput::FileContent(fc) = & output && ! fc.content.is_empty() {
+                    let content = fc.content.as_bytes(); let mut last_total : u64 = 0; let
+                    mut window_start = 0usize; while window_start < content.len() { let mut
+                    window_end = (window_start + STREAM_DELTA_TARGET_BYTES).min(content
+                    .len()); while window_end > window_start && ! fc.content
+                    .is_char_boundary(window_end) { window_end -= 1; }
+        if let Some(p) =
+                    xai_tool_runtime::stream_chunk(spec, & content[..window_end], window_end
+                    as u64, & mut last_total, false,) { yield
+                    xai_tool_runtime::ToolStreamItem::Progress(p); } window_start =
+                    window_end; } } yield
+                    xai_tool_runtime::ToolStreamItem::Terminal(Ok(output)); } Err(e) => yield
+                    xai_tool_runtime::ToolStreamItem::Terminal(Err(e)), }
+                })
     }
     #[tracing::instrument(name = "tool.read_file", skip_all, fields(path = %input.path))]
     async fn run(

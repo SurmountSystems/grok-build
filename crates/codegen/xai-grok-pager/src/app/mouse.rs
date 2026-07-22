@@ -858,14 +858,11 @@ impl AgentView {
                                         .scrollback
                                         .entry_screen_area(idx, self.pane_areas.scrollback)
                                         .is_some_and(|(a, _, _)| click_row == a.y);
-                                let (last_click, show_word_select_tip, open_viewer) =
+                                let (last_click, show_word_select_tip) =
                                     self.handle_scrollback_click(now, idx, header_row_click);
                                 self.last_click = last_click;
                                 if show_word_select_tip {
                                     return InputOutcome::Action(Action::ShowWordSelectTip);
-                                }
-                                if open_viewer {
-                                    return InputOutcome::Action(Action::OpenBlockViewer);
                                 }
                                 return InputOutcome::Changed;
                             }
@@ -873,14 +870,11 @@ impl AgentView {
                             && now.duration_since(last_time).as_millis() < MULTI_CLICK_TIMEOUT_MS
                             && last_count >= 2
                         {
-                            let (last_click, show_word_select_tip, open_viewer) =
+                            let (last_click, show_word_select_tip) =
                                 self.handle_scrollback_click(now, last_idx, false);
                             self.last_click = last_click;
                             if show_word_select_tip {
                                 return InputOutcome::Action(Action::ShowWordSelectTip);
-                            }
-                            if open_viewer {
-                                return InputOutcome::Action(Action::OpenBlockViewer);
                             }
                             return InputOutcome::Changed;
                         }

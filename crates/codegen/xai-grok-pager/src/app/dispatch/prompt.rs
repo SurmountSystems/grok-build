@@ -1453,7 +1453,9 @@ pub(super) fn handle_prompt_response(
             crate::app::auto_implement::on_successful_turn_end(agent);
         }
 
-        let mut effects = maybe_drain_queue(agent);
+        let drain = maybe_drain_queue(agent);
+        let page_flip_entry = adopted_page_flip.or(drain.page_flip_entry);
+        let mut effects = drain.effects;
 
         // Predicted-next-prompt (tab autocomplete): fetch a fresh suggestion
         // (the stale one was wiped above) — but only after a clean, non-bash

@@ -16,6 +16,9 @@
 //! When **economic mode** is on (soft-cap context ≈ 200K), auto-queued blocks
 //! clamp explicit `--effort N` / `effort N` above 1 down to 1 so implement
 //! loops stay on the cheap tier (no multi-reviewer fan-out).
+//!
+//! Enqueue is always **append** (`push_back`): existing local queued prompts
+//! are kept; the follow-up `/implement` is added at the end.
 
 use crate::app::agent_view::AgentView;
 use crate::scrollback::block::RenderBlock;
@@ -336,10 +339,10 @@ pub fn maybe_enqueue_auto_implement(agent: &mut AgentView, enabled: bool) -> Opt
     if agent.bash_turn {
         return None;
     }
-    // Don't stack on top of an already-busy local/server queue.
-    if !agent.session.pending_prompts.is_empty() || !agent.shared_queue.is_empty() {
-        return None;
-    }
+    // Always append to the end of the local queue (enqueue_prompt is push_back).
+    // Do not drop or skip when other prompts are already waiting — keep them
+    // and add /implement after. Shared/server queue rows are separate; local
+    // append still records the follow-up for when the session is free to drain.
 
     let prior = agent.session.prompt_history.first().cloned();
 

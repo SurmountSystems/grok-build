@@ -15,23 +15,33 @@ Terminal AI coding agent: full-screen TUI, headless/CI mode, and ACP for editors
 [Build from source](#build-from-source) ·
 [Upstream](#relationship-to-upstream)
 
-A small `SOURCE_REV` file at the root records the full monorepo commit SHA
-for the version of the code present in this tree.
-
 </div>
 
 ---
+
+## How Grok OSS differs (short)
+
+Upstream does not accept external pull requests; this fork does. Product name
+and binary are **`grok-oss`**. Config and sessions stay under **`~/.grok`**.
+
+Fork additions include OpenRouter as a separate model option, shared rate
+limits across processes, economic mode, and auto-run `/implement` follow-ups.
+Detail: **[`FORK.md`](FORK.md)**.
+
+If upstream ever accepts outside PRs, Surmount intends to contribute the useful
+work back.
+
+`SOURCE_REV` at the repo root is a **monorepo export pin** (full SHA recorded
+for an absorbed upstream-side tree), not a substitute for `git rev-parse HEAD`.
 
 ## Vision
 
 | Pillar | What we do |
 |--------|------------|
-| **Faithful** | Track [xai-org/grok-build](https://github.com/xai-org/grok-build); keep crate layout for clean merges |
+| **Faithful** | Track [xai-org/grok-build](https://github.com/xai-org/grok-build); keep crate layout for clean content alignment |
 | **Open** | Public source, **PRs accepted here**, security-conscious review |
 | **Distinct** | Product **Grok OSS**, CLI **`grok-oss`**, clear unofficial labeling |
 | **Compatible** | Config/session state still under **`~/.grok`** (shared with upstream CLI if both installed) |
-
-Fork features (examples): OpenRouter as a separate model option — see shell docs.
 
 ## Install
 
@@ -41,7 +51,6 @@ Sources live in-tree under [`packaging/aur/`](packaging/aur/). After the package
 is published to the AUR:
 
 ```bash
-# VCS package tracking main (recommended while following upstream closely)
 yay -S grok-oss-git
 # or: paru -S grok-oss-git
 ```
@@ -58,22 +67,20 @@ cargo install --path crates/codegen/xai-grok-pager-bin --locked --force
 grok-oss --version
 ```
 
-If the GitHub repo is still named `grok-build`, use that clone URL until rename.
-
 ### Nix
 
 ```bash
 nix develop          # fenix toolchain from rust-toolchain.toml + build deps
-nix build .#grok-oss # → ./result/bin/grok-oss
+nix build .#grok-oss # → ./result/bin/grok-oss  (human packaging, not GHA)
 ```
 
-CI uses the same flake (see `.github/workflows/ci.yml`). Locally, mirror GH CI with:
+**CI is for checks only** (no release package in GitHub Actions — supply chain).
+Locally, the same quality gate:
 
 ```bash
-just ci        # local mirror of GHA quality (flake-meta + ci-prep + just test)
-just ci-quick  # faster cargo check/tests inside nix develop
+just check     # or: just ci  — full gate; run before push
+just test      # fmt / clippy / tests without redoing full flake prep
 ```
-
 
 ### Official upstream binary (not this fork)
 
@@ -87,22 +94,12 @@ That path is SpaceXAI’s release channel, **not** Grok OSS.
 
 Requirements:
 
-- **Rust** — the toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml);
-  `rustup` installs it automatically on first build.
-- **[DotSlash](https://dotslash-cli.com)** — required so hermetic tools under
-  [`bin/`](bin/) (notably [`bin/protoc`](bin/protoc)) can download and run.
-  Install it and ensure `dotslash` is on your `PATH` **before** building:
-
-  ```sh
-  cargo install dotslash
-  # or: prebuilt packages — https://dotslash-cli.com/docs/installation/
-  /usr/bin/env dotslash --help   # sanity check
-  ```
-
-- **protoc** — proto codegen resolves [`bin/protoc`](bin/protoc) via DotSlash,
-  or falls back to a `protoc` on `PATH` / `$PROTOC`.
-- macOS and Linux are supported build hosts; Windows builds are best-effort
-  and not currently tested from this tree.
+- **Rust** — pinned by [`rust-toolchain.toml`](rust-toolchain.toml);
+  `rustup` installs on first build.
+- **[DotSlash](https://dotslash-cli.com)** — hermetic tools under [`bin/`](bin/)
+  (notably `bin/protoc`). Install and put `dotslash` on `PATH` before building.
+- **protoc** — via DotSlash `bin/protoc`, or `PATH` / `$PROTOC`.
+- macOS and Linux are supported; Windows is best-effort.
 
 ```bash
 cargo run -p xai-grok-pager-bin                 # build + launch
@@ -120,21 +117,23 @@ artifact is **`grok-oss`**.
 | Repo | [xai-org/grok-build](https://github.com/xai-org/grok-build) | [SurmountSystems/grok-oss](https://github.com/SurmountSystems/grok-oss) |
 | External PRs | Not accepted | **Welcome** |
 | Binary | `grok` (official installer) | `grok-oss` |
-| Releases | Official channels / installers | **No separate release train** — identity is **upstream version + git SHA**; `grok-oss update --check` vs Surmount `main` |
-| License | Apache-2.0 | Apache-2.0 (same first-party terms) |
+| Releases | Official channels / installers | **No separate release train** — upstream version + git SHA; `grok-oss update --check` vs Surmount `main` |
+| License | Apache-2.0 | Apache-2.0 |
 
 Sync and versioning: [`FORK.md`](FORK.md), [`docs/upstream-history.md`](docs/upstream-history.md).  
-Users: `grok-oss update --check`. Maintainers: `just upstream-detect` / `just upstream-import` (never blind-merge xAI force-exports).
+Users: `grok-oss update --check`. Maintainers: `just upstream-detect` / import or put-history scripts (never blind-merge xAI force-exports).
+
 ## Documentation
 
-- Fork process & divergences: [`FORK.md`](FORK.md)
-- User guide (upstream docs tree): [`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
-- Online upstream docs may still say “Grok Build”; behavior is largely the same, CLI name differs.
+- Fork process and divergences: [`FORK.md`](FORK.md)
+- User guide (mostly upstream tree): [`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
+- Online upstream docs may still say “Grok Build”; CLI name and fork features differ as above.
 
 ## Development
 
 ```bash
-cargo check -p <crate>        # prefer targeted crates; full workspace is slow
+just check                    # full quality gate (preferred before push)
+cargo check -p <crate>
 cargo test -p xai-grok-shell --test openrouter_credentials
 cargo clippy -p <crate>
 cargo fmt --all
@@ -142,7 +141,8 @@ cargo fmt --all
 
 ## Contributing
 
-PRs against **this** repository are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+PRs against **this** repository are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md).  
+Normal git flow: feature branch → PR → `main`.
 
 ## License
 

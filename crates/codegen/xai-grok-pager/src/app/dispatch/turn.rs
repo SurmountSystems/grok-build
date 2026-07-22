@@ -422,7 +422,9 @@ pub(crate) fn reconcile_overdue_turn_ends(app: &mut AppView) -> Option<Vec<Effec
                 agent.discard_pending_adoption_updates(&p.prompt_id);
                 None
             }
-        }
+        } else {
+            None
+        };
         // Same auto-implement follow-up path as PromptResponse (settings-
         // gated). Only on successful non-cancel reconcile exits.
         let clean_success = !was_cancelling
@@ -431,7 +433,12 @@ pub(crate) fn reconcile_overdue_turn_ends(app: &mut AppView) -> Option<Vec<Effec
         if clean_success {
             crate::app::auto_implement::on_successful_turn_end(agent);
         }
-        effects.extend(maybe_drain_queue(agent));
+        let drain = maybe_drain_queue(agent);
+        effects.extend(drain.effects);
+        drained_ids.push((id, adopted_page_flip.or(drain.page_flip_entry)));
+    }
+    for (id, page_flip_entry) in drained_ids {
+        note_peek_page_flip(app, id, page_flip_entry);
     }
     fired.then_some(effects)
 }

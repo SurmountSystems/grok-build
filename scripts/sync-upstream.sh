@@ -40,9 +40,9 @@ case $code in
     if [[ "${IMPORT_NOW:-}" == "1" ]]; then
       exec ./scripts/import-upstream-export.sh
     fi
-    echo "Still useful anytime (rebuild stack on current tip):"
+    echo "Still useful anytime (rebuild stack on current tip; real cherry-pick):"
     echo "  ./scripts/put-history-on-xai.sh"
-    echo "  MODE=overlay ./scripts/put-history-on-xai.sh"
+    echo "  FORCE=1 SURMOUNT_REF=origin/main ./scripts/put-history-on-xai.sh"
     exit 0
     ;;
   2)
@@ -54,11 +54,12 @@ case $code in
     if [[ "${IMPORT_NOW:-}" == "1" ]]; then
       exec ./scripts/import-upstream-export.sh
     fi
-    echo "Put Surmount history on their tip (rebuildable after force-export):"
+    echo "1) Stack Surmount product commits on their tip (preferred when histories break):"
     echo "  ./scripts/put-history-on-xai.sh"
+    echo "  FORCE=1 SURMOUNT_REF=origin/main ./scripts/put-history-on-xai.sh"
     echo "  PUT_ON_XAI=1 ./scripts/sync-upstream.sh"
     echo
-    echo "Absorb export into Surmount main (separate, reviewed content import):"
+    echo "2) Absorb export into Surmount main (reviewed content import → PR):"
     echo "  ./scripts/import-upstream-export.sh"
     echo "  IMPORT_NOW=1 ./scripts/sync-upstream.sh"
     exit 2

@@ -54,7 +54,15 @@ async fn wait_before_attempt(config: &SamplerConfig) {
 
 /// After a failed attempt: on 429 publish shared cooldown; always wait shared
 /// then apply local backoff for non-429 (429 is fully covered by shared wait).
-async fn sleep_for_retry(config: &SamplerConfig, err: &SamplingError, local_backoff: Duration) {
+///
+/// Returns `false` if `cancel_token` fires during the wait (caller should
+/// treat as cancellation and stop retrying).
+async fn sleep_for_retry(
+    config: &SamplerConfig,
+    err: &SamplingError,
+    local_backoff: Duration,
+    cancel_token: &CancellationToken,
+) -> bool {
     let store = SharedRateLimitStore::process_default();
     let key = provider_key_for_config(config);
     if err.is_rate_limited() {
@@ -69,14 +77,23 @@ async fn sleep_for_retry(config: &SamplerConfig, err: &SamplingError, local_back
         if let Err(e) = store.observe(&key, wait, meta) {
             tracing::debug!(error = %e, "shared rate limit observe failed");
         }
-        store.wait_if_limited(&key).await;
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => return false,
+            _ = store.wait_if_limited(&key) => {}
+        }
     } else {
         // Peers may still have a host-level cooldown; then local exp backoff.
-        store.wait_if_limited(&key).await;
-        if !local_backoff.is_zero() {
-            tokio::time::sleep(local_backoff).await;
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => return false,
+            _ = store.wait_if_limited(&key) => {}
+        }
+        if !local_backoff.is_zero() && !sleep_or_cancel(local_backoff, cancel_token).await {
+            return false;
         }
     }
+    true
 }
 
 /// Default per-chunk idle timeout when neither config nor caller
@@ -276,7 +293,7 @@ pub(crate) async fn run_request_task(
                     &request_id,
                     &mut request,
                     &mut client,
-                    &config,
+                    &mut config,
                     &cancel_token,
                     &mut completion_tx,
                 )
@@ -330,7 +347,7 @@ pub(crate) async fn run_request_task(
                     &request_id,
                     &mut request,
                     &mut client,
-                    &config,
+                    &mut config,
                     &cancel_token,
                     &mut completion_tx,
                 )
@@ -353,7 +370,7 @@ pub(crate) async fn run_request_task(
                     &request_id,
                     &mut request,
                     &mut client,
-                    &config,
+                    &mut config,
                     &cancel_token,
                     &mut completion_tx,
                 )
@@ -428,7 +445,7 @@ async fn apply_retry_decision(
     request_id: &RequestId,
     request: &mut ConversationRequest,
     client: &mut SamplingClient,
-    config: &SamplerConfig,
+    config: &mut SamplerConfig,
     cancel_token: &CancellationToken,
     completion_tx: &mut Option<oneshot::Sender<CompletionResult>>,
 ) -> bool {
@@ -466,14 +483,22 @@ async fn apply_retry_decision(
         RetryDecision::Retry { backoff } => {
             *retry_count += 1;
             emit_retrying(event_tx, request_id, *retry_count, max_retries, err, config);
-            sleep_for_retry(config, err, backoff).await;
-            true
+            if sleep_for_retry(config, err, backoff, cancel_token).await {
+                true
+            } else {
+                handle_cancellation(event_tx, request_id, completion_tx);
+                false
+            }
         }
         RetryDecision::RetryWithBackoff { backoff, .. } => {
             *retry_count += 1;
             emit_retrying(event_tx, request_id, *retry_count, max_retries, err, config);
-            sleep_for_retry(config, err, backoff).await;
-            true
+            if sleep_for_retry(config, err, backoff, cancel_token).await {
+                true
+            } else {
+                handle_cancellation(event_tx, request_id, completion_tx);
+                false
+            }
         }
         RetryDecision::RetryWithImageStrip => {
             let stripped = request.strip_images();
@@ -490,7 +515,10 @@ async fn apply_retry_decision(
         RetryDecision::RetryWithClientRebuild { backoff } => {
             *retry_count += 1;
             emit_retrying(event_tx, request_id, *retry_count, max_retries, err, config);
-            sleep_for_retry(config, err, backoff).await;
+            if !sleep_for_retry(config, err, backoff, cancel_token).await {
+                handle_cancellation(event_tx, request_id, completion_tx);
+                return false;
+            }
 
             // Rebuild client with HTTP/1.1 fallback to escape poisoned
             // HTTP/2 connection pools.
@@ -1079,7 +1107,7 @@ mod tests {
         let mut completion_tx = Some(completion_tx);
         let mut retry_count = 0;
         let mut request = ConversationRequest::default();
-        let config = SamplerConfig {
+        let mut config = SamplerConfig {
             base_url: "http://localhost".into(),
             model: "test-model".into(),
             ..Default::default()
@@ -1096,7 +1124,7 @@ mod tests {
             &RequestId::from("cancel-backoff"),
             &mut request,
             &mut client,
-            &config,
+            &mut config,
             &cancel_token,
             &mut completion_tx,
         )

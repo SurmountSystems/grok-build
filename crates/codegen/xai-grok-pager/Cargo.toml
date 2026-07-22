@@ -281,14 +281,12 @@ path = "src/bin/todo_pane_playground.rs"
 workspace = true
 
 [features]
-# Cross-crate test seams (minimal_api helpers, pager-render probes).
-test-support = ["xai-grok-pager-render/test-support"]
 default = ["jemalloc", "sandbox-enforce"]
 default-bazel = [
     "jemalloc",
     "sandbox-enforce",
     "test-support",
-    ]
+]
 # No-op on this crate: the actual `#[global_allocator]` (and the
 # `tikv-jemallocator` dep) live on the composition-root binary
 # `xai-grok-pager-bin`, which owns `main.rs`. Kept as an empty feature so the
@@ -297,7 +295,7 @@ default-bazel = [
 jemalloc = []
 sandbox-enforce = ["xai-grok-sandbox/enforce"]
 release-dist = []
-# Exposes test-only view-model constructors/setters (e.g. `test_agent_view`,
-# `AgentSession::set_yolo_mode_for_test`) to sibling crates' test builds — used
-# by `xai-grok-pager-minimal`'s unit tests. Never enabled in production builds.
+# Cross-crate test seams (minimal_api helpers, pager-render probes) plus
+# test-only view-model constructors/setters for sibling crates' tests
+# (e.g. xai-grok-pager-minimal). Never enabled in production builds.
 test-support = ["xai-grok-pager-render/test-support"]

@@ -4857,6 +4857,7 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
         debug_assert!(model.effective_auth_provider().is_some());
         (
             provider.cached_token(),
+            Vec::new(),
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )

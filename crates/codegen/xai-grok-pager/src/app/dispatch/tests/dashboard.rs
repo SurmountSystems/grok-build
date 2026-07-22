@@ -1197,11 +1197,11 @@ fn dashboard_second_stash_does_not_overwrite_first() {
     );
     let reply_sent = effects.iter().any(|e| {
         matches!(
-            e, Effect::SendPromptBlocks { agent_id, blocks, .. }
-if * agent_id ==
-            AgentId(0) && blocks.iter().any(| b | matches!(b,
-            acp::ContentBlock::Image(_)))
-        )
+                    e, Effect::SendPromptBlocks { agent_id, blocks, .. }
+        if * agent_id ==
+                    AgentId(0) && blocks.iter().any(| b | matches!(b,
+                    acp::ContentBlock::Image(_)))
+                )
     });
     assert!(
         reply_sent,
@@ -4632,11 +4632,9 @@ fn dashboard_peek_reply_to_idle_agent_sends() {
         false,
     );
     assert_eq!(effects.len(), 1);
-    assert!(
-        matches!(& effects[0], Effect::SendPrompt { text, .. }
+    assert!(matches!(& effects[0], Effect::SendPrompt { text, .. }
 if text ==
-        "please continue")
-    );
+        "please continue"));
     assert!(app.agents[&AgentId(0)].session.state.is_turn_running());
     assert_eq!(app.agents[&AgentId(0)].session.queue_len(), 0);
     assert!(app.dashboard.as_ref().unwrap().peek_reply.text().is_empty());

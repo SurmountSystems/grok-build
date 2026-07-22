@@ -3793,20 +3793,20 @@ mod tests {
         };
         assert_eq!(u.content.len(), 2);
         assert_matches!(
-            &u.content[1],
-            ContentPart::Image { url }
-if url.as_ref() == "https://example.com/image.png"
-        );
+                    &u.content[1],
+                    ContentPart::Image { url }
+        if url.as_ref() == "https://example.com/image.png"
+                );
 
         // Convert to chat request and verify
         let chat_msg = conversation_item_to_chat_message(user);
         let blocks = chat_msg.content.blocks();
         assert_eq!(blocks.len(), 2);
         assert_matches!(
-            &blocks[1],
-            ChatContentBlock::ImageUrl { image_url }
-if image_url.url == "https://example.com/image.png"
-        );
+                    &blocks[1],
+                    ChatContentBlock::ImageUrl { image_url }
+        if image_url.url == "https://example.com/image.png"
+                );
     }
 
     #[test]

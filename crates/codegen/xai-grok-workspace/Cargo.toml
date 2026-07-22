@@ -123,14 +123,13 @@ path = "src/bin/workspace_server_probe.rs"
 [features]
 default = ["sandbox-enforce"]
 compression = []
-test-support = []
 sandbox-enforce = ["xai-grok-sandbox/enforce"]
 # WorkspaceOps::for_test / WorkspaceHandle::for_test for dependents' cargo tests.
 test-support = []
 default-bazel = [
     "sandbox-enforce",
     "test-support",
-    ]
+]
 
 [dev-dependencies]
 filetime = { workspace = true }
