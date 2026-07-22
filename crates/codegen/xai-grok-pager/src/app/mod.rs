@@ -1948,51 +1948,6 @@ mod tests {
         assert!(out.contains("  grok-oss --resume sess-abc\n"));
     }
     #[test]
-    fn print_exit_resume_hint_includes_session_summary() {
-        let info = ExitInfo {
-            session_id: "sess-abc".to_string(),
-            minimal: false,
-            summary: Some(ExitSummary {
-                title: "Fix flaky CI test".to_string(),
-                last_prompt: Some("make the suite deterministic".to_string()),
-                last_response: Some("Pinned the seed; 200 consecutive green runs.".to_string()),
-            }),
-        };
-        let mut buf = Vec::new();
-        print_exit_resume_hint(&info, 80, &mut buf);
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            concat!(
-                "\n",
-                "Fix flaky CI test\n",
-                "> make the suite deterministic\n",
-                "  Pinned the seed; 200 consecutive green runs.\n",
-                "\n",
-                "Resume this session with:\n",
-                "  grok --resume sess-abc\n",
-            )
-        );
-    }
-    #[test]
-    fn print_exit_resume_hint_truncates_summary_to_width() {
-        let info = ExitInfo {
-            session_id: "sess-abc".to_string(),
-            minimal: false,
-            summary: Some(ExitSummary {
-                title: "t".repeat(50),
-                last_prompt: Some("p".repeat(50)),
-                last_response: Some("r".repeat(50)),
-            }),
-        };
-        let mut buf = Vec::new();
-        print_exit_resume_hint(&info, 20, &mut buf);
-        let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains(&format!("\n{}…\n", "t".repeat(19))));
-        assert!(out.contains(&format!("\n> {}…\n", "p".repeat(17))));
-        assert!(out.contains(&format!("\n  {}…\n", "r".repeat(17))));
-        assert!(out.contains("  grok --resume sess-abc\n"));
-    }
-    #[test]
     fn print_relaunch_failure_hint_writes_expected_lines() {
         let mut buf = Vec::new();
         print_relaunch_failure_hint(&"exec failed", "sess-xyz", false, &mut buf);

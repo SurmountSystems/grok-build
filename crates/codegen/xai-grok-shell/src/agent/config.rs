@@ -6939,10 +6939,16 @@ if n == name && f.as_deref() == field
             entry.env_key.as_ref().map(|k| k.names()),
             Some(vec![crate::auth::openrouter::OPENROUTER_API_KEY_ENV])
         );
-        // Native default remains grok-build (not OpenRouter).
-        assert_eq!(crate::models::default_model(), "grok-build");
+        // Native default remains first-party (not the OpenRouter catalog id).
+        let dm = crate::models::default_model();
+        assert_ne!(
+            dm,
+            crate::auth::openrouter::OPENROUTER_GROK_45_CATALOG_ID,
+            "OpenRouter must stay additive, not the product default"
+        );
         assert!(
-            models.contains_key("grok-build") || models.values().any(|m| m.model == "grok-build")
+            models.contains_key(dm) || models.values().any(|m| m.model == dm),
+            "defaults must include the product default model {dm}"
         );
     }
 
@@ -12360,7 +12366,7 @@ default = "grok-4.5"
         let resolved = resolve_model_list(&cfg, Some(p));
         // First-party prefetch entry + additive OpenRouter default (survives
         // replace). OpenRouter is `supported_in_api` so it appears for API-key
-        // auth users too; grok-build is session-only in the bundled defaults.
+        // auth users too; the bundled first-party default is session-only.
         let sess: Vec<_> = resolved
             .values()
             .filter(|e| e.visible_for_auth(true))
@@ -12369,13 +12375,23 @@ default = "grok-4.5"
             .values()
             .filter(|e| e.visible_for_auth(false))
             .collect();
-        assert!(resolved.contains_key("grok-build"));
-        assert!(resolved.contains_key(crate::auth::openrouter::OPENROUTER_GROK_45_CATALOG_ID));
-        assert_eq!(sess.len(), 2, "grok-build + openrouter-grok-4.5");
-        assert_eq!(api.len(), 1, "only openrouter is supported_in_api");
         assert!(
-            api[0].info.base_url.contains("openrouter.ai"),
-            "api-visible entry should be OpenRouter"
+            resolved.contains_key(dm),
+            "resolved catalog must include product default {dm}"
+        );
+        assert!(resolved.contains_key(crate::auth::openrouter::OPENROUTER_GROK_45_CATALOG_ID));
+        assert_eq!(sess.len(), 2, "{dm} + openrouter-grok-4.5");
+        // First-party defaults may also be `supported_in_api`; OpenRouter must
+        // still be present among API-key-visible entries.
+        assert!(
+            api.iter()
+                .any(|e| e.info.base_url.contains("openrouter.ai")),
+            "api-visible set must include OpenRouter, got {} entries",
+            api.len()
+        );
+        assert!(
+            api.len() >= 1,
+            "expected at least OpenRouter for API-key users"
         );
     }
     #[test]

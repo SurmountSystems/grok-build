@@ -470,6 +470,7 @@ async fn rate_limit_exhausts_when_policy_caps_retries() {
     let policy = RetryPolicy {
         max_retries: 2,
         rate_limit_retry_threshold: 2,
+        retry_only_before_output: false,
     };
     let handle = SamplerActor::spawn(cfg, policy, event_tx);
 

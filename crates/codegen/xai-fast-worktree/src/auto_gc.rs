@@ -792,7 +792,13 @@ mod tests {
                 .status
                 .success()
         );
-        for (k, v) in [("user.email", "t@test"), ("user.name", "t")] {
+        // Local-only: CI hosts often require GPG on the user git config;
+        // temp fixture repos must still be able to create an unsigned commit.
+        for (k, v) in [
+            ("user.email", "t@test"),
+            ("user.name", "t"),
+            ("commit.gpgsign", "false"),
+        ] {
             assert!(
                 std::process::Command::new("git")
                     .args(["config", k, v])
@@ -813,14 +819,17 @@ mod tests {
                 .status
                 .success()
         );
+        let commit = std::process::Command::new("git")
+            .args(["commit", "-m", "i"])
+            .current_dir(repo)
+            .env("ALLOW_UNSIGNED_COMMIT", "1")
+            .output()
+            .unwrap();
         assert!(
-            std::process::Command::new("git")
-                .args(["commit", "-m", "i"])
-                .current_dir(repo)
-                .output()
-                .unwrap()
-                .status
-                .success()
+            commit.status.success(),
+            "fixture commit failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&commit.stdout),
+            String::from_utf8_lossy(&commit.stderr)
         );
         let add_wt = std::process::Command::new("git")
             .args(["worktree", "add", "--detach", wt.to_str().unwrap(), "HEAD"])

@@ -2188,7 +2188,7 @@ pub(crate) fn render_session_picker(
     // this render disagrees with `handle_welcome_input`'s `build_entry_map`
     // (which receives the effective query) on row indices.
     let filter_query =
-        crate::views::session_picker::effective_filter_query(&ctx.state.query(), ctx.entries_query);
+        crate::views::session_picker::effective_filter_query(ctx.state.query(), ctx.entries_query);
     let filtered_indices =
         crate::app::app_view::filter_session_entries(ctx.sessions, filter_query, ctx.source_filter);
 
@@ -2721,10 +2721,8 @@ mod tests {
 
         let render = |entries_query: Option<&str>| -> String {
             let mut buf = Buffer::empty(area);
-            let mut state = PickerState {
-                query: "hit".into(),
-                ..PickerState::default()
-            };
+            let mut state = PickerState::default();
+            state.set_query("hit");
             render_session_picker(
                 area,
                 &mut buf,
@@ -2944,15 +2942,15 @@ mod tests {
         use crate::views::picker::{PickerOutcome, handle_picker_input};
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
-        let mut state = PickerState {
-            search_active: true,
-            ..PickerState::default()
-        };
+        let mut state = PickerState::input_active();
         let config = resume_picker_config();
         let ev = Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         let outcome = handle_picker_input(&ev, &mut state, 3, &config);
-        assert!(matches!(outcome, PickerOutcome::Changed));
-        assert_eq!(state.query, "e");
+        assert!(
+            matches!(outcome, PickerOutcome::QueryChanged),
+            "typing into active search must change the query"
+        );
+        assert_eq!(state.query(), "e");
     }
 
     #[test]

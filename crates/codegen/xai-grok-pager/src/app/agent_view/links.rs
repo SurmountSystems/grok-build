@@ -1618,7 +1618,7 @@ mod link_click_tests {
             .push_block(crate::scrollback::block::RenderBlock::agent_message("done"));
         agent.scrollback.prepare_layout(80, 40);
         let now = std::time::Instant::now();
-        (agent.last_click, _, _) = agent.handle_scrollback_click(now, 0, false);
+        (agent.last_click, _) = agent.handle_scrollback_click(now, 0, false);
         let _ = agent.handle_scrollback_click(now + std::time::Duration::from_millis(10), 0, false);
         if crate::app::inline_edit::INLINE_EDIT_ENABLED {
             assert!(
