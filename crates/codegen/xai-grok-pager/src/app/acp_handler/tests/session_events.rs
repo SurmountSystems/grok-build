@@ -18,6 +18,8 @@
             tokens_used: 90000,
             context_window: 131072,
             percentage: 85,
+            threshold_percent: Some(95),
+            threshold_tokens: None,
             reason: "threshold".into(),
         };
         assert!(apply_session_event(&update, &mut session, &mut scrollback, false));
@@ -754,6 +756,8 @@
             tokens_used: 95_000,
             context_window: 131_072,
             percentage: 72,
+            threshold_percent: Some(95),
+            threshold_tokens: None,
             reason: "threshold".into(),
         };
         let _ = handle_child_session_notification(update, child_sid, &mut agent, false);
@@ -773,6 +777,8 @@
             tokens_used: 90000,
             context_window: 131072,
             percentage: 85,
+            threshold_percent: Some(95),
+            threshold_tokens: None,
             reason: "threshold".into(),
         };
         let changed = handle_child_session_notification(update, "unknown-child", &mut agent, false);

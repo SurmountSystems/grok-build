@@ -402,8 +402,15 @@ pub enum SessionUpdate {
         tokens_used: u64,
         /// Total context window size
         context_window: u64,
-        /// Percentage used (e.g., 82)
+        /// Usage percentage at fire time (e.g., 82) — not the configured threshold.
         percentage: u8,
+        /// Configured auto-compact threshold percent (live session Cell).
+        /// Absent on older shells; UI falls back to usage-only banner text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        threshold_percent: Option<u8>,
+        /// Configured absolute-token threshold when in tokens mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        threshold_tokens: Option<u64>,
         /// Reason for compaction
         reason: String,
     },

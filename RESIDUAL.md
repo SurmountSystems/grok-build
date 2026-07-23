@@ -25,6 +25,13 @@ or code — not only here.
    ask a human rather than inventing policy. Write the answer here only while
    it stays open; then migrate the lasting rule into FORK or AGENTS.
 
+5. **Live-apply auto-compact threshold (settings → open session)**  
+   Settings still mark `auto_compact_threshold_percent` as restart-required:
+   open sessions keep the threshold resolved at spawn / last model switch.
+   Slice 1 fixed catalog undercut + banner honesty; live Cell update on
+   settings commit (mirror model-switch / economic-mode patterns,
+   `restart_required: false`) is still open.
+
 ## Not residual (resolved elsewhere)
 
 - CI checks-only (no release package in GHA) — FORK + justfile + AGENTS  

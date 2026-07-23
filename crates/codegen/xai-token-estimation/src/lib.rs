@@ -282,4 +282,20 @@ mod tests {
         // 100_000_000 — saturating sub yields 0, so any used fires.
         assert!(exceeds_threshold_with_headroom(0, 100_000, 85, 1_000_000));
     }
+
+    /// Economic mode soft-caps the effective window at 200k; product default
+    /// auto-compact is 95% → fire at exactly 190_000 tokens.
+    #[test]
+    fn economic_200k_at_95_percent_fires_at_190k() {
+        assert!(!exceeds_threshold(189_999, 200_000, 95));
+        assert!(exceeds_threshold(190_000, 200_000, 95));
+    }
+
+    /// Historical catalog-undercut gate (80% of 200k = 160k). Stock path must
+    /// not use this after catalog omit; kept as arithmetic documentation.
+    #[test]
+    fn economic_200k_at_80_percent_fires_at_160k() {
+        assert!(!exceeds_threshold(159_999, 200_000, 80));
+        assert!(exceeds_threshold(160_000, 200_000, 80));
+    }
 }

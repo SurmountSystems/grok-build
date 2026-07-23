@@ -16,7 +16,6 @@
       "show_model_fingerprint": true,
       "supports_reasoning_effort": true,
       "reasoning_effort": "high",
-      "auto_compact_threshold_percent": 80,
       "compaction_at_tokens": true,
       "compactions_remaining": 1,
       "reasoning_efforts": [

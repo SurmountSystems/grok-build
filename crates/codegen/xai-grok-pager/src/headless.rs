@@ -1656,6 +1656,10 @@ fn handle_ext_notification(
     enum XaiUpdate {
         AutoCompactStarted {
             percentage: u8,
+            #[serde(default)]
+            threshold_percent: Option<u8>,
+            #[serde(default)]
+            threshold_tokens: Option<u64>,
         },
         AutoCompactCompleted {},
         AutoCompactFailed {
@@ -1687,15 +1691,31 @@ fn handle_ext_notification(
     };
 
     match xai_notif.update {
-        XaiUpdate::AutoCompactStarted { percentage } => match format {
+        XaiUpdate::AutoCompactStarted {
+            percentage,
+            threshold_percent,
+            threshold_tokens,
+        } => match format {
             OutputFormat::StreamingJson => {
-                println!(
-                    "{}",
-                    serde_json::json!({"type": "auto_compact_started", "percentage": percentage})
-                );
+                let mut obj = serde_json::json!({
+                    "type": "auto_compact_started",
+                    "percentage": percentage,
+                });
+                if let Some(t) = threshold_percent {
+                    obj["threshold_percent"] = serde_json::json!(t);
+                }
+                if let Some(t) = threshold_tokens {
+                    obj["threshold_tokens"] = serde_json::json!(t);
+                }
+                println!("{obj}");
             }
             OutputFormat::Plain => {
-                eprintln!("Auto-compacting conversation ({percentage}% full)...");
+                let detail = match (threshold_tokens, threshold_percent) {
+                    (Some(t), _) => format!("{percentage}% full, auto-compact at {t} tokens"),
+                    (None, Some(t)) => format!("{percentage}% full, auto-compact at {t}%"),
+                    (None, None) => format!("{percentage}% full"),
+                };
+                eprintln!("Auto-compacting conversation ({detail})...");
             }
             OutputFormat::Json => {}
         },

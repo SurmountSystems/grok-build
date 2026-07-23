@@ -40,7 +40,7 @@ use xai_grok_shell::session::{ContextInfo, count_detail};
 /// ◈ Skills            2.4k tokens  (0.2%) · 21 skills
 /// ◈ MCP servers        320 tokens  (0.1%) ·  4 servers
 ///
-/// Auto-compact at 85% · ~812k tokens remaining
+/// Auto-compact at 95% · ~812k tokens remaining
 ///
 /// Turns: 5 · Tool calls: 12 · Compactions: 0
 /// ```

@@ -3477,6 +3477,27 @@ pub fn resolve_model_list(
                 if entry.info.api_backend == ApiBackend::default() {
                     entry.info.api_backend.clone_from(&donor.info.api_backend);
                 }
+                // Surmount product default is 95%. Baked stock models that omit
+                // auto_compact_threshold_percent must not re-acquire a remote
+                // undercut (e.g. models_cache 80) that beats DEFAULT via the GB
+                // per-model tier. Remote-only fleet models (no donor) keep their
+                // per-model value. User session / env / [model.*] still win in
+                // resolve_auto_compact_threshold_percent.
+                if donor.info.auto_compact_threshold_percent.is_none()
+                    && entry
+                        .info
+                        .auto_compact_threshold_percent
+                        .is_some_and(|p| {
+                            p < crate::util::config::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT
+                        })
+                {
+                    tracing::debug!(
+                        model_key = %key,
+                        remote = ?entry.info.auto_compact_threshold_percent,
+                        "dropping remote auto_compact undercut for stock model (product default 95)"
+                    );
+                    entry.info.auto_compact_threshold_percent = None;
+                }
             }
             if resolved.contains_key(key) {
                 tracing::debug!(
@@ -3912,7 +3933,7 @@ pub struct ModelEntryConfig {
     /// usage exceeds this percentage of `context_window`, the conversation
     /// is summarized. Resolver precedence:
     /// requirements > env > user (per-model > global) > managed (per-model > global)
-    /// > remote per-model (this field) > remote global > 85.
+    /// > remote per-model (this field) > remote global > 95.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_compact_threshold_percent: Option<u8>,
     /// Per-model system-prompt identity label (not UI `name`).

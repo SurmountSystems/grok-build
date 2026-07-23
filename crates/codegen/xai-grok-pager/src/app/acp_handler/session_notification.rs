@@ -1108,13 +1108,22 @@ pub(super) fn apply_session_event(
     is_api_key_auth: bool,
 ) -> bool {
     match update {
-        XaiSessionUpdate::AutoCompactStarted { percentage, .. } => {
-            tracing::info!("Auto-compact started: {percentage}% context used");
+        XaiSessionUpdate::AutoCompactStarted {
+            percentage,
+            threshold_percent,
+            threshold_tokens,
+            ..
+        } => {
+            tracing::info!(
+                "Auto-compact started: {percentage}% context used (threshold {threshold_percent:?}/{threshold_tokens:?})"
+            );
             session.in_flight_prompt = None;
             session.set_compaction_activity(Some(TurnActivity::AutoCompacting));
             scrollback.push_block(RenderBlock::session_event(
                 SessionEvent::CompactionStarted {
                     percentage: *percentage,
+                    threshold_percent: *threshold_percent,
+                    threshold_tokens: *threshold_tokens,
                 },
             ));
             true

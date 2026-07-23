@@ -1416,6 +1416,144 @@ auto_update = true
                  user-per-model and GB-per-model remain distinguishable tiers"
             );
         }
+
+        /// Pin: user session 98 always beats a catalog/remote undercut of 80.
+        #[test]
+        fn user_session_98_beats_catalog_even_if_catalog_80() {
+            let _g = EnvVarGuard::unset();
+            let cfg = make_cfg(Some(98), None, None);
+            assert_eq!(resolve(&cfg, Some(80)), 98);
+        }
+
+        /// Stock grok-4.5 ModelInfo from baked default_models must resolve to 95
+        /// with no user override (catalog must not undercut product default).
+        #[test]
+        fn stock_grok_45_model_info_resolves_to_default_95() {
+            let _g = EnvVarGuard::unset();
+            use crate::agent::config::{default_model_entries, EndpointsConfig};
+            let entries = default_model_entries(&EndpointsConfig::default());
+            let entry = entries
+                .get("grok-4.5")
+                .expect("baked catalog must include grok-4.5");
+            let pct = entry.info.auto_compact_threshold_percent;
+            assert!(
+                pct.is_none() || pct.is_some_and(|p| p >= DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT),
+                "grok-4.5 catalog auto_compact must be None or ≥95, got {pct:?}"
+            );
+            let cfg = make_cfg(None, None, None);
+            assert_eq!(
+                resolve_auto_compact_threshold_percent(&cfg, "grok-4.5", Some(&entry.info)),
+                DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                "stock grok-4.5 with no user override must resolve to product default 95"
+            );
+        }
+    }
+
+    /// Guard: baked default_models.json must not ship grok-4.5 with an
+    /// undercut of the product auto-compact default (95). Catches upstream
+    /// catalog re-imports that reintroduce `"auto_compact_threshold_percent": 80`.
+    #[test]
+    fn default_models_grok_45_does_not_undercut_auto_compact_default() {
+        use crate::util::config::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT;
+        let root: serde_json::Value =
+            serde_json::from_str(crate::models::DEFAULT_MODELS_JSON).expect("valid JSON");
+        let models = root
+            .get("models")
+            .and_then(|v| v.as_array())
+            .expect("models array");
+        let grok45 = models
+            .iter()
+            .find(|m| {
+                m.get("id").and_then(|v| v.as_str()) == Some("grok-4.5")
+                    || m.get("model").and_then(|v| v.as_str()) == Some("grok-4.5")
+            })
+            .expect("grok-4.5 entry in default_models.json");
+        let field = grok45.get("auto_compact_threshold_percent");
+        match field {
+            None | Some(serde_json::Value::Null) => {}
+            Some(v) => {
+                let p = v.as_u64().expect("auto_compact_threshold_percent must be u64") as u8;
+                assert!(
+                    p >= DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    "grok-4.5 auto_compact_threshold_percent={p} undercuts product default {}",
+                    DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT
+                );
+            }
+        }
+    }
+
+    /// Remote models_cache undercut (80) on a stock model whose baked catalog
+    /// omits the field must not survive resolve_model_list merge.
+    #[test]
+    fn resolve_model_list_drops_remote_auto_compact_undercut_on_stock_grok_45() {
+        use crate::agent::config::{
+            default_model_entries, resolve_model_list, Config, EndpointsConfig,
+        };
+        use crate::util::config::{
+            DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT, resolve_auto_compact_threshold_percent,
+        };
+        use indexmap::IndexMap;
+
+        let cfg = Config::default();
+        let defaults = default_model_entries(&EndpointsConfig::default());
+        let mut stock = defaults
+            .get("grok-4.5")
+            .expect("grok-4.5")
+            .clone();
+        // Simulate remote models_cache reintroducing the old 80 undercut.
+        stock.info.auto_compact_threshold_percent = Some(80);
+        let mut prefetched = IndexMap::new();
+        prefetched.insert("grok-4.5".to_owned(), stock);
+
+        let resolved = resolve_model_list(&cfg, Some(prefetched));
+        let entry = resolved.get("grok-4.5").expect("grok-4.5 present");
+        assert_eq!(
+            entry.info.auto_compact_threshold_percent, None,
+            "remote undercut must be dropped for stock model with no baked special policy"
+        );
+        assert_eq!(
+            resolve_auto_compact_threshold_percent(&cfg, "grok-4.5", Some(&entry.info)),
+            DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT
+        );
+    }
+
+    /// Remote-only models (not in baked defaults) keep intentional fleet %.
+    #[test]
+    fn resolve_model_list_keeps_remote_only_fleet_auto_compact() {
+        use crate::agent::config::{
+            resolve_model_list, Config, EndpointsConfig, ModelEntry, ModelInfo,
+        };
+        use indexmap::IndexMap;
+        use std::num::NonZeroU64;
+
+        let cfg = Config::default();
+        let mut info = ModelInfo::fallback("fleet-special");
+        info.context_window = NonZeroU64::new(200_000).unwrap();
+        info.auto_compact_threshold_percent = Some(65);
+        let entry = ModelEntry {
+            info,
+            api_key: None,
+            env_key: None,
+            auth_provider: None,
+            api_base_url: None,
+        };
+        let mut prefetched = IndexMap::new();
+        prefetched.insert("fleet-special".to_owned(), entry);
+
+        // Ensure fleet-special is not a baked stock model.
+        let defaults = crate::agent::config::default_model_entries(&EndpointsConfig::default());
+        assert!(!defaults.contains_key("fleet-special"));
+
+        let resolved = resolve_model_list(&cfg, Some(prefetched));
+        assert_eq!(
+            resolved
+                .get("fleet-special")
+                .expect("present")
+                .info
+                .auto_compact_threshold_percent,
+            Some(65),
+            "intentional remote-only fleet per-model threshold must be preserved"
+        );
     }
 
     #[test]

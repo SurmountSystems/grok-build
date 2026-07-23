@@ -80,9 +80,12 @@ remote_fetch = true                    # allow optional online model-catalog fet
 [session]
 auto_compact_threshold_percent = 95    # auto-compact at this % of the *effective* context window
                                        # (0–100; settings UI offers 85 / 90 / 95 / 98;
-                                       # default 95; restart required for open sessions).
+                                       # default 95; stock Grok 4.5 catalog must not undercut
+                                       # this default; restart required for open sessions).
                                        # With [ui] economic_mode = true the window is soft-capped
                                        # at 200k, so 95% ≈ 190k tokens.
+                                       # The compaction banner shows usage % and the configured
+                                       # threshold (e.g. "Context 81% full (auto-compact at 95%)").
 # Or pin an absolute token budget instead (wins over percent when set):
 # auto_compact_threshold_tokens = 200000  # Grok 4.5 long-context price cliff (same 200k as
 #                                         # economic mode). Costs double for the entire request

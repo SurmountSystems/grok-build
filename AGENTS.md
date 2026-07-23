@@ -16,6 +16,14 @@ apply (`~/.grok/AGENTS.md`).
    either/or menus, or planning jargon (phases, tracks, workstreams) in user
    replies, product docs, tests, or **filenames**.
 
+## Regressions and deep diagnosis
+
+- Do **not** investigate regressions or multi-file diagnosis in the parent
+  thread (no parent-marathon of greps, logs, or long code walks). Spawn tightly
+  scoped subagents; join on short on-disk summaries only.
+- Full rule: `~/.grok/AGENTS.md` § *Regressions and deep diagnosis — never in
+  the parent thread*.
+
 ## When you ship product work
 
 - Update **[`FORK.md`](FORK.md)** with a short hierarchical note (what changed
